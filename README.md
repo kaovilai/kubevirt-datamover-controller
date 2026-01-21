@@ -1,1 +1,1 @@
-# kubevirt-datamover-operator
+# kubevirt-datamover-controller
