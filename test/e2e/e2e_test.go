@@ -34,7 +34,7 @@ import (
 )
 
 // namespace where the project is deployed in
-const namespace = "kubevirt-datamover-system"
+const namespace = "openshift-adp"
 
 // serviceAccountName created for the project
 const serviceAccountName = "kubevirt-datamover-controller-manager"
