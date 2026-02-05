@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+//nolint:goconst // Test files use repeated string literals for readability
 package controller
 
 import (
