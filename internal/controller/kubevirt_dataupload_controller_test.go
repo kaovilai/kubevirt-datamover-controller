@@ -926,3 +926,407 @@ func TestAnnotationConstants(t *testing.T) {
 		t.Errorf("expected DefaultTempPVCSize='10Gi', got '%s'", DefaultTempPVCSize)
 	}
 }
+
+func TestExtractPodFailureMessage(t *testing.T) {
+	tests := []struct {
+		name     string
+		pod      *corev1.Pod
+		expected string
+	}{
+		{
+			name: "container terminated with message",
+			pod: &corev1.Pod{
+				Status: corev1.PodStatus{
+					ContainerStatuses: []corev1.ContainerStatus{
+						{
+							Name: "uploader",
+							State: corev1.ContainerState{
+								Terminated: &corev1.ContainerStateTerminated{
+									Message: "Error: failed to upload files",
+								},
+							},
+						},
+					},
+				},
+			},
+			expected: "Error: failed to upload files",
+		},
+		{
+			name: "container terminated with reason only",
+			pod: &corev1.Pod{
+				Status: corev1.PodStatus{
+					ContainerStatuses: []corev1.ContainerStatus{
+						{
+							Name: "uploader",
+							State: corev1.ContainerState{
+								Terminated: &corev1.ContainerStateTerminated{
+									Reason: "OOMKilled",
+								},
+							},
+						},
+					},
+				},
+			},
+			expected: "OOMKilled",
+		},
+		{
+			name: "init container terminated with message",
+			pod: &corev1.Pod{
+				Status: corev1.PodStatus{
+					InitContainerStatuses: []corev1.ContainerStatus{
+						{
+							Name: "init",
+							State: corev1.ContainerState{
+								Terminated: &corev1.ContainerStateTerminated{
+									Message: "Init container failed",
+								},
+							},
+						},
+					},
+				},
+			},
+			expected: "Init container failed",
+		},
+		{
+			name: "pod condition with message",
+			pod: &corev1.Pod{
+				Status: corev1.PodStatus{
+					Conditions: []corev1.PodCondition{
+						{
+							Type:    corev1.PodScheduled,
+							Status:  corev1.ConditionFalse,
+							Message: "Insufficient memory",
+						},
+					},
+				},
+			},
+			expected: "Insufficient memory",
+		},
+		{
+			name: "no failure info",
+			pod: &corev1.Pod{
+				Status: corev1.PodStatus{},
+			},
+			expected: "unknown error",
+		},
+		{
+			name: "running container - no terminated state",
+			pod: &corev1.Pod{
+				Status: corev1.PodStatus{
+					ContainerStatuses: []corev1.ContainerStatus{
+						{
+							Name: "uploader",
+							State: corev1.ContainerState{
+								Running: &corev1.ContainerStateRunning{},
+							},
+						},
+					},
+				},
+			},
+			expected: "unknown error",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := extractPodFailureMessage(tt.pod)
+			if result != tt.expected {
+				t.Errorf("extractPodFailureMessage() = %q, want %q", result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestHandleInProgress_PodSucceeded(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	du := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-du",
+			Namespace: "openshift-adp",
+			Annotations: map[string]string{
+				common.AnnotationVMName:      "test-vm",
+				common.AnnotationVMNamespace: "test-ns",
+			},
+		},
+		Spec: velerov2alpha1.DataUploadSpec{
+			DataMover: common.DataMoverKubeVirt,
+		},
+		Status: velerov2alpha1.DataUploadStatus{
+			Phase: velerov2alpha1.DataUploadPhaseInProgress,
+		},
+	}
+
+	// Create a succeeded datamover pod
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      common.DatamoverPodNamePrefix + du.Name,
+			Namespace: "openshift-adp",
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodSucceeded,
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(du, pod).
+		Build()
+
+	r := &KubeVirtDataUploadReconciler{
+		Client:        fakeClient,
+		Scheme:        scheme,
+		Log:           logr.Discard(),
+		OADPNamespace: "openshift-adp",
+	}
+
+	result, err := r.handleInProgress(context.Background(), logr.Discard(), du)
+
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	if result.RequeueAfter != 0 {
+		t.Errorf("expected no requeue when pod succeeded, got RequeueAfter=%v", result.RequeueAfter)
+	}
+
+	// Verify phase transitioned to Completed
+	updatedDU := &velerov2alpha1.DataUpload{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{
+		Name:      du.Name,
+		Namespace: du.Namespace,
+	}, updatedDU); err != nil {
+		t.Fatalf("failed to get updated DataUpload: %v", err)
+	}
+
+	if updatedDU.Status.Phase != velerov2alpha1.DataUploadPhaseCompleted {
+		t.Errorf("expected phase=%s, got phase=%s", velerov2alpha1.DataUploadPhaseCompleted, updatedDU.Status.Phase)
+	}
+}
+
+func TestHandleInProgress_PodFailed(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	du := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-du",
+			Namespace: "openshift-adp",
+			Annotations: map[string]string{
+				common.AnnotationVMName:      "test-vm",
+				common.AnnotationVMNamespace: "test-ns",
+			},
+		},
+		Spec: velerov2alpha1.DataUploadSpec{
+			DataMover: common.DataMoverKubeVirt,
+		},
+		Status: velerov2alpha1.DataUploadStatus{
+			Phase: velerov2alpha1.DataUploadPhaseInProgress,
+		},
+	}
+
+	// Create a failed datamover pod
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      common.DatamoverPodNamePrefix + du.Name,
+			Namespace: "openshift-adp",
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodFailed,
+			ContainerStatuses: []corev1.ContainerStatus{
+				{
+					Name: "uploader",
+					State: corev1.ContainerState{
+						Terminated: &corev1.ContainerStateTerminated{
+							Message: "S3 upload failed: access denied",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(du, pod).
+		Build()
+
+	r := &KubeVirtDataUploadReconciler{
+		Client:        fakeClient,
+		Scheme:        scheme,
+		Log:           logr.Discard(),
+		OADPNamespace: "openshift-adp",
+	}
+
+	result, err := r.handleInProgress(context.Background(), logr.Discard(), du)
+
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	if result.RequeueAfter != 0 {
+		t.Errorf("expected no requeue when pod failed, got RequeueAfter=%v", result.RequeueAfter)
+	}
+
+	// Verify phase transitioned to Failed
+	updatedDU := &velerov2alpha1.DataUpload{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{
+		Name:      du.Name,
+		Namespace: du.Namespace,
+	}, updatedDU); err != nil {
+		t.Fatalf("failed to get updated DataUpload: %v", err)
+	}
+
+	if updatedDU.Status.Phase != velerov2alpha1.DataUploadPhaseFailed {
+		t.Errorf("expected phase=%s, got phase=%s", velerov2alpha1.DataUploadPhaseFailed, updatedDU.Status.Phase)
+	}
+}
+
+func TestHandleInProgress_PodNotFound(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	du := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-du",
+			Namespace: "openshift-adp",
+			Annotations: map[string]string{
+				common.AnnotationVMName:      "test-vm",
+				common.AnnotationVMNamespace: "test-ns",
+			},
+		},
+		Spec: velerov2alpha1.DataUploadSpec{
+			DataMover: common.DataMoverKubeVirt,
+		},
+		Status: velerov2alpha1.DataUploadStatus{
+			Phase: velerov2alpha1.DataUploadPhaseInProgress,
+		},
+	}
+
+	// No pod exists
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(du).
+		Build()
+
+	r := &KubeVirtDataUploadReconciler{
+		Client:        fakeClient,
+		Scheme:        scheme,
+		Log:           logr.Discard(),
+		OADPNamespace: "openshift-adp",
+	}
+
+	result, err := r.handleInProgress(context.Background(), logr.Discard(), du)
+
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	if result.RequeueAfter != 0 {
+		t.Errorf("expected no requeue when pod not found, got RequeueAfter=%v", result.RequeueAfter)
+	}
+
+	// Verify phase transitioned to Failed
+	updatedDU := &velerov2alpha1.DataUpload{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{
+		Name:      du.Name,
+		Namespace: du.Namespace,
+	}, updatedDU); err != nil {
+		t.Fatalf("failed to get updated DataUpload: %v", err)
+	}
+
+	if updatedDU.Status.Phase != velerov2alpha1.DataUploadPhaseFailed {
+		t.Errorf("expected phase=%s, got phase=%s", velerov2alpha1.DataUploadPhaseFailed, updatedDU.Status.Phase)
+	}
+}
+
+func TestCleanupDatamoverResources(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	du := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-du",
+			Namespace: "openshift-adp",
+			UID:       types.UID("test-uid"),
+		},
+		Spec: velerov2alpha1.DataUploadSpec{
+			DataMover: common.DataMoverKubeVirt,
+		},
+	}
+
+	// Create resources to be cleaned up
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      common.DatamoverPodNamePrefix + du.Name,
+			Namespace: "openshift-adp",
+		},
+	}
+
+	reboundPVC := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      common.ReboundPVCNamePrefix + du.Name,
+			Namespace: "openshift-adp",
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceStorage: resource.MustParse("1Gi"),
+				},
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(du, pod, reboundPVC).
+		Build()
+
+	r := &KubeVirtDataUploadReconciler{
+		Client:        fakeClient,
+		Scheme:        scheme,
+		Log:           logr.Discard(),
+		OADPNamespace: "openshift-adp",
+	}
+
+	// Call cleanup
+	r.cleanupDatamoverResources(context.Background(), logr.Discard(), du, "openshift-adp")
+
+	// Verify pod was deleted
+	deletedPod := &corev1.Pod{}
+	err := fakeClient.Get(context.Background(), types.NamespacedName{
+		Name:      pod.Name,
+		Namespace: pod.Namespace,
+	}, deletedPod)
+	if err == nil {
+		t.Error("expected pod to be deleted")
+	}
+
+	// Verify rebound PVC was deleted
+	deletedPVC := &corev1.PersistentVolumeClaim{}
+	err = fakeClient.Get(context.Background(), types.NamespacedName{
+		Name:      reboundPVC.Name,
+		Namespace: reboundPVC.Namespace,
+	}, deletedPVC)
+	if err == nil {
+		t.Error("expected rebound PVC to be deleted")
+	}
+}
+
+func TestGetDatamoverPodName(t *testing.T) {
+	du := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "my-dataupload",
+		},
+	}
+
+	expected := common.DatamoverPodNamePrefix + "my-dataupload"
+	result := getDatamoverPodName(du)
+
+	if result != expected {
+		t.Errorf("getDatamoverPodName() = %q, want %q", result, expected)
+	}
+}
