@@ -162,7 +162,7 @@ func uploadQcow2Files(ctx context.Context, store *S3ObjectStore, config *Uploade
 		if err != nil {
 			return fmt.Errorf("failed to open file %s: %w", path, err)
 		}
-		defer file.Close()
+		defer func() { _ = file.Close() }()
 
 		fmt.Printf("Uploading %s (%d bytes) to %s\n", d.Name(), info.Size(), objectPath)
 
@@ -221,8 +221,8 @@ func updateVMIndex(ctx context.Context, store *S3ObjectStore, config *UploaderCo
 	} else {
 		// Index doesn't exist, create new
 		vmIndex = VMIndex{
-			VMName:    config.VMName,
-			Namespace: config.VMNamespace,
+			VMName:      config.VMName,
+			Namespace:   config.VMNamespace,
 			Checkpoints: []CheckpointEntry{},
 		}
 	}

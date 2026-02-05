@@ -75,21 +75,21 @@ func TestExtractDiskName(t *testing.T) {
 func TestLoadConfigFromEnv(t *testing.T) {
 	// Save original env and restore after test
 	originalEnv := map[string]string{
-		EnvBSLBucket:    os.Getenv(EnvBSLBucket),
-		EnvVMName:       os.Getenv(EnvVMName),
-		EnvVMNamespace:  os.Getenv(EnvVMNamespace),
-		EnvBSLProvider:  os.Getenv(EnvBSLProvider),
-		EnvBSLPrefix:    os.Getenv(EnvBSLPrefix),
-		EnvBSLRegion:    os.Getenv(EnvBSLRegion),
-		EnvBackupType:   os.Getenv(EnvBackupType),
+		EnvBSLBucket:     os.Getenv(EnvBSLBucket),
+		EnvVMName:        os.Getenv(EnvVMName),
+		EnvVMNamespace:   os.Getenv(EnvVMNamespace),
+		EnvBSLProvider:   os.Getenv(EnvBSLProvider),
+		EnvBSLPrefix:     os.Getenv(EnvBSLPrefix),
+		EnvBSLRegion:     os.Getenv(EnvBSLRegion),
+		EnvBackupType:    os.Getenv(EnvBackupType),
 		EnvSourcePVCPath: os.Getenv(EnvSourcePVCPath),
 	}
 	defer func() {
 		for k, v := range originalEnv {
 			if v == "" {
-				os.Unsetenv(k)
+				_ = os.Unsetenv(k)
 			} else {
-				os.Setenv(k, v)
+				_ = os.Setenv(k, v)
 			}
 		}
 	}()
@@ -190,11 +190,11 @@ func TestLoadConfigFromEnv(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			// Clear all env vars first
 			for k := range originalEnv {
-				os.Unsetenv(k)
+				_ = os.Unsetenv(k)
 			}
 			// Set test env vars
 			for k, v := range tt.envVars {
-				os.Setenv(k, v)
+				_ = os.Setenv(k, v)
 			}
 
 			cfg, err := LoadConfigFromEnv()
@@ -232,7 +232,12 @@ func TestUpdateVMIndex(t *testing.T) {
 				VeleroBackupName: "backup-001",
 			},
 			files: []CheckpointFile{
-				{Filename: "vmb-test-disk1.qcow2", DiskName: "disk1", Size: 1024, ObjectPath: "checkpoints/test-ns/test-vm/cp-001/vmb-test-disk1.qcow2"},
+				{
+					Filename:   "vmb-test-disk1.qcow2",
+					DiskName:   "disk1",
+					Size:       1024,
+					ObjectPath: "checkpoints/test-ns/test-vm/cp-001/vmb-test-disk1.qcow2",
+				},
 			},
 			existingIndex: nil,
 			expectError:   false,
@@ -267,7 +272,12 @@ func TestUpdateVMIndex(t *testing.T) {
 				VeleroBackupName: "backup-002",
 			},
 			files: []CheckpointFile{
-				{Filename: "vmb-test-2-disk1.qcow2", DiskName: "disk1", Size: 512, ObjectPath: "checkpoints/test-ns/test-vm/cp-002/vmb-test-2-disk1.qcow2"},
+				{
+					Filename:   "vmb-test-2-disk1.qcow2",
+					DiskName:   "disk1",
+					Size:       512,
+					ObjectPath: "checkpoints/test-ns/test-vm/cp-002/vmb-test-2-disk1.qcow2",
+				},
 			},
 			existingIndex: &VMIndex{
 				VMName:    "test-vm",
@@ -306,7 +316,12 @@ func TestUpdateVMIndex(t *testing.T) {
 				VeleroBackupName: "backup-001",
 			},
 			files: []CheckpointFile{
-				{Filename: "vmb-test-disk1.qcow2", DiskName: "disk1", Size: 2048, ObjectPath: "checkpoints/test-ns/test-vm/cp-001/vmb-test-disk1.qcow2"},
+				{
+					Filename:   "vmb-test-disk1.qcow2",
+					DiskName:   "disk1",
+					Size:       2048,
+					ObjectPath: "checkpoints/test-ns/test-vm/cp-001/vmb-test-disk1.qcow2",
+				},
 			},
 			existingIndex: &VMIndex{
 				VMName:    "test-vm",
@@ -344,8 +359,9 @@ func TestUpdateVMIndex(t *testing.T) {
 			// Set up existing index if provided
 			if tt.existingIndex != nil {
 				data, _ := json.Marshal(tt.existingIndex)
-				indexPath := fmt.Sprintf("checkpoints/%s/%s/index.json", tt.config.VMNamespace, tt.config.VMName)
-				store.PutObjectBytes(indexPath, data)
+				indexPath := fmt.Sprintf("checkpoints/%s/%s/index.json",
+					tt.config.VMNamespace, tt.config.VMName)
+				_ = store.PutObjectBytes(indexPath, data)
 			}
 
 			// Create a mock S3ObjectStore wrapper for the function
@@ -361,7 +377,7 @@ func TestUpdateVMIndex(t *testing.T) {
 				var vmIndex VMIndex
 				data, err := store.GetObjectBytes(indexPath)
 				if err == nil {
-					json.Unmarshal(data, &vmIndex)
+					_ = json.Unmarshal(data, &vmIndex)
 				} else {
 					vmIndex = VMIndex{
 						VMName:      tt.config.VMName,
@@ -408,7 +424,7 @@ func TestUpdateVMIndex(t *testing.T) {
 				}
 
 				indexData, _ := json.Marshal(vmIndex)
-				store.PutObjectBytes(indexPath, indexData)
+				_ = store.PutObjectBytes(indexPath, indexData)
 
 				tt.validateResult(t, store)
 			}
@@ -510,14 +526,17 @@ func TestUpdateBackupManifests(t *testing.T) {
 			store := NewMockObjectStore("test-bucket", "")
 
 			// Set up VM index
-			indexPath := fmt.Sprintf("checkpoints/%s/%s/index.json", tt.config.VMNamespace, tt.config.VMName)
+			indexPath := fmt.Sprintf("checkpoints/%s/%s/index.json",
+				tt.config.VMNamespace, tt.config.VMName)
 			indexData, _ := json.Marshal(tt.vmIndex)
-			store.PutObjectBytes(indexPath, indexData)
+			_ = store.PutObjectBytes(indexPath, indexData)
 
 			// Simulate updateBackupManifests logic
 			chain := buildCheckpointChain(tt.vmIndex.Checkpoints, tt.config.CheckpointName)
 
 			// Create backup manifest
+			manifestPath := fmt.Sprintf("manifests/%s/%s-%s.json",
+				tt.config.VeleroBackupName, tt.config.VMNamespace, tt.config.VMName)
 			backupManifest := BackupManifest{
 				BackupName: tt.config.VeleroBackupName,
 				VMs: []VMBackupReference{
@@ -525,12 +544,13 @@ func TestUpdateBackupManifests(t *testing.T) {
 						Name:         tt.config.VMName,
 						Namespace:    tt.config.VMNamespace,
 						CheckpointID: tt.config.CheckpointName,
-						ManifestPath: fmt.Sprintf("manifests/%s/%s-%s.json", tt.config.VeleroBackupName, tt.config.VMNamespace, tt.config.VMName),
+						ManifestPath: manifestPath,
 					},
 				},
 			}
 			backupManifestData, _ := json.Marshal(backupManifest)
-			store.PutObjectBytes(fmt.Sprintf("manifests/%s/index.json", tt.config.VeleroBackupName), backupManifestData)
+			backupIndexPath := fmt.Sprintf("manifests/%s/index.json", tt.config.VeleroBackupName)
+			_ = store.PutObjectBytes(backupIndexPath, backupManifestData)
 
 			// Create VM manifest
 			vmManifest := VMBackupManifest{
@@ -540,7 +560,7 @@ func TestUpdateBackupManifests(t *testing.T) {
 				BackupName:      tt.config.VeleroBackupName,
 			}
 			vmManifestData, _ := json.Marshal(vmManifest)
-			store.PutObjectBytes(fmt.Sprintf("manifests/%s/%s-%s.json", tt.config.VeleroBackupName, tt.config.VMNamespace, tt.config.VMName), vmManifestData)
+			_ = store.PutObjectBytes(manifestPath, vmManifestData)
 
 			tt.validateResult(t, store)
 		})
