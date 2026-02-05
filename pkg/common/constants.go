@@ -42,6 +42,27 @@ const (
 	// LabelDataUploadUID is the label key for the DataUpload UID.
 	// Used for precise ownership tracking.
 	LabelDataUploadUID = "velero.io/dataupload-uid"
+
+	// LabelDatamoverPod identifies the type of datamover pod.
+	LabelDatamoverPod = "kubevirt-datamover.io/pod-type"
+
+	// LabelVeleroBackupName is the label key for the Velero backup name.
+	LabelVeleroBackupName = "velero.io/backup-name"
+)
+
+// Naming conventions for resources
+const (
+	// DatamoverPodNamePrefix is the prefix for datamover pod names.
+	DatamoverPodNamePrefix = "kubevirt-dm-"
+
+	// TempPVCNamePrefix is the prefix for temporary PVC names.
+	TempPVCNamePrefix = "kubevirt-backup-"
+
+	// ReboundPVCNamePrefix is the prefix for PVCs created in OADP namespace after PV rebinding.
+	ReboundPVCNamePrefix = "kubevirt-dm-pvc-"
+
+	// VMBackupNamePrefix is the prefix for VirtualMachineBackup names.
+	VMBackupNamePrefix = "vmb-"
 )
 
 // DataMover identifier

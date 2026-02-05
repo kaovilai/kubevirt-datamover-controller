@@ -1,0 +1,325 @@
+/*
+Copyright 2026.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controller
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"time"
+
+	jsonpatch "github.com/evanphx/json-patch/v5"
+	"github.com/go-logr/logr"
+	"github.com/migtools/kubevirt-datamover-controller/pkg/common"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+)
+
+const (
+	// PVRebindTimeout is the maximum time to wait for PV rebinding operations
+	PVRebindTimeout = 2 * time.Minute
+
+	// PVRebindPollInterval is the interval between polling for PV binding status
+	PVRebindPollInterval = 2 * time.Second
+
+	// KubeAnnBoundByController is the annotation added by Kubernetes PV controller
+	KubeAnnBoundByController = "pv.kubernetes.io/bound-by-controller"
+)
+
+// PVRebindResult contains the result of a PV rebind operation
+type PVRebindResult struct {
+	// NewPVCName is the name of the new PVC in the target namespace
+	NewPVCName string
+	// NewPVCNamespace is the namespace of the new PVC
+	NewPVCNamespace string
+	// PVName is the name of the PV that was rebound
+	PVName string
+	// OriginalReclaimPolicy is the original reclaim policy (to restore later)
+	OriginalReclaimPolicy corev1.PersistentVolumeReclaimPolicy
+}
+
+// rebindPVToNamespace rebinds a PV from a PVC in the source namespace to a new PVC in the target namespace.
+// This follows the same pattern as Velero's generic restore exposer, using Patch operations
+// to avoid conflicts with Kubernetes PV controller.
+//
+// Steps:
+// 1. Get the PV bound to the source PVC
+// 2. Set PV reclaim policy to Retain (using Patch)
+// 3. Delete the source PVC (PV stays due to Retain)
+// 4. Create new PVC in target namespace with volumeName and selector
+// 5. Reset PV binding: set claimRef to new PVC, add labels (using Patch)
+// 6. Wait for PV to bind to new PVC
+func (r *KubeVirtDataUploadReconciler) rebindPVToNamespace(
+	ctx context.Context,
+	logger logr.Logger,
+	sourcePVCName string,
+	sourceNamespace string,
+	targetNamespace string,
+	dataUploadName string,
+) (*PVRebindResult, error) {
+	// Step 1: Get the source PVC and its bound PV
+	sourcePVC := &corev1.PersistentVolumeClaim{}
+	if err := r.Get(ctx, types.NamespacedName{Name: sourcePVCName, Namespace: sourceNamespace}, sourcePVC); err != nil {
+		return nil, fmt.Errorf("failed to get source PVC %s/%s: %w", sourceNamespace, sourcePVCName, err)
+	}
+
+	if sourcePVC.Status.Phase != corev1.ClaimBound {
+		return nil, fmt.Errorf("source PVC %s/%s is not bound (phase: %s)", sourceNamespace, sourcePVCName, sourcePVC.Status.Phase)
+	}
+
+	pvName := sourcePVC.Spec.VolumeName
+	if pvName == "" {
+		return nil, fmt.Errorf("source PVC %s/%s has no volume name", sourceNamespace, sourcePVCName)
+	}
+
+	pv := &corev1.PersistentVolume{}
+	if err := r.Get(ctx, types.NamespacedName{Name: pvName}, pv); err != nil {
+		return nil, fmt.Errorf("failed to get PV %s: %w", pvName, err)
+	}
+
+	logger.Info("Found PV bound to source PVC", "pv", pvName, "sourcePVC", sourcePVCName)
+
+	// Step 2: Set PV reclaim policy to Retain using Patch
+	originalReclaimPolicy := pv.Spec.PersistentVolumeReclaimPolicy
+	if pv.Spec.PersistentVolumeReclaimPolicy != corev1.PersistentVolumeReclaimRetain {
+		if err := r.patchPVReclaimPolicy(ctx, pv, corev1.PersistentVolumeReclaimRetain); err != nil {
+			return nil, fmt.Errorf("failed to set PV %s reclaim policy to Retain: %w", pvName, err)
+		}
+		logger.Info("Set PV reclaim policy to Retain", "pv", pvName, "originalPolicy", originalReclaimPolicy)
+	}
+
+	// Step 3: Delete the source PVC
+	if err := r.Delete(ctx, sourcePVC); err != nil && !errors.IsNotFound(err) {
+		return nil, fmt.Errorf("failed to delete source PVC %s/%s: %w", sourceNamespace, sourcePVCName, err)
+	}
+	logger.Info("Deleted source PVC", "pvc", sourcePVCName, "namespace", sourceNamespace)
+
+	// Wait for PVC to be fully deleted
+	if err := r.waitForPVCDeletion(ctx, sourcePVCName, sourceNamespace); err != nil {
+		return nil, fmt.Errorf("failed waiting for source PVC deletion: %w", err)
+	}
+
+	// Step 4: Create new PVC in target namespace with volumeName and selector
+	labelKey := common.LabelDataUploadName
+	labelValue := dataUploadName
+	newPVCName := fmt.Sprintf("%s%s", common.ReboundPVCNamePrefix, dataUploadName)
+	newPVC := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      newPVCName,
+			Namespace: targetNamespace,
+			Labels: map[string]string{
+				common.LabelDataUploadName: dataUploadName,
+			},
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: sourcePVC.Spec.AccessModes,
+			Resources:   sourcePVC.Spec.Resources,
+			// Direct binding via volumeName
+			VolumeName: pvName,
+			// Label selector binding
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					labelKey: labelValue,
+				},
+			},
+			StorageClassName: sourcePVC.Spec.StorageClassName,
+			VolumeMode:       sourcePVC.Spec.VolumeMode,
+		},
+	}
+
+	if err := r.Create(ctx, newPVC); err != nil {
+		return nil, fmt.Errorf("failed to create new PVC %s/%s: %w", targetNamespace, newPVCName, err)
+	}
+	logger.Info("Created new PVC in target namespace", "pvc", newPVCName, "namespace", targetNamespace)
+
+	// Step 5: Reset PV binding using Patch (like Velero's ResetPVBinding)
+	// Re-fetch PV to get latest version
+	if err := r.Get(ctx, types.NamespacedName{Name: pvName}, pv); err != nil {
+		return nil, fmt.Errorf("failed to re-fetch PV %s: %w", pvName, err)
+	}
+
+	labels := map[string]string{labelKey: labelValue}
+	if err := r.patchPVBinding(ctx, pv, newPVC, labels); err != nil {
+		return nil, fmt.Errorf("failed to reset PV %s binding: %w", pvName, err)
+	}
+	logger.Info("Reset PV binding to new PVC", "pv", pvName, "newPVC", newPVCName, "namespace", targetNamespace)
+
+	// Step 6: Wait for PV to bind to new PVC
+	if err := r.waitForPVCBound(ctx, newPVCName, targetNamespace); err != nil {
+		return nil, fmt.Errorf("failed waiting for new PVC to bind: %w", err)
+	}
+	logger.Info("New PVC is bound to PV", "pvc", newPVCName, "pv", pvName)
+
+	return &PVRebindResult{
+		NewPVCName:            newPVCName,
+		NewPVCNamespace:       targetNamespace,
+		PVName:                pvName,
+		OriginalReclaimPolicy: originalReclaimPolicy,
+	}, nil
+}
+
+// patchPVReclaimPolicy patches a PV to set its reclaim policy (like Velero's SetPVReclaimPolicy)
+func (r *KubeVirtDataUploadReconciler) patchPVReclaimPolicy(ctx context.Context, pv *corev1.PersistentVolume, policy corev1.PersistentVolumeReclaimPolicy) error {
+	origBytes, err := json.Marshal(pv)
+	if err != nil {
+		return fmt.Errorf("error marshaling original PV: %w", err)
+	}
+
+	updated := pv.DeepCopy()
+	updated.Spec.PersistentVolumeReclaimPolicy = policy
+
+	updatedBytes, err := json.Marshal(updated)
+	if err != nil {
+		return fmt.Errorf("error marshaling updated PV: %w", err)
+	}
+
+	patchBytes, err := jsonpatch.CreateMergePatch(origBytes, updatedBytes)
+	if err != nil {
+		return fmt.Errorf("error creating merge patch for PV: %w", err)
+	}
+
+	return r.Patch(ctx, pv, client.RawPatch(types.MergePatchType, patchBytes))
+}
+
+// patchPVBinding patches a PV to reset its binding info (like Velero's ResetPVBinding)
+func (r *KubeVirtDataUploadReconciler) patchPVBinding(ctx context.Context, pv *corev1.PersistentVolume, pvc *corev1.PersistentVolumeClaim, labels map[string]string) error {
+	origBytes, err := json.Marshal(pv)
+	if err != nil {
+		return fmt.Errorf("error marshaling original PV: %w", err)
+	}
+
+	updated := pv.DeepCopy()
+	// Set claimRef to new PVC (without UID, like Velero)
+	updated.Spec.ClaimRef = &corev1.ObjectReference{
+		Kind:      "PersistentVolumeClaim",
+		Namespace: pvc.Namespace,
+		Name:      pvc.Name,
+	}
+	// Remove bound-by-controller annotation
+	if updated.Annotations != nil {
+		delete(updated.Annotations, KubeAnnBoundByController)
+	}
+	// Add labels for selector matching
+	if labels != nil {
+		if updated.Labels == nil {
+			updated.Labels = make(map[string]string)
+		}
+		for k, v := range labels {
+			updated.Labels[k] = v
+		}
+	}
+
+	updatedBytes, err := json.Marshal(updated)
+	if err != nil {
+		return fmt.Errorf("error marshaling updated PV: %w", err)
+	}
+
+	patchBytes, err := jsonpatch.CreateMergePatch(origBytes, updatedBytes)
+	if err != nil {
+		return fmt.Errorf("error creating merge patch for PV: %w", err)
+	}
+
+	return r.Patch(ctx, pv, client.RawPatch(types.MergePatchType, patchBytes))
+}
+
+// waitForPVCDeletion waits for a PVC to be fully deleted
+func (r *KubeVirtDataUploadReconciler) waitForPVCDeletion(ctx context.Context, pvcName, namespace string) error {
+	return wait.PollUntilContextTimeout(ctx, PVRebindPollInterval, PVRebindTimeout, true, func(ctx context.Context) (bool, error) {
+		pvc := &corev1.PersistentVolumeClaim{}
+		err := r.Get(ctx, types.NamespacedName{Name: pvcName, Namespace: namespace}, pvc)
+		if errors.IsNotFound(err) {
+			return true, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		return false, nil
+	})
+}
+
+// waitForPVCBound waits for a PVC to be bound
+func (r *KubeVirtDataUploadReconciler) waitForPVCBound(ctx context.Context, pvcName, namespace string) error {
+	return wait.PollUntilContextTimeout(ctx, PVRebindPollInterval, PVRebindTimeout, true, func(ctx context.Context) (bool, error) {
+		pvc := &corev1.PersistentVolumeClaim{}
+		if err := r.Get(ctx, types.NamespacedName{Name: pvcName, Namespace: namespace}, pvc); err != nil {
+			return false, err
+		}
+		return pvc.Status.Phase == corev1.ClaimBound, nil
+	})
+}
+
+// cleanupReboundPVCAndPV deletes the rebound PVC and PV after upload completes
+func (r *KubeVirtDataUploadReconciler) cleanupReboundPVCAndPV(
+	ctx context.Context,
+	logger logr.Logger,
+	pvcName string,
+	pvcNamespace string,
+) error {
+	// Get the PVC to find the PV name
+	pvc := &corev1.PersistentVolumeClaim{}
+	err := r.Get(ctx, types.NamespacedName{Name: pvcName, Namespace: pvcNamespace}, pvc)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			logger.V(1).Info("Rebound PVC already deleted", "pvc", pvcName)
+			return nil
+		}
+		return fmt.Errorf("failed to get rebound PVC %s/%s: %w", pvcNamespace, pvcName, err)
+	}
+
+	pvName := pvc.Spec.VolumeName
+
+	// Delete the PVC first
+	if err := r.Delete(ctx, pvc); err != nil && !errors.IsNotFound(err) {
+		return fmt.Errorf("failed to delete rebound PVC %s/%s: %w", pvcNamespace, pvcName, err)
+	}
+	logger.Info("Deleted rebound PVC", "pvc", pvcName, "namespace", pvcNamespace)
+
+	// Wait for PVC deletion
+	if err := r.waitForPVCDeletion(ctx, pvcName, pvcNamespace); err != nil {
+		logger.Error(err, "Timeout waiting for PVC deletion", "pvc", pvcName)
+		// Continue to try deleting PV anyway
+	}
+
+	// Delete the PV
+	if pvName != "" {
+		pv := &corev1.PersistentVolume{}
+		if err := r.Get(ctx, types.NamespacedName{Name: pvName}, pv); err != nil {
+			if errors.IsNotFound(err) {
+				logger.V(1).Info("PV already deleted", "pv", pvName)
+				return nil
+			}
+			return fmt.Errorf("failed to get PV %s: %w", pvName, err)
+		}
+
+		// Set reclaim policy to Delete to ensure underlying storage is cleaned up
+		if err := r.patchPVReclaimPolicy(ctx, pv, corev1.PersistentVolumeReclaimDelete); err != nil {
+			logger.Error(err, "Failed to set PV reclaim policy to Delete", "pv", pvName)
+			// Continue to try deleting anyway
+		}
+
+		if err := r.Delete(ctx, pv); err != nil && !errors.IsNotFound(err) {
+			return fmt.Errorf("failed to delete PV %s: %w", pvName, err)
+		}
+		logger.Info("Deleted PV", "pv", pvName)
+	}
+
+	return nil
+}

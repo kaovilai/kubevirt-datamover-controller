@@ -215,7 +215,7 @@ func TestReconcile(t *testing.T) {
 			expectError:     false,
 		},
 		{
-			name: "prepared phase transitions to inprogress",
+			name: "prepared phase without VM annotations fails",
 			dataUpload: &velerov2alpha1.DataUpload{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "test-du",
@@ -228,8 +228,8 @@ func TestReconcile(t *testing.T) {
 					Phase: velerov2alpha1.DataUploadPhasePrepared,
 				},
 			},
-			expectedRequeue: true,
-			expectedPhase:   velerov2alpha1.DataUploadPhaseInProgress,
+			expectedRequeue: false,
+			expectedPhase:   velerov2alpha1.DataUploadPhaseFailed,
 			expectError:     false,
 		},
 	}
@@ -733,6 +733,7 @@ func strPtr(s string) *string {
 func TestHandleInProgress(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
 
 	du := &velerov2alpha1.DataUpload{
 		ObjectMeta: metav1.ObjectMeta{
@@ -747,9 +748,20 @@ func TestHandleInProgress(t *testing.T) {
 		},
 	}
 
+	// Create a running datamover pod in the OADP namespace
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      common.DatamoverPodNamePrefix + du.Name,
+			Namespace: "openshift-adp",
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+		},
+	}
+
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(du).
+		WithObjects(du, pod).
 		Build()
 
 	r := &KubeVirtDataUploadReconciler{
@@ -764,10 +776,9 @@ func TestHandleInProgress(t *testing.T) {
 	if err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
-	// handleInProgress is a placeholder for Phase 3
-	// Currently returns empty result (no requeue)
-	if result.RequeueAfter > 0 {
-		t.Errorf("expected no requeue from handleInProgress (not yet implemented), got RequeueAfter=%v", result.RequeueAfter)
+	// When pod is running, should requeue to check again
+	if result.RequeueAfter != RequeueAfterShort {
+		t.Errorf("expected RequeueAfter=%v when pod is running, got %v", RequeueAfterShort, result.RequeueAfter)
 	}
 }
 
