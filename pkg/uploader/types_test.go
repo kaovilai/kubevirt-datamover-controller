@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+//nolint:goconst // Test files use repeated string literals for readability
 package uploader
 
 import (
@@ -26,7 +27,7 @@ func TestCheckpointEntryJSONSerialization(t *testing.T) {
 	tests := []struct {
 		name       string
 		entry      CheckpointEntry
-		expectJSON map[string]interface{}
+		expectJSON map[string]any
 	}{
 		{
 			name: "full backup checkpoint",
@@ -46,12 +47,12 @@ func TestCheckpointEntryJSONSerialization(t *testing.T) {
 				PVCs:         []string{"disk1"},
 				ReferencedBy: []string{"backup-001"},
 			},
-			expectJSON: map[string]interface{}{
+			expectJSON: map[string]any{
 				"id":           "cp-001",
 				"type":         "full",
 				"vmBackup":     "vmb-test",
-				"pvcs":         []interface{}{"disk1"},
-				"referencedBy": []interface{}{"backup-001"},
+				"pvcs":         []any{"disk1"},
+				"referencedBy": []any{"backup-001"},
 			},
 		},
 		{
@@ -73,13 +74,13 @@ func TestCheckpointEntryJSONSerialization(t *testing.T) {
 				PVCs:         []string{"disk1"},
 				ReferencedBy: []string{"backup-002"},
 			},
-			expectJSON: map[string]interface{}{
+			expectJSON: map[string]any{
 				"id":           "cp-002",
 				"type":         "incremental",
 				"parent":       "cp-001",
 				"vmBackup":     "vmb-test-2",
-				"pvcs":         []interface{}{"disk1"},
-				"referencedBy": []interface{}{"backup-002"},
+				"pvcs":         []any{"disk1"},
+				"referencedBy": []any{"backup-002"},
 			},
 		},
 	}
@@ -93,7 +94,7 @@ func TestCheckpointEntryJSONSerialization(t *testing.T) {
 			}
 
 			// Parse JSON back to map
-			var result map[string]interface{}
+			var result map[string]any
 			if err := json.Unmarshal(data, &result); err != nil {
 				t.Fatalf("failed to unmarshal: %v", err)
 			}
@@ -112,8 +113,8 @@ func TestCheckpointEntryJSONSerialization(t *testing.T) {
 					if actual != exp {
 						t.Errorf("field %q = %v, want %v", key, actual, exp)
 					}
-				case []interface{}:
-					actualSlice, ok := actual.([]interface{})
+				case []any:
+					actualSlice, ok := actual.([]any)
 					if !ok {
 						t.Errorf("field %q is not a slice", key)
 						continue
@@ -150,7 +151,7 @@ func TestVMIndexJSONSerialization(t *testing.T) {
 		t.Fatalf("failed to marshal VMIndex: %v", err)
 	}
 
-	var result map[string]interface{}
+	var result map[string]any
 	if err := json.Unmarshal(data, &result); err != nil {
 		t.Fatalf("failed to unmarshal: %v", err)
 	}
@@ -163,7 +164,7 @@ func TestVMIndexJSONSerialization(t *testing.T) {
 		t.Errorf("namespace = %v, want %v", result["namespace"], "test-ns")
 	}
 
-	checkpoints, ok := result["checkpoints"].([]interface{})
+	checkpoints, ok := result["checkpoints"].([]any)
 	if !ok {
 		t.Fatal("checkpoints is not a slice")
 	}
@@ -191,7 +192,7 @@ func TestBackupManifestJSONSerialization(t *testing.T) {
 		t.Fatalf("failed to marshal BackupManifest: %v", err)
 	}
 
-	var result map[string]interface{}
+	var result map[string]any
 	if err := json.Unmarshal(data, &result); err != nil {
 		t.Fatalf("failed to unmarshal: %v", err)
 	}
@@ -201,7 +202,7 @@ func TestBackupManifestJSONSerialization(t *testing.T) {
 		t.Errorf("backupName = %v, want %v", result["backupName"], "velero-backup-001")
 	}
 
-	vms, ok := result["vms"].([]interface{})
+	vms, ok := result["vms"].([]any)
 	if !ok {
 		t.Fatal("vms is not a slice")
 	}
@@ -227,7 +228,7 @@ func TestVMBackupManifestJSONSerialization(t *testing.T) {
 		t.Fatalf("failed to marshal VMBackupManifest: %v", err)
 	}
 
-	var result map[string]interface{}
+	var result map[string]any
 	if err := json.Unmarshal(data, &result); err != nil {
 		t.Fatalf("failed to unmarshal: %v", err)
 	}
@@ -243,7 +244,7 @@ func TestVMBackupManifestJSONSerialization(t *testing.T) {
 		t.Errorf("backupName = %v, want %v", result["backupName"], "velero-backup-001")
 	}
 
-	chain, ok := result["checkpointChain"].([]interface{})
+	chain, ok := result["checkpointChain"].([]any)
 	if !ok {
 		t.Fatal("checkpointChain is not a slice")
 	}
@@ -265,7 +266,7 @@ func TestCheckpointFileJSONSerialization(t *testing.T) {
 		t.Fatalf("failed to marshal CheckpointFile: %v", err)
 	}
 
-	var result map[string]interface{}
+	var result map[string]any
 	if err := json.Unmarshal(data, &result); err != nil {
 		t.Fatalf("failed to unmarshal: %v", err)
 	}

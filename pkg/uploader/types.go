@@ -88,6 +88,12 @@ const (
 	DefaultCredentialsPath = "/credentials/cloud"
 )
 
+// Backup type values
+const (
+	BackupTypeFull        = "full"
+	BackupTypeIncremental = "incremental"
+)
+
 // UploaderConfig holds configuration loaded from environment variables.
 type UploaderConfig struct {
 	// BSL configuration

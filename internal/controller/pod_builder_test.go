@@ -24,6 +24,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 )
 
+//nolint:gocyclo,goconst // Table-driven test with many validation cases
 func TestBuildDatamoverPod(t *testing.T) {
 	tests := []struct {
 		name     string

@@ -129,7 +129,7 @@ func LoadConfigFromEnv() (*UploaderConfig, error) {
 }
 
 // uploadQcow2Files walks the source path and uploads all qcow2 files.
-func uploadQcow2Files(ctx context.Context, store *S3ObjectStore, config *UploaderConfig) ([]CheckpointFile, error) {
+func uploadQcow2Files(_ context.Context, store *S3ObjectStore, config *UploaderConfig) ([]CheckpointFile, error) {
 	var files []CheckpointFile
 
 	err := filepath.WalkDir(config.SourcePVCPath, func(path string, d fs.DirEntry, err error) error {
@@ -207,7 +207,7 @@ func extractDiskName(filename string) string {
 }
 
 // updateVMIndex creates or updates the per-VM index.json file.
-func updateVMIndex(ctx context.Context, store *S3ObjectStore, config *UploaderConfig, files []CheckpointFile) error {
+func updateVMIndex(_ context.Context, store *S3ObjectStore, config *UploaderConfig, files []CheckpointFile) error {
 	indexPath := fmt.Sprintf("checkpoints/%s/%s/index.json", config.VMNamespace, config.VMName)
 
 	// Try to load existing index
@@ -253,7 +253,7 @@ func updateVMIndex(ctx context.Context, store *S3ObjectStore, config *UploaderCo
 	}
 
 	// For incremental backups, set parent checkpoint
-	if strings.ToLower(config.BackupType) == "incremental" && len(vmIndex.Checkpoints) > 0 {
+	if strings.ToLower(config.BackupType) == BackupTypeIncremental && len(vmIndex.Checkpoints) > 0 {
 		// Use the most recent checkpoint as parent
 		checkpoint.Parent = vmIndex.Checkpoints[len(vmIndex.Checkpoints)-1].ID
 	}
@@ -288,7 +288,7 @@ func updateVMIndex(ctx context.Context, store *S3ObjectStore, config *UploaderCo
 }
 
 // updateBackupManifests creates/updates the per-backup manifest files.
-func updateBackupManifests(ctx context.Context, store *S3ObjectStore, config *UploaderConfig) error {
+func updateBackupManifests(_ context.Context, store *S3ObjectStore, config *UploaderConfig) error {
 	if config.VeleroBackupName == "" {
 		fmt.Println("Warning: no Velero backup name provided, skipping manifest update")
 		return nil

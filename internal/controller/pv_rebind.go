@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"time"
 
 	jsonpatch "github.com/evanphx/json-patch/v5"
@@ -222,9 +223,7 @@ func (r *KubeVirtDataUploadReconciler) patchPVBinding(ctx context.Context, pv *c
 		if updated.Labels == nil {
 			updated.Labels = make(map[string]string)
 		}
-		for k, v := range labels {
-			updated.Labels[k] = v
-		}
+		maps.Copy(updated.Labels, labels)
 	}
 
 	updatedBytes, err := json.Marshal(updated)

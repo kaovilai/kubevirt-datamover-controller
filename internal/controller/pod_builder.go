@@ -17,6 +17,8 @@ limitations under the License.
 package controller
 
 import (
+	"maps"
+
 	"github.com/migtools/kubevirt-datamover-controller/pkg/common"
 	"github.com/migtools/kubevirt-datamover-controller/pkg/uploader"
 	corev1 "k8s.io/api/core/v1"
@@ -70,9 +72,7 @@ func buildDatamoverPod(config *DatamoverPodConfig) *corev1.Pod {
 		common.LabelDataUploadName: config.DataUploadName,
 		common.LabelDataUploadUID:  config.DataUploadUID,
 	}
-	for k, v := range config.Labels {
-		labels[k] = v
-	}
+	maps.Copy(labels, config.Labels)
 
 	// Build environment variables
 	envVars := []corev1.EnvVar{

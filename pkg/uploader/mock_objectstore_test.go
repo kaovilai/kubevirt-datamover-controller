@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"maps"
 	"strings"
 	"sync"
 	"time"
@@ -117,15 +118,14 @@ func (m *MockObjectStore) ListCommonPrefixes(bucket, prefix, delimiter string) (
 	prefixSet := make(map[string]bool)
 
 	for key := range m.objects {
-		if strings.HasPrefix(key, fullPrefix) {
-			remainder := strings.TrimPrefix(key, fullPrefix)
+		if remainder, found := strings.CutPrefix(key, fullPrefix); found {
 			if idx := strings.Index(remainder, delimiter); idx >= 0 {
 				prefixSet[fullPrefix+remainder[:idx+1]] = true
 			}
 		}
 	}
 
-	var prefixes []string
+	prefixes := make([]string, 0, len(prefixSet))
 	for p := range prefixSet {
 		prefixes = append(prefixes, p)
 	}
@@ -187,8 +187,6 @@ func (m *MockObjectStore) GetAllObjects() map[string][]byte {
 	defer m.mu.RUnlock()
 
 	result := make(map[string][]byte)
-	for k, v := range m.objects {
-		result[k] = v
-	}
+	maps.Copy(result, m.objects)
 	return result
 }

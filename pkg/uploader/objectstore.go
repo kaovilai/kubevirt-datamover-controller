@@ -282,8 +282,7 @@ func loadAWSCredentialsFromFile(path string) (aws.CredentialsProvider, error) {
 
 	var accessKeyID, secretAccessKey string
 
-	lines := strings.Split(string(data), "\n")
-	for _, line := range lines {
+	for line := range strings.SplitSeq(string(data), "\n") {
 		line = strings.TrimSpace(line)
 		if strings.HasPrefix(line, "aws_access_key_id") {
 			parts := strings.SplitN(line, "=", 2)
@@ -307,26 +306,26 @@ func loadAWSCredentialsFromFile(path string) (aws.CredentialsProvider, error) {
 
 // InitObjectStore creates an ObjectStore based on the provider type.
 // Returns a velero.ObjectStore implementation.
-func InitObjectStore(config *UploaderConfig) (velero.ObjectStore, error) {
-	switch strings.ToLower(config.BSLProvider) {
+func InitObjectStore(cfg *UploaderConfig) (velero.ObjectStore, error) {
+	switch strings.ToLower(cfg.BSLProvider) {
 	case "aws", "":
 		return NewS3ObjectStore(
-			config.BSLBucket,
-			config.BSLPrefix,
-			config.BSLRegion,
-			config.CredentialsFile,
+			cfg.BSLBucket,
+			cfg.BSLPrefix,
+			cfg.BSLRegion,
+			cfg.CredentialsFile,
 		)
 	case "gcp":
-		return nil, fmt.Errorf("GCP object store not yet implemented")
+		return nil, fmt.Errorf("gcp object store not yet implemented")
 	case "azure":
-		return nil, fmt.Errorf("Azure object store not yet implemented")
+		return nil, fmt.Errorf("azure object store not yet implemented")
 	default:
 		// Try S3-compatible for unknown providers
 		return NewS3ObjectStore(
-			config.BSLBucket,
-			config.BSLPrefix,
-			config.BSLRegion,
-			config.CredentialsFile,
+			cfg.BSLBucket,
+			cfg.BSLPrefix,
+			cfg.BSLRegion,
+			cfg.CredentialsFile,
 		)
 	}
 }
