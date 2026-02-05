@@ -1,0 +1,332 @@
+/*
+Copyright 2026.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controller
+
+import (
+	"testing"
+
+	"github.com/migtools/kubevirt-datamover-controller/pkg/common"
+	"github.com/migtools/kubevirt-datamover-controller/pkg/uploader"
+	corev1 "k8s.io/api/core/v1"
+)
+
+func TestBuildDatamoverPod(t *testing.T) {
+	tests := []struct {
+		name     string
+		config   *DatamoverPodConfig
+		validate func(*testing.T, *corev1.Pod)
+	}{
+		{
+			name: "basic pod configuration",
+			config: &DatamoverPodConfig{
+				Name:                 "kubevirt-dm-test-du",
+				Namespace:            "test-ns",
+				Image:                "quay.io/test/datamover:latest",
+				ImagePullPolicy:      corev1.PullIfNotPresent,
+				BSLProvider:          "aws",
+				BSLBucket:            "test-bucket",
+				BSLPrefix:            "backups",
+				BSLRegion:            "us-east-1",
+				CredentialSecretName: "cloud-credentials",
+				CredentialSecretKey:  "cloud",
+				VMName:               "test-vm",
+				VMNamespace:          "vm-ns",
+				CheckpointName:       "checkpoint-001",
+				BackupType:           "full",
+				VeleroBackupName:     "backup-001",
+				DataUploadName:       "test-du",
+				DataUploadUID:        "uid-12345",
+				VMBName:              "vmb-test-du",
+				SourcePVCName:        "kubevirt-backup-test-du",
+			},
+			validate: func(t *testing.T, pod *corev1.Pod) {
+				// Verify pod metadata
+				if pod.Name != "kubevirt-dm-test-du" {
+					t.Errorf("pod name = %q, want %q", pod.Name, "kubevirt-dm-test-du")
+				}
+				if pod.Namespace != "test-ns" {
+					t.Errorf("pod namespace = %q, want %q", pod.Namespace, "test-ns")
+				}
+
+				// Verify labels
+				if pod.Labels[common.LabelDatamoverPod] != "uploader" {
+					t.Errorf("label %s = %q, want %q", common.LabelDatamoverPod, pod.Labels[common.LabelDatamoverPod], "uploader")
+				}
+				if pod.Labels[common.LabelDataUploadName] != "test-du" {
+					t.Errorf("label %s = %q, want %q", common.LabelDataUploadName, pod.Labels[common.LabelDataUploadName], "test-du")
+				}
+
+				// Verify pod spec
+				if pod.Spec.RestartPolicy != corev1.RestartPolicyNever {
+					t.Errorf("restart policy = %q, want %q", pod.Spec.RestartPolicy, corev1.RestartPolicyNever)
+				}
+				if pod.Spec.ServiceAccountName != "velero" {
+					t.Errorf("service account = %q, want %q", pod.Spec.ServiceAccountName, "velero")
+				}
+
+				// Verify container
+				if len(pod.Spec.Containers) != 1 {
+					t.Fatalf("expected 1 container, got %d", len(pod.Spec.Containers))
+				}
+				container := pod.Spec.Containers[0]
+				if container.Name != "uploader" {
+					t.Errorf("container name = %q, want %q", container.Name, "uploader")
+				}
+				if container.Image != "quay.io/test/datamover:latest" {
+					t.Errorf("container image = %q, want %q", container.Image, "quay.io/test/datamover:latest")
+				}
+
+				// Verify command
+				if len(container.Command) != 2 || container.Command[0] != "/manager" || container.Command[1] != "upload" {
+					t.Errorf("container command = %v, want [/manager upload]", container.Command)
+				}
+			},
+		},
+		{
+			name: "environment variables are set correctly",
+			config: &DatamoverPodConfig{
+				Name:                 "test-pod",
+				Namespace:            "default",
+				Image:                "test-image",
+				BSLProvider:          "aws",
+				BSLBucket:            "my-bucket",
+				BSLPrefix:            "my-prefix",
+				BSLRegion:            "eu-west-1",
+				CredentialSecretName: "secret",
+				CredentialSecretKey:  "key",
+				VMName:               "my-vm",
+				VMNamespace:          "my-ns",
+				CheckpointName:       "cp-001",
+				BackupType:           "incremental",
+				VeleroBackupName:     "velero-backup",
+				DataUploadName:       "du-001",
+				DataUploadUID:        "uid-001",
+				VMBName:              "vmb-001",
+				SourcePVCName:        "pvc-001",
+			},
+			validate: func(t *testing.T, pod *corev1.Pod) {
+				container := pod.Spec.Containers[0]
+				envMap := make(map[string]string)
+				for _, env := range container.Env {
+					envMap[env.Name] = env.Value
+				}
+
+				expectedEnvs := map[string]string{
+					uploader.EnvBSLProvider:      "aws",
+					uploader.EnvBSLBucket:        "my-bucket",
+					uploader.EnvBSLPrefix:        "my-prefix",
+					uploader.EnvBSLRegion:        "eu-west-1",
+					uploader.EnvCredentialsFile:  uploader.DefaultCredentialsPath,
+					uploader.EnvVMName:           "my-vm",
+					uploader.EnvVMNamespace:      "my-ns",
+					uploader.EnvCheckpointName:   "cp-001",
+					uploader.EnvBackupType:       "incremental",
+					uploader.EnvVeleroBackupName: "velero-backup",
+					uploader.EnvSourcePVCPath:    uploader.DefaultSourcePVCPath,
+					uploader.EnvDataUploadName:   "du-001",
+					uploader.EnvDataUploadUID:    "uid-001",
+					uploader.EnvVMBName:          "vmb-001",
+				}
+
+				for key, expected := range expectedEnvs {
+					if envMap[key] != expected {
+						t.Errorf("env %s = %q, want %q", key, envMap[key], expected)
+					}
+				}
+			},
+		},
+		{
+			name: "volume mounts are configured correctly",
+			config: &DatamoverPodConfig{
+				Name:                 "test-pod",
+				Namespace:            "default",
+				Image:                "test-image",
+				CredentialSecretName: "cloud-creds",
+				CredentialSecretKey:  "credentials",
+				SourcePVCName:        "backup-pvc",
+			},
+			validate: func(t *testing.T, pod *corev1.Pod) {
+				container := pod.Spec.Containers[0]
+
+				// Verify volume mounts
+				if len(container.VolumeMounts) != 2 {
+					t.Fatalf("expected 2 volume mounts, got %d", len(container.VolumeMounts))
+				}
+
+				// Check backup-data mount
+				var backupMount, credsMount *corev1.VolumeMount
+				for i := range container.VolumeMounts {
+					switch container.VolumeMounts[i].Name {
+					case "backup-data":
+						backupMount = &container.VolumeMounts[i]
+					case "cloud-credentials":
+						credsMount = &container.VolumeMounts[i]
+					}
+				}
+
+				if backupMount == nil {
+					t.Fatal("backup-data volume mount not found")
+				}
+				if backupMount.MountPath != uploader.DefaultSourcePVCPath {
+					t.Errorf("backup-data mount path = %q, want %q", backupMount.MountPath, uploader.DefaultSourcePVCPath)
+				}
+				if !backupMount.ReadOnly {
+					t.Error("backup-data mount should be read-only")
+				}
+
+				if credsMount == nil {
+					t.Fatal("cloud-credentials volume mount not found")
+				}
+				if credsMount.MountPath != "/credentials" {
+					t.Errorf("cloud-credentials mount path = %q, want %q", credsMount.MountPath, "/credentials")
+				}
+				if !credsMount.ReadOnly {
+					t.Error("cloud-credentials mount should be read-only")
+				}
+
+				// Verify volumes
+				if len(pod.Spec.Volumes) != 2 {
+					t.Fatalf("expected 2 volumes, got %d", len(pod.Spec.Volumes))
+				}
+
+				var pvcVolume, secretVolume *corev1.Volume
+				for i := range pod.Spec.Volumes {
+					switch pod.Spec.Volumes[i].Name {
+					case "backup-data":
+						pvcVolume = &pod.Spec.Volumes[i]
+					case "cloud-credentials":
+						secretVolume = &pod.Spec.Volumes[i]
+					}
+				}
+
+				if pvcVolume == nil || pvcVolume.PersistentVolumeClaim == nil {
+					t.Fatal("backup-data PVC volume not found")
+				}
+				if pvcVolume.PersistentVolumeClaim.ClaimName != "backup-pvc" {
+					t.Errorf("PVC claim name = %q, want %q", pvcVolume.PersistentVolumeClaim.ClaimName, "backup-pvc")
+				}
+
+				if secretVolume == nil || secretVolume.Secret == nil {
+					t.Fatal("cloud-credentials secret volume not found")
+				}
+				if secretVolume.Secret.SecretName != "cloud-creds" {
+					t.Errorf("secret name = %q, want %q", secretVolume.Secret.SecretName, "cloud-creds")
+				}
+			},
+		},
+		{
+			name: "security context is configured correctly",
+			config: &DatamoverPodConfig{
+				Name:                 "test-pod",
+				Namespace:            "default",
+				Image:                "test-image",
+				CredentialSecretName: "secret",
+				CredentialSecretKey:  "key",
+				SourcePVCName:        "pvc",
+			},
+			validate: func(t *testing.T, pod *corev1.Pod) {
+				// Verify pod security context
+				if pod.Spec.SecurityContext == nil {
+					t.Fatal("pod security context is nil")
+				}
+				if pod.Spec.SecurityContext.RunAsUser == nil || *pod.Spec.SecurityContext.RunAsUser != 0 {
+					t.Error("pod should run as root (UID 0)")
+				}
+				if pod.Spec.SecurityContext.SELinuxOptions == nil || pod.Spec.SecurityContext.SELinuxOptions.Type != "spc_t" {
+					t.Error("pod should have SELinux type spc_t")
+				}
+
+				// Verify container security context
+				container := pod.Spec.Containers[0]
+				if container.SecurityContext == nil {
+					t.Fatal("container security context is nil")
+				}
+				if container.SecurityContext.ReadOnlyRootFilesystem == nil || !*container.SecurityContext.ReadOnlyRootFilesystem {
+					t.Error("container should have read-only root filesystem")
+				}
+			},
+		},
+		{
+			name: "custom labels are merged",
+			config: &DatamoverPodConfig{
+				Name:                 "test-pod",
+				Namespace:            "default",
+				Image:                "test-image",
+				DataUploadName:       "du-001",
+				DataUploadUID:        "uid-001",
+				CredentialSecretName: "secret",
+				CredentialSecretKey:  "key",
+				SourcePVCName:        "pvc",
+				Labels: map[string]string{
+					"custom-label":  "custom-value",
+					"another-label": "another-value",
+				},
+			},
+			validate: func(t *testing.T, pod *corev1.Pod) {
+				// Check custom labels are present
+				if pod.Labels["custom-label"] != "custom-value" {
+					t.Errorf("custom-label = %q, want %q", pod.Labels["custom-label"], "custom-value")
+				}
+				if pod.Labels["another-label"] != "another-value" {
+					t.Errorf("another-label = %q, want %q", pod.Labels["another-label"], "another-value")
+				}
+				// Check default labels are still present
+				if pod.Labels[common.LabelDatamoverPod] != "uploader" {
+					t.Errorf("default label missing: %s", common.LabelDatamoverPod)
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pod := buildDatamoverPod(tt.config)
+			if pod == nil {
+				t.Fatal("buildDatamoverPod returned nil")
+			}
+			tt.validate(t, pod)
+		})
+	}
+}
+
+func TestDatamoverPodConfigDefaults(t *testing.T) {
+	config := &DatamoverPodConfig{
+		Name:                 "test",
+		Namespace:            "default",
+		Image:                "test",
+		CredentialSecretName: "secret",
+		CredentialSecretKey:  "key",
+		SourcePVCName:        "pvc",
+	}
+
+	pod := buildDatamoverPod(config)
+
+	// Verify defaults
+	container := pod.Spec.Containers[0]
+	envMap := make(map[string]string)
+	for _, env := range container.Env {
+		envMap[env.Name] = env.Value
+	}
+
+	// Check default paths are used
+	if envMap[uploader.EnvCredentialsFile] != uploader.DefaultCredentialsPath {
+		t.Errorf("credentials file = %q, want default %q", envMap[uploader.EnvCredentialsFile], uploader.DefaultCredentialsPath)
+	}
+	if envMap[uploader.EnvSourcePVCPath] != uploader.DefaultSourcePVCPath {
+		t.Errorf("source pvc path = %q, want default %q", envMap[uploader.EnvSourcePVCPath], uploader.DefaultSourcePVCPath)
+	}
+}
