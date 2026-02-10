@@ -153,6 +153,9 @@ func buildDatamoverPod(config *DatamoverPodConfig) *corev1.Pod {
 					},
 				},
 				{
+					// Mount BSL credentials secret. The secret key (from BSL config) is mounted
+					// to a fixed path "/credentials/cloud" that matches uploader.DefaultCredentialsPath.
+					// This is simpler than Velero's dynamic path approach since we control both ends.
 					Name: "cloud-credentials",
 					VolumeSource: corev1.VolumeSource{
 						Secret: &corev1.SecretVolumeSource{
@@ -160,7 +163,7 @@ func buildDatamoverPod(config *DatamoverPodConfig) *corev1.Pod {
 							Items: []corev1.KeyToPath{
 								{
 									Key:  config.CredentialSecretKey,
-									Path: "cloud",
+									Path: "cloud", // Fixed filename, matches uploader.DefaultCredentialsPath
 								},
 							},
 						},

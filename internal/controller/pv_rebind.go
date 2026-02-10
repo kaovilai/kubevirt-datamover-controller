@@ -153,9 +153,13 @@ func (r *KubeVirtDataUploadReconciler) rebindPVToNamespace(
 	}
 
 	if err := r.Create(ctx, newPVC); err != nil {
-		return nil, fmt.Errorf("failed to create new PVC %s/%s: %w", targetNamespace, newPVCName, err)
+		if !errors.IsAlreadyExists(err) {
+			return nil, fmt.Errorf("failed to create new PVC %s/%s: %w", targetNamespace, newPVCName, err)
+		}
+		logger.Info("Rebound PVC already exists", "pvc", newPVCName, "namespace", targetNamespace)
+	} else {
+		logger.Info("Created new PVC in target namespace", "pvc", newPVCName, "namespace", targetNamespace)
 	}
-	logger.Info("Created new PVC in target namespace", "pvc", newPVCName, "namespace", targetNamespace)
 
 	// Step 5: Reset PV binding using Patch (like Velero's ResetPVBinding)
 	// Re-fetch PV to get latest version
@@ -307,6 +311,9 @@ func (r *KubeVirtDataUploadReconciler) waitForPVCBound(ctx context.Context, pvcN
 	return wait.PollUntilContextTimeout(ctx, PVRebindPollInterval, PVRebindTimeout, true, func(ctx context.Context) (bool, error) {
 		pvc := &corev1.PersistentVolumeClaim{}
 		if err := r.Get(ctx, types.NamespacedName{Name: pvcName, Namespace: namespace}, pvc); err != nil {
+			if errors.IsNotFound(err) {
+				return false, fmt.Errorf("PVC %s/%s was deleted while waiting for it to bind", namespace, pvcName)
+			}
 			return false, err
 		}
 		return pvc.Status.Phase == corev1.ClaimBound, nil

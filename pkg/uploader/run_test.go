@@ -76,14 +76,15 @@ func TestExtractDiskName(t *testing.T) {
 func TestLoadConfigFromEnv(t *testing.T) {
 	// Save original env and restore after test
 	originalEnv := map[string]string{
-		EnvBSLBucket:     os.Getenv(EnvBSLBucket),
-		EnvVMName:        os.Getenv(EnvVMName),
-		EnvVMNamespace:   os.Getenv(EnvVMNamespace),
-		EnvBSLProvider:   os.Getenv(EnvBSLProvider),
-		EnvBSLPrefix:     os.Getenv(EnvBSLPrefix),
-		EnvBSLRegion:     os.Getenv(EnvBSLRegion),
-		EnvBackupType:    os.Getenv(EnvBackupType),
-		EnvSourcePVCPath: os.Getenv(EnvSourcePVCPath),
+		EnvBSLBucket:      os.Getenv(EnvBSLBucket),
+		EnvVMName:         os.Getenv(EnvVMName),
+		EnvVMNamespace:    os.Getenv(EnvVMNamespace),
+		EnvBSLProvider:    os.Getenv(EnvBSLProvider),
+		EnvBSLPrefix:      os.Getenv(EnvBSLPrefix),
+		EnvBSLRegion:      os.Getenv(EnvBSLRegion),
+		EnvBackupType:     os.Getenv(EnvBackupType),
+		EnvSourcePVCPath:  os.Getenv(EnvSourcePVCPath),
+		EnvCheckpointName: os.Getenv(EnvCheckpointName),
 	}
 	defer func() {
 		for k, v := range originalEnv {
@@ -104,9 +105,10 @@ func TestLoadConfigFromEnv(t *testing.T) {
 		{
 			name: "valid config with all required fields",
 			envVars: map[string]string{
-				EnvBSLBucket:   "test-bucket",
-				EnvVMName:      "test-vm",
-				EnvVMNamespace: "test-ns",
+				EnvBSLBucket:      "test-bucket",
+				EnvVMName:         "test-vm",
+				EnvVMNamespace:    "test-ns",
+				EnvCheckpointName: "cp-001",
 			},
 			expectError: false,
 			validate: func(t *testing.T, cfg *UploaderConfig) {
@@ -118,6 +120,9 @@ func TestLoadConfigFromEnv(t *testing.T) {
 				}
 				if cfg.VMNamespace != "test-ns" {
 					t.Errorf("VMNamespace = %q, want %q", cfg.VMNamespace, "test-ns")
+				}
+				if cfg.CheckpointName != "cp-001" {
+					t.Errorf("CheckpointName = %q, want %q", cfg.CheckpointName, "cp-001")
 				}
 				// Check defaults
 				if cfg.SourcePVCPath != DefaultSourcePVCPath {
@@ -134,34 +139,58 @@ func TestLoadConfigFromEnv(t *testing.T) {
 		{
 			name: "missing bucket returns error",
 			envVars: map[string]string{
-				EnvVMName:      "test-vm",
-				EnvVMNamespace: "test-ns",
+				EnvVMName:         "test-vm",
+				EnvVMNamespace:    "test-ns",
+				EnvCheckpointName: "cp-001",
 			},
 			expectError: true,
 		},
 		{
 			name: "missing vm name returns error",
 			envVars: map[string]string{
-				EnvBSLBucket:   "test-bucket",
-				EnvVMNamespace: "test-ns",
+				EnvBSLBucket:      "test-bucket",
+				EnvVMNamespace:    "test-ns",
+				EnvCheckpointName: "cp-001",
 			},
 			expectError: true,
 		},
 		{
 			name: "missing vm namespace returns error",
 			envVars: map[string]string{
-				EnvBSLBucket: "test-bucket",
-				EnvVMName:    "test-vm",
+				EnvBSLBucket:      "test-bucket",
+				EnvVMName:         "test-vm",
+				EnvCheckpointName: "cp-001",
+			},
+			expectError: true,
+		},
+		{
+			name: "missing checkpoint name returns error",
+			envVars: map[string]string{
+				EnvBSLBucket:   "test-bucket",
+				EnvVMName:      "test-vm",
+				EnvVMNamespace: "test-ns",
+			},
+			expectError: true,
+		},
+		{
+			name: "invalid backup type returns error",
+			envVars: map[string]string{
+				EnvBSLBucket:      "test-bucket",
+				EnvVMName:         "test-vm",
+				EnvVMNamespace:    "test-ns",
+				EnvCheckpointName: "cp-001",
+				EnvBackupType:     "invalid",
 			},
 			expectError: true,
 		},
 		{
 			name: "custom source path is used",
 			envVars: map[string]string{
-				EnvBSLBucket:     "test-bucket",
-				EnvVMName:        "test-vm",
-				EnvVMNamespace:   "test-ns",
-				EnvSourcePVCPath: "/custom/path",
+				EnvBSLBucket:      "test-bucket",
+				EnvVMName:         "test-vm",
+				EnvVMNamespace:    "test-ns",
+				EnvCheckpointName: "cp-001",
+				EnvSourcePVCPath:  "/custom/path",
 			},
 			expectError: false,
 			validate: func(t *testing.T, cfg *UploaderConfig) {
@@ -173,10 +202,11 @@ func TestLoadConfigFromEnv(t *testing.T) {
 		{
 			name: "backup type incremental is preserved",
 			envVars: map[string]string{
-				EnvBSLBucket:   "test-bucket",
-				EnvVMName:      "test-vm",
-				EnvVMNamespace: "test-ns",
-				EnvBackupType:  "incremental",
+				EnvBSLBucket:      "test-bucket",
+				EnvVMName:         "test-vm",
+				EnvVMNamespace:    "test-ns",
+				EnvCheckpointName: "cp-001",
+				EnvBackupType:     "incremental",
 			},
 			expectError: false,
 			validate: func(t *testing.T, cfg *UploaderConfig) {

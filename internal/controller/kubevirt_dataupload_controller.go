@@ -288,10 +288,7 @@ func (r *KubeVirtDataUploadReconciler) handlePrepared(ctx context.Context, logge
 	}
 
 	// Datamover pod runs in OADP namespace (where credentials are accessible)
-	podNamespace := r.OADPNamespace
-	if podNamespace == "" {
-		podNamespace = du.Namespace
-	}
+	podNamespace := r.getPodNamespace(du)
 
 	// Check if datamover pod already exists (idempotency)
 	podName := getDatamoverPodName(du)
@@ -350,6 +347,9 @@ func (r *KubeVirtDataUploadReconciler) handlePrepared(ctx context.Context, logge
 
 		rebindResult, err := r.rebindPVToNamespace(ctx, logger, sourcePVCName, vmRef.Namespace, podNamespace, du.Name)
 		if err != nil {
+			// Fail without retry: PV rebind is a multi-step operation (delete PVC, patch PV, create new PVC).
+			// If it fails partway through, automatic retries could leave resources in an inconsistent state.
+			// Failing allows the user to investigate and take corrective action.
 			logger.Error(err, "Failed to rebind PV to OADP namespace")
 			if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed, fmt.Sprintf("Failed to rebind PV: %v", err)); err != nil {
 				return ctrl.Result{}, err
@@ -426,10 +426,7 @@ func (r *KubeVirtDataUploadReconciler) handleInProgress(ctx context.Context, log
 	logger.Info("Handling InProgress phase DataUpload")
 
 	// Datamover pod runs in OADP namespace
-	podNamespace := r.OADPNamespace
-	if podNamespace == "" {
-		podNamespace = du.Namespace
-	}
+	podNamespace := r.getPodNamespace(du)
 
 	// Get the datamover pod
 	podName := getDatamoverPodName(du)
@@ -511,10 +508,7 @@ func (r *KubeVirtDataUploadReconciler) handleCanceling(ctx context.Context, logg
 	logger.Info("Handling Canceling phase DataUpload")
 
 	// Datamover pod runs in OADP namespace
-	podNamespace := r.OADPNamespace
-	if podNamespace == "" {
-		podNamespace = du.Namespace
-	}
+	podNamespace := r.getPodNamespace(du)
 
 	// Clean up datamover resources in OADP namespace
 	r.cleanupDatamoverResources(ctx, logger, du, podNamespace)
@@ -560,6 +554,15 @@ func (r *KubeVirtDataUploadReconciler) updatePhase(ctx context.Context, du *vele
 		"message", message)
 
 	return nil
+}
+
+// getPodNamespace returns the namespace where datamover pods should run.
+// Uses OADPNamespace if configured, otherwise falls back to the DataUpload's namespace.
+func (r *KubeVirtDataUploadReconciler) getPodNamespace(du *velerov2alpha1.DataUpload) string {
+	if r.OADPNamespace != "" {
+		return r.OADPNamespace
+	}
+	return du.Namespace
 }
 
 // SetupWithManager sets up the controller with the Manager

@@ -323,8 +323,12 @@ func loadAWSCredentialsFromFile(path string) (aws.CredentialsProvider, error) {
 // InitObjectStore creates an ObjectStore based on the provider type.
 // Returns a velero.ObjectStore implementation.
 func InitObjectStore(cfg *UploaderConfig) (velero.ObjectStore, error) {
+	if cfg.BSLProvider == "" {
+		return nil, fmt.Errorf("BSL provider is required but was empty")
+	}
+
 	switch strings.ToLower(cfg.BSLProvider) {
-	case "aws", "":
+	case "aws":
 		return NewS3ObjectStore(
 			cfg.BSLBucket,
 			cfg.BSLPrefix,

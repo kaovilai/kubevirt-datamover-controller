@@ -47,6 +47,7 @@ func Run(ctx context.Context) error {
 	}
 
 	// Type assert to get the concrete type with convenience methods
+	// TODO: Refactor to use a common interface when GCP/Azure are added (issue #11)
 	store, ok := storeInterface.(*S3ObjectStore)
 	if !ok {
 		return fmt.Errorf("expected S3ObjectStore, got %T", storeInterface)
@@ -124,6 +125,18 @@ func LoadConfigFromEnv() (*UploaderConfig, error) {
 	if config.VMNamespace == "" {
 		return nil, fmt.Errorf("%s is required", EnvVMNamespace)
 	}
+	if config.CheckpointName == "" {
+		return nil, fmt.Errorf("%s is required", EnvCheckpointName)
+	}
+
+	// Validate backup type
+	switch strings.ToLower(config.BackupType) {
+	case BackupTypeFull, BackupTypeIncremental:
+		// Valid
+	default:
+		return nil, fmt.Errorf("invalid backup type %q: must be %q or %q",
+			config.BackupType, BackupTypeFull, BackupTypeIncremental)
+	}
 
 	return config, nil
 }
@@ -162,13 +175,15 @@ func uploadQcow2Files(_ context.Context, store *S3ObjectStore, config *UploaderC
 		if err != nil {
 			return fmt.Errorf("failed to open file %s: %w", path, err)
 		}
-		defer func() { _ = file.Close() }()
 
 		fmt.Printf("Uploading %s (%d bytes) to %s\n", d.Name(), info.Size(), objectPath)
 
 		// Upload file using convenience method
-		if err := store.PutObjectWithBucket(objectPath, file); err != nil {
-			return fmt.Errorf("failed to upload %s: %w", path, err)
+		uploadErr := store.PutObjectWithBucket(objectPath, file)
+		// Close file immediately after upload to avoid resource exhaustion with many files
+		_ = file.Close()
+		if uploadErr != nil {
+			return fmt.Errorf("failed to upload %s: %w", path, uploadErr)
 		}
 
 		// Extract disk name from filename (e.g., "vmb-xxx-disk1.qcow2" -> "disk1")
@@ -212,8 +227,18 @@ func updateVMIndex(_ context.Context, store *S3ObjectStore, config *UploaderConf
 
 	// Try to load existing index
 	var vmIndex VMIndex
-	data, err := store.GetObjectBytes(indexPath)
-	if err == nil {
+
+	// First check if index exists to distinguish "not found" from other errors
+	exists, err := store.ObjectExists(store.bucket, indexPath)
+	if err != nil {
+		return fmt.Errorf("failed to check if VM index exists: %w", err)
+	}
+
+	if exists {
+		data, err := store.GetObjectBytes(indexPath)
+		if err != nil {
+			return fmt.Errorf("failed to read existing VM index: %w", err)
+		}
 		if err := json.Unmarshal(data, &vmIndex); err != nil {
 			fmt.Printf("Warning: failed to parse existing index, creating new: %v\n", err)
 			vmIndex = VMIndex{}
@@ -308,13 +333,26 @@ func updateBackupManifests(_ context.Context, store *S3ObjectStore, config *Uplo
 
 	// Build checkpoint chain (for restore)
 	chain := buildCheckpointChain(vmIndex.Checkpoints, config.CheckpointName)
+	if len(chain) == 0 {
+		return fmt.Errorf("failed to build checkpoint chain: checkpoint %q not found in VM index", config.CheckpointName)
+	}
 
 	// Create/update per-backup index.json
 	backupIndexPath := fmt.Sprintf("manifests/%s/index.json", config.VeleroBackupName)
 
 	var backupManifest BackupManifest
-	data, err = store.GetObjectBytes(backupIndexPath)
-	if err == nil {
+
+	// Check if backup manifest exists to distinguish "not found" from other errors
+	exists, err := store.ObjectExists(store.bucket, backupIndexPath)
+	if err != nil {
+		return fmt.Errorf("failed to check if backup manifest exists: %w", err)
+	}
+
+	if exists {
+		data, err = store.GetObjectBytes(backupIndexPath)
+		if err != nil {
+			return fmt.Errorf("failed to read existing backup manifest: %w", err)
+		}
 		if err := json.Unmarshal(data, &backupManifest); err != nil {
 			fmt.Printf("Warning: failed to parse existing backup manifest, creating new: %v\n", err)
 			backupManifest = BackupManifest{}
