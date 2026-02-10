@@ -530,9 +530,9 @@ func (r *KubeVirtDataUploadReconciler) handleCanceling(ctx context.Context, logg
 func (r *KubeVirtDataUploadReconciler) updatePhase(ctx context.Context, du *velerov2alpha1.DataUpload, phase velerov2alpha1.DataUploadPhase, message string) error {
 	logger := log.FromContext(ctx)
 
-	// Skip update if already at target phase (idempotency)
-	if du.Status.Phase == phase {
-		logger.V(1).Info("DataUpload already at target phase, skipping update",
+	// Skip update if already at target phase with same message (idempotency)
+	if du.Status.Phase == phase && du.Status.Message == message {
+		logger.V(1).Info("DataUpload already at target phase with same message, skipping update",
 			"dataUpload", du.Name,
 			"phase", phase)
 		return nil

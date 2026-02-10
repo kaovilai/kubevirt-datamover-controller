@@ -351,6 +351,13 @@ func updateBackupManifests(_ context.Context, store velero.ObjectStore, config *
 		return fmt.Errorf("failed to build checkpoint chain: checkpoint %q not found in VM index", config.CheckpointName)
 	}
 
+	// Validate that the chain starts with a full backup (required for restore)
+	if strings.ToLower(chain[0].Type) != BackupTypeFull {
+		fmt.Printf("Warning: checkpoint chain does not start with a full backup (starts with %q)\n", chain[0].Type)
+		// This is a warning, not an error - the chain might be valid if this is the first backup
+		// and it's marked as incremental by mistake, or the user knows what they're doing
+	}
+
 	// Create/update per-backup index.json
 	backupIndexPath := fmt.Sprintf("manifests/%s/index.json", config.VeleroBackupName)
 
