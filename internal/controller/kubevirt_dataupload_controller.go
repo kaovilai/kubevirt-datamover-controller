@@ -461,8 +461,8 @@ func (r *KubeVirtDataUploadReconciler) handleInProgress(ctx context.Context, log
 		failureMessage := extractPodFailureMessage(pod)
 		logger.Error(nil, "Datamover pod failed", "pod", podName, "message", failureMessage)
 
-		// Cleanup resources on failure
-		r.cleanupDatamoverResources(ctx, logger, du, podNamespace)
+		// Skip cleanup on failure to preserve resources for debugging.
+		// Resources (pod, rebound PVC/PV) can be manually cleaned up after investigation.
 
 		if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed, fmt.Sprintf("Datamover pod failed: %s", failureMessage)); err != nil {
 			return ctrl.Result{}, err
