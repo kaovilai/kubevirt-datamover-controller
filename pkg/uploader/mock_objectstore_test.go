@@ -24,9 +24,14 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	velero "github.com/vmware-tanzu/velero/pkg/plugin/velero"
 )
 
-// MockObjectStore is an in-memory implementation of ObjectStore for testing.
+// Compile-time check that MockObjectStore implements velero.ObjectStore
+var _ velero.ObjectStore = (*MockObjectStore)(nil)
+
+// MockObjectStore is an in-memory implementation of velero.ObjectStore for testing.
 type MockObjectStore struct {
 	mu      sync.RWMutex
 	objects map[string][]byte // key -> data

@@ -19,6 +19,7 @@ package uploader
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -255,6 +256,7 @@ func TestUpdateVMIndex(t *testing.T) {
 		{
 			name: "creates new index for full backup",
 			config: &UploaderConfig{
+				BSLBucket:        "test-bucket",
 				VMName:           "test-vm",
 				VMNamespace:      "test-ns",
 				CheckpointName:   "cp-001",
@@ -295,6 +297,7 @@ func TestUpdateVMIndex(t *testing.T) {
 		{
 			name: "updates existing index for incremental backup",
 			config: &UploaderConfig{
+				BSLBucket:        "test-bucket",
 				VMName:           "test-vm",
 				VMNamespace:      "test-ns",
 				CheckpointName:   "cp-002",
@@ -330,8 +333,8 @@ func TestUpdateVMIndex(t *testing.T) {
 				if !containsBytes(data, "cp-002") {
 					t.Error("index should contain second checkpoint")
 				}
-				// Incremental should have parent reference
-				if !containsBytes(data, "\"parent\":\"cp-001\"") {
+				// Incremental should have parent reference (note: json.MarshalIndent adds space after colon)
+				if !containsBytes(data, "\"parent\": \"cp-001\"") {
 					t.Error("incremental checkpoint should have parent")
 				}
 			},
@@ -339,6 +342,7 @@ func TestUpdateVMIndex(t *testing.T) {
 		{
 			name: "deduplicates checkpoint if already exists",
 			config: &UploaderConfig{
+				BSLBucket:        "test-bucket",
 				VMName:           "test-vm",
 				VMNamespace:      "test-ns",
 				CheckpointName:   "cp-001",
@@ -368,7 +372,8 @@ func TestUpdateVMIndex(t *testing.T) {
 					t.Fatalf("failed to get index: %v", err)
 				}
 				// Should only have one checkpoint (updated) - check for unique id field
-				if countOccurrences(data, "\"id\":\"cp-001\"") != 1 {
+				// Note: json.MarshalIndent adds space after colon
+				if countOccurrences(data, "\"id\": \"cp-001\"") != 1 {
 					t.Errorf("should have exactly one cp-001 entry, got data: %s", string(data))
 				}
 				// Should have updated VMBackup name
@@ -395,68 +400,22 @@ func TestUpdateVMIndex(t *testing.T) {
 				_ = store.PutObjectBytes(indexPath, data)
 			}
 
-			// Create a mock S3ObjectStore wrapper for the function
-			// Since updateVMIndex expects *S3ObjectStore, we need to test it differently
-			// For now, we test the logic by verifying the mock directly
+			// Call the real updateVMIndex function with MockObjectStore
+			// This is possible now because updateVMIndex accepts velero.ObjectStore interface
+			err := updateVMIndex(context.Background(), store, tt.config, tt.files)
 
-			// We can't directly call updateVMIndex with MockObjectStore
-			// but we can verify the mock works correctly
-			if tt.validateResult != nil {
-				// Simulate what updateVMIndex does
-				indexPath := fmt.Sprintf("checkpoints/%s/%s/index.json", tt.config.VMNamespace, tt.config.VMName)
-
-				var vmIndex VMIndex
-				data, err := store.GetObjectBytes(indexPath)
+			if tt.expectError {
 				if err == nil {
-					_ = json.Unmarshal(data, &vmIndex)
-				} else {
-					vmIndex = VMIndex{
-						VMName:      tt.config.VMName,
-						Namespace:   tt.config.VMNamespace,
-						Checkpoints: []CheckpointEntry{},
-					}
+					t.Error("expected error but got none")
 				}
+				return
+			}
 
-				// Extract PVC names
-				var pvcNames []string
-				for _, f := range tt.files {
-					if f.DiskName != "" {
-						pvcNames = append(pvcNames, f.DiskName)
-					}
-				}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
 
-				checkpoint := CheckpointEntry{
-					ID:       tt.config.CheckpointName,
-					Type:     tt.config.BackupType,
-					VMBackup: tt.config.VMBName,
-					Files:    tt.files,
-					PVCs:     pvcNames,
-				}
-
-				if tt.config.BackupType == "incremental" && len(vmIndex.Checkpoints) > 0 {
-					checkpoint.Parent = vmIndex.Checkpoints[len(vmIndex.Checkpoints)-1].ID
-				}
-
-				if tt.config.VeleroBackupName != "" {
-					checkpoint.ReferencedBy = []string{tt.config.VeleroBackupName}
-				}
-
-				// Update or add
-				found := false
-				for i, cp := range vmIndex.Checkpoints {
-					if cp.ID == checkpoint.ID {
-						vmIndex.Checkpoints[i] = checkpoint
-						found = true
-						break
-					}
-				}
-				if !found {
-					vmIndex.Checkpoints = append(vmIndex.Checkpoints, checkpoint)
-				}
-
-				indexData, _ := json.Marshal(vmIndex)
-				_ = store.PutObjectBytes(indexPath, indexData)
-
+			if tt.validateResult != nil {
 				tt.validateResult(t, store)
 			}
 		})

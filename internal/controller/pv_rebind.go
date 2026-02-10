@@ -312,7 +312,9 @@ func (r *KubeVirtDataUploadReconciler) waitForPVCBound(ctx context.Context, pvcN
 		pvc := &corev1.PersistentVolumeClaim{}
 		if err := r.Get(ctx, types.NamespacedName{Name: pvcName, Namespace: namespace}, pvc); err != nil {
 			if errors.IsNotFound(err) {
-				return false, fmt.Errorf("PVC %s/%s was deleted while waiting for it to bind", namespace, pvcName)
+				// With a cached client, the PVC can be briefly invisible after creation.
+				// Treat NotFound as a transient condition and keep polling.
+				return false, nil
 			}
 			return false, err
 		}
@@ -320,41 +322,48 @@ func (r *KubeVirtDataUploadReconciler) waitForPVCBound(ctx context.Context, pvcN
 	})
 }
 
-// cleanupReboundPVCAndPV deletes the rebound PVC and PV after upload completes
+// cleanupReboundPVCAndPV deletes the rebound PVC and PV after upload completes.
+// The dataUploadName is used to find the PV by label if the PVC is already gone,
+// preventing storage leakage.
 func (r *KubeVirtDataUploadReconciler) cleanupReboundPVCAndPV(
 	ctx context.Context,
 	logger logr.Logger,
 	pvcName string,
 	pvcNamespace string,
+	dataUploadName string,
 ) error {
+	var pvName string
+
 	// Get the PVC to find the PV name
 	pvc := &corev1.PersistentVolumeClaim{}
 	err := r.Get(ctx, types.NamespacedName{Name: pvcName, Namespace: pvcNamespace}, pvc)
 	if err != nil {
 		if errors.IsNotFound(err) {
-			logger.V(1).Info("Rebound PVC already deleted", "pvc", pvcName)
-			return nil
+			logger.V(1).Info("Rebound PVC already deleted, will find PV by label", "pvc", pvcName)
+			// PVC is gone, but we still need to clean up the PV to prevent storage leakage.
+			// Find PV by the label we set during rebind.
+		} else {
+			return fmt.Errorf("failed to get rebound PVC %s/%s: %w", pvcNamespace, pvcName, err)
 		}
-		return fmt.Errorf("failed to get rebound PVC %s/%s: %w", pvcNamespace, pvcName, err)
+	} else {
+		pvName = pvc.Spec.VolumeName
+
+		// Delete the PVC first
+		if err := r.Delete(ctx, pvc); err != nil && !errors.IsNotFound(err) {
+			return fmt.Errorf("failed to delete rebound PVC %s/%s: %w", pvcNamespace, pvcName, err)
+		}
+		logger.Info("Deleted rebound PVC", "pvc", pvcName, "namespace", pvcNamespace)
+
+		// Wait for PVC deletion
+		if err := r.waitForPVCDeletion(ctx, pvcName, pvcNamespace); err != nil {
+			logger.Error(err, "Timeout waiting for PVC deletion", "pvc", pvcName)
+			// Continue to try deleting PV anyway
+		}
 	}
 
-	pvName := pvc.Spec.VolumeName
-
-	// Delete the PVC first
-	if err := r.Delete(ctx, pvc); err != nil && !errors.IsNotFound(err) {
-		return fmt.Errorf("failed to delete rebound PVC %s/%s: %w", pvcNamespace, pvcName, err)
-	}
-	logger.Info("Deleted rebound PVC", "pvc", pvcName, "namespace", pvcNamespace)
-
-	// Wait for PVC deletion
-	if err := r.waitForPVCDeletion(ctx, pvcName, pvcNamespace); err != nil {
-		logger.Error(err, "Timeout waiting for PVC deletion", "pvc", pvcName)
-		// Continue to try deleting PV anyway
-	}
-
-	// Delete the PV
+	// Find PV by name if we got it from PVC, otherwise find by label
+	pv := &corev1.PersistentVolume{}
 	if pvName != "" {
-		pv := &corev1.PersistentVolume{}
 		if err := r.Get(ctx, types.NamespacedName{Name: pvName}, pv); err != nil {
 			if errors.IsNotFound(err) {
 				logger.V(1).Info("PV already deleted", "pv", pvName)
@@ -362,20 +371,36 @@ func (r *KubeVirtDataUploadReconciler) cleanupReboundPVCAndPV(
 			}
 			return fmt.Errorf("failed to get PV %s: %w", pvName, err)
 		}
-
-		// Set reclaim policy to Delete to ensure underlying storage is cleaned up
-		// This includes retry logic. If it fails, we must NOT delete the PV
-		// because that would orphan the underlying storage (storage leakage).
-		if err := r.patchPVReclaimPolicy(ctx, pv, corev1.PersistentVolumeReclaimDelete); err != nil {
-			logger.Error(err, "Failed to set PV reclaim policy to Delete after retries", "pv", pvName)
-			return fmt.Errorf("cannot delete PV %s: failed to set reclaim policy to Delete (would cause storage leakage): %w", pvName, err)
+	} else {
+		// Find PV by label (PVC was already deleted)
+		pvList := &corev1.PersistentVolumeList{}
+		if err := r.List(ctx, pvList, client.MatchingLabels{common.LabelDataUploadName: dataUploadName}); err != nil {
+			return fmt.Errorf("failed to list PVs by label: %w", err)
 		}
-
-		if err := r.Delete(ctx, pv); err != nil && !errors.IsNotFound(err) {
-			return fmt.Errorf("failed to delete PV %s: %w", pvName, err)
+		if len(pvList.Items) == 0 {
+			logger.V(1).Info("No PV found with label, already cleaned up", "label", common.LabelDataUploadName, "value", dataUploadName)
+			return nil
 		}
-		logger.Info("Deleted PV", "pv", pvName)
+		if len(pvList.Items) > 1 {
+			logger.Info("Warning: multiple PVs found with label, cleaning up first one", "count", len(pvList.Items))
+		}
+		pv = &pvList.Items[0]
+		pvName = pv.Name
+		logger.Info("Found PV by label", "pv", pvName, "label", common.LabelDataUploadName)
 	}
+
+	// Set reclaim policy to Delete to ensure underlying storage is cleaned up
+	// This includes retry logic. If it fails, we must NOT delete the PV
+	// because that would orphan the underlying storage (storage leakage).
+	if err := r.patchPVReclaimPolicy(ctx, pv, corev1.PersistentVolumeReclaimDelete); err != nil {
+		logger.Error(err, "Failed to set PV reclaim policy to Delete after retries", "pv", pvName)
+		return fmt.Errorf("cannot delete PV %s: failed to set reclaim policy to Delete (would cause storage leakage): %w", pvName, err)
+	}
+
+	if err := r.Delete(ctx, pv); err != nil && !errors.IsNotFound(err) {
+		return fmt.Errorf("failed to delete PV %s: %w", pvName, err)
+	}
+	logger.Info("Deleted PV", "pv", pvName)
 
 	return nil
 }

@@ -17,15 +17,36 @@ limitations under the License.
 package uploader
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
+
+	velero "github.com/vmware-tanzu/velero/pkg/plugin/velero"
 )
+
+// Helper functions for working with velero.ObjectStore interface
+
+// putObjectBytes uploads bytes to the object store.
+func putObjectBytes(store velero.ObjectStore, bucket, key string, data []byte) error {
+	return store.PutObject(bucket, key, bytes.NewReader(data))
+}
+
+// getObjectBytes downloads an object as bytes from the object store.
+func getObjectBytes(store velero.ObjectStore, bucket, key string) ([]byte, error) {
+	reader, err := store.GetObject(bucket, key)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = reader.Close() }()
+	return io.ReadAll(reader)
+}
 
 // Run is the main entrypoint for the uploader.
 func Run(ctx context.Context) error {
@@ -40,17 +61,10 @@ func Run(ctx context.Context) error {
 	fmt.Printf("Config loaded: VM=%s/%s, checkpoint=%s, type=%s\n",
 		config.VMNamespace, config.VMName, config.CheckpointName, config.BackupType)
 
-	// Initialize object store
-	storeInterface, err := InitObjectStore(config)
+	// Initialize object store - returns velero.ObjectStore interface
+	store, err := InitObjectStore(config)
 	if err != nil {
 		return fmt.Errorf("failed to initialize object store: %w", err)
-	}
-
-	// Type assert to get the concrete type with convenience methods
-	// TODO: Refactor to use a common interface when GCP/Azure are added (issue #11)
-	store, ok := storeInterface.(*S3ObjectStore)
-	if !ok {
-		return fmt.Errorf("expected S3ObjectStore, got %T", storeInterface)
 	}
 
 	fmt.Printf("Object store initialized: bucket=%s, prefix=%s\n", config.BSLBucket, config.BSLPrefix)
@@ -142,7 +156,7 @@ func LoadConfigFromEnv() (*UploaderConfig, error) {
 }
 
 // uploadQcow2Files walks the source path and uploads all qcow2 files.
-func uploadQcow2Files(_ context.Context, store *S3ObjectStore, config *UploaderConfig) ([]CheckpointFile, error) {
+func uploadQcow2Files(_ context.Context, store velero.ObjectStore, config *UploaderConfig) ([]CheckpointFile, error) {
 	var files []CheckpointFile
 
 	err := filepath.WalkDir(config.SourcePVCPath, func(path string, d fs.DirEntry, err error) error {
@@ -178,8 +192,8 @@ func uploadQcow2Files(_ context.Context, store *S3ObjectStore, config *UploaderC
 
 		fmt.Printf("Uploading %s (%d bytes) to %s\n", d.Name(), info.Size(), objectPath)
 
-		// Upload file using convenience method
-		uploadErr := store.PutObjectWithBucket(objectPath, file)
+		// Upload file using velero.ObjectStore interface
+		uploadErr := store.PutObject(config.BSLBucket, objectPath, file)
 		// Close file immediately after upload to avoid resource exhaustion with many files
 		_ = file.Close()
 		if uploadErr != nil {
@@ -222,20 +236,20 @@ func extractDiskName(filename string) string {
 }
 
 // updateVMIndex creates or updates the per-VM index.json file.
-func updateVMIndex(_ context.Context, store *S3ObjectStore, config *UploaderConfig, files []CheckpointFile) error {
+func updateVMIndex(_ context.Context, store velero.ObjectStore, config *UploaderConfig, files []CheckpointFile) error {
 	indexPath := fmt.Sprintf("checkpoints/%s/%s/index.json", config.VMNamespace, config.VMName)
 
 	// Try to load existing index
 	var vmIndex VMIndex
 
 	// First check if index exists to distinguish "not found" from other errors
-	exists, err := store.ObjectExists(store.bucket, indexPath)
+	exists, err := store.ObjectExists(config.BSLBucket, indexPath)
 	if err != nil {
 		return fmt.Errorf("failed to check if VM index exists: %w", err)
 	}
 
 	if exists {
-		data, err := store.GetObjectBytes(indexPath)
+		data, err := getObjectBytes(store, config.BSLBucket, indexPath)
 		if err != nil {
 			return fmt.Errorf("failed to read existing VM index: %w", err)
 		}
@@ -305,7 +319,7 @@ func updateVMIndex(_ context.Context, store *S3ObjectStore, config *UploaderConf
 		return fmt.Errorf("failed to marshal VM index: %w", err)
 	}
 
-	if err := store.PutObjectBytes(indexPath, indexData); err != nil {
+	if err := putObjectBytes(store, config.BSLBucket, indexPath, indexData); err != nil {
 		return fmt.Errorf("failed to write VM index: %w", err)
 	}
 
@@ -313,7 +327,7 @@ func updateVMIndex(_ context.Context, store *S3ObjectStore, config *UploaderConf
 }
 
 // updateBackupManifests creates/updates the per-backup manifest files.
-func updateBackupManifests(_ context.Context, store *S3ObjectStore, config *UploaderConfig) error {
+func updateBackupManifests(_ context.Context, store velero.ObjectStore, config *UploaderConfig) error {
 	if config.VeleroBackupName == "" {
 		fmt.Println("Warning: no Velero backup name provided, skipping manifest update")
 		return nil
@@ -321,7 +335,7 @@ func updateBackupManifests(_ context.Context, store *S3ObjectStore, config *Uplo
 
 	// Load the VM index to get the checkpoint chain
 	indexPath := fmt.Sprintf("checkpoints/%s/%s/index.json", config.VMNamespace, config.VMName)
-	data, err := store.GetObjectBytes(indexPath)
+	data, err := getObjectBytes(store, config.BSLBucket, indexPath)
 	if err != nil {
 		return fmt.Errorf("failed to read VM index: %w", err)
 	}
@@ -343,13 +357,13 @@ func updateBackupManifests(_ context.Context, store *S3ObjectStore, config *Uplo
 	var backupManifest BackupManifest
 
 	// Check if backup manifest exists to distinguish "not found" from other errors
-	exists, err := store.ObjectExists(store.bucket, backupIndexPath)
+	exists, err := store.ObjectExists(config.BSLBucket, backupIndexPath)
 	if err != nil {
 		return fmt.Errorf("failed to check if backup manifest exists: %w", err)
 	}
 
 	if exists {
-		data, err = store.GetObjectBytes(backupIndexPath)
+		data, err = getObjectBytes(store, config.BSLBucket, backupIndexPath)
 		if err != nil {
 			return fmt.Errorf("failed to read existing backup manifest: %w", err)
 		}
@@ -395,7 +409,7 @@ func updateBackupManifests(_ context.Context, store *S3ObjectStore, config *Uplo
 		return fmt.Errorf("failed to marshal backup manifest: %w", err)
 	}
 
-	if err := store.PutObjectBytes(backupIndexPath, manifestData); err != nil {
+	if err := putObjectBytes(store, config.BSLBucket, backupIndexPath, manifestData); err != nil {
 		return fmt.Errorf("failed to write backup manifest: %w", err)
 	}
 
@@ -413,7 +427,7 @@ func updateBackupManifests(_ context.Context, store *S3ObjectStore, config *Uplo
 		return fmt.Errorf("failed to marshal VM backup manifest: %w", err)
 	}
 
-	if err := store.PutObjectBytes(vmManifestPath, vmManifestData); err != nil {
+	if err := putObjectBytes(store, config.BSLBucket, vmManifestPath, vmManifestData); err != nil {
 		return fmt.Errorf("failed to write VM backup manifest: %w", err)
 	}
 

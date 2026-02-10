@@ -494,7 +494,7 @@ func (r *KubeVirtDataUploadReconciler) cleanupDatamoverResources(ctx context.Con
 
 	// Delete the rebound PVC and PV
 	reboundPVCName := fmt.Sprintf("%s%s", common.ReboundPVCNamePrefix, du.Name)
-	if err := r.cleanupReboundPVCAndPV(ctx, logger, reboundPVCName, podNamespace); err != nil {
+	if err := r.cleanupReboundPVCAndPV(ctx, logger, reboundPVCName, podNamespace, du.Name); err != nil {
 		logger.Error(err, "Failed to cleanup rebound PVC and PV", "pvc", reboundPVCName)
 		// Continue - don't block completion on cleanup failures
 	}
