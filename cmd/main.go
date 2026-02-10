@@ -118,6 +118,12 @@ func main() {
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
 
+	// Allow DATAMOVER_IMAGE env var to override the default
+	// This enables kustomize to set the image via environment variable
+	if envImage := os.Getenv("DATAMOVER_IMAGE"); envImage != "" && datamoverImage == common.DefaultDatamoverImage {
+		datamoverImage = envImage
+	}
+
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 
 	// if the enable-http2 flag is false (the default), http/2 should be disabled
