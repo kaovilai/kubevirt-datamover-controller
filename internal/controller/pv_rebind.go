@@ -43,6 +43,12 @@ const (
 
 	// KubeAnnBoundByController is the annotation added by Kubernetes PV controller
 	KubeAnnBoundByController = "pv.kubernetes.io/bound-by-controller"
+
+	// PatchRetryAttempts is the number of times to retry patch operations
+	PatchRetryAttempts = 3
+
+	// PatchRetryInterval is the interval between patch retry attempts
+	PatchRetryInterval = 1 * time.Second
 )
 
 // PVRebindResult contains the result of a PV rebind operation
@@ -178,7 +184,28 @@ func (r *KubeVirtDataUploadReconciler) rebindPVToNamespace(
 }
 
 // patchPVReclaimPolicy patches a PV to set its reclaim policy (like Velero's SetPVReclaimPolicy)
+// Includes retry logic for transient errors.
 func (r *KubeVirtDataUploadReconciler) patchPVReclaimPolicy(ctx context.Context, pv *corev1.PersistentVolume, policy corev1.PersistentVolumeReclaimPolicy) error {
+	var lastErr error
+	for attempt := 1; attempt <= PatchRetryAttempts; attempt++ {
+		err := r.doPatchPVReclaimPolicy(ctx, pv, policy)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if attempt < PatchRetryAttempts {
+			time.Sleep(PatchRetryInterval)
+			// Re-fetch PV to get latest version for next attempt
+			if fetchErr := r.Get(ctx, types.NamespacedName{Name: pv.Name}, pv); fetchErr != nil {
+				return fmt.Errorf("failed to re-fetch PV after patch error: %w", fetchErr)
+			}
+		}
+	}
+	return fmt.Errorf("failed after %d attempts: %w", PatchRetryAttempts, lastErr)
+}
+
+// doPatchPVReclaimPolicy performs a single patch attempt
+func (r *KubeVirtDataUploadReconciler) doPatchPVReclaimPolicy(ctx context.Context, pv *corev1.PersistentVolume, policy corev1.PersistentVolumeReclaimPolicy) error {
 	origBytes, err := json.Marshal(pv)
 	if err != nil {
 		return fmt.Errorf("error marshaling original PV: %w", err)
@@ -201,7 +228,28 @@ func (r *KubeVirtDataUploadReconciler) patchPVReclaimPolicy(ctx context.Context,
 }
 
 // patchPVBinding patches a PV to reset its binding info (like Velero's ResetPVBinding)
+// Includes retry logic for transient errors.
 func (r *KubeVirtDataUploadReconciler) patchPVBinding(ctx context.Context, pv *corev1.PersistentVolume, pvc *corev1.PersistentVolumeClaim, labels map[string]string) error {
+	var lastErr error
+	for attempt := 1; attempt <= PatchRetryAttempts; attempt++ {
+		err := r.doPatchPVBinding(ctx, pv, pvc, labels)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if attempt < PatchRetryAttempts {
+			time.Sleep(PatchRetryInterval)
+			// Re-fetch PV to get latest version for next attempt
+			if fetchErr := r.Get(ctx, types.NamespacedName{Name: pv.Name}, pv); fetchErr != nil {
+				return fmt.Errorf("failed to re-fetch PV after patch error: %w", fetchErr)
+			}
+		}
+	}
+	return fmt.Errorf("failed after %d attempts: %w", PatchRetryAttempts, lastErr)
+}
+
+// doPatchPVBinding performs a single patch attempt
+func (r *KubeVirtDataUploadReconciler) doPatchPVBinding(ctx context.Context, pv *corev1.PersistentVolume, pvc *corev1.PersistentVolumeClaim, labels map[string]string) error {
 	origBytes, err := json.Marshal(pv)
 	if err != nil {
 		return fmt.Errorf("error marshaling original PV: %w", err)
@@ -309,9 +357,11 @@ func (r *KubeVirtDataUploadReconciler) cleanupReboundPVCAndPV(
 		}
 
 		// Set reclaim policy to Delete to ensure underlying storage is cleaned up
+		// This includes retry logic. If it fails, we must NOT delete the PV
+		// because that would orphan the underlying storage (storage leakage).
 		if err := r.patchPVReclaimPolicy(ctx, pv, corev1.PersistentVolumeReclaimDelete); err != nil {
-			logger.Error(err, "Failed to set PV reclaim policy to Delete", "pv", pvName)
-			// Continue to try deleting anyway
+			logger.Error(err, "Failed to set PV reclaim policy to Delete after retries", "pv", pvName)
+			return fmt.Errorf("cannot delete PV %s: failed to set reclaim policy to Delete (would cause storage leakage): %w", pvName, err)
 		}
 
 		if err := r.Delete(ctx, pv); err != nil && !errors.IsNotFound(err) {

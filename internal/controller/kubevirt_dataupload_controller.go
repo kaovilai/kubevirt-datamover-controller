@@ -309,6 +309,29 @@ func (r *KubeVirtDataUploadReconciler) handlePrepared(ctx context.Context, logge
 		return ctrl.Result{}, fmt.Errorf("failed to check for existing datamover pod: %w", err)
 	}
 
+	// Validate BSL and VMB exist BEFORE rebinding PV
+	// This prevents leaving PV in a bad state if these checks fail
+
+	// Get BackupStorageLocation
+	bsl, err := r.getBackupStorageLocation(ctx, du)
+	if err != nil {
+		logger.Error(err, "Failed to get BackupStorageLocation")
+		if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed, fmt.Sprintf("Failed to get BSL: %v", err)); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, nil
+	}
+
+	// Get VMB to extract checkpoint info
+	vmb, err := r.getVMBackup(ctx, du, vmRef.Namespace)
+	if err != nil {
+		logger.Error(err, "Failed to get VirtualMachineBackup")
+		if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed, fmt.Sprintf("Failed to get VMB: %v", err)); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, nil
+	}
+
 	// Check if PV has already been rebound (idempotency)
 	reboundPVCName := fmt.Sprintf("%s%s", common.ReboundPVCNamePrefix, du.Name)
 	reboundPVC := &corev1.PersistentVolumeClaim{}
@@ -341,26 +364,6 @@ func (r *KubeVirtDataUploadReconciler) handlePrepared(ctx context.Context, logge
 		reboundPVCName = rebindResult.NewPVCName
 	} else {
 		logger.Info("PV already rebound to OADP namespace", "pvc", reboundPVCName)
-	}
-
-	// Get BackupStorageLocation
-	bsl, err := r.getBackupStorageLocation(ctx, du)
-	if err != nil {
-		logger.Error(err, "Failed to get BackupStorageLocation")
-		if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed, fmt.Sprintf("Failed to get BSL: %v", err)); err != nil {
-			return ctrl.Result{}, err
-		}
-		return ctrl.Result{}, nil
-	}
-
-	// Get VMB to extract checkpoint info
-	vmb, err := r.getVMBackup(ctx, du, vmRef.Namespace)
-	if err != nil {
-		logger.Error(err, "Failed to get VirtualMachineBackup")
-		if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed, fmt.Sprintf("Failed to get VMB: %v", err)); err != nil {
-			return ctrl.Result{}, err
-		}
-		return ctrl.Result{}, nil
 	}
 
 	// Get backup type from VMB status

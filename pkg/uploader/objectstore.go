@@ -19,6 +19,7 @@ package uploader
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -26,10 +27,12 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/aws/retry"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	velero "github.com/vmware-tanzu/velero/pkg/plugin/velero"
 )
 
@@ -100,6 +103,13 @@ func (s *S3ObjectStore) Init(configMap map[string]string) error {
 		opts = append(opts, config.WithCredentialsProvider(creds))
 	}
 
+	// Add retry configuration for transient errors
+	opts = append(opts, config.WithRetryer(func() aws.Retryer {
+		return retry.NewStandard(func(o *retry.StandardOptions) {
+			o.MaxAttempts = 3
+		})
+	}))
+
 	cfg, err := config.LoadDefaultConfig(ctx, opts...)
 	if err != nil {
 		return fmt.Errorf("failed to load AWS config: %w", err)
@@ -154,8 +164,14 @@ func (s *S3ObjectStore) ObjectExists(bucket, key string) (bool, error) {
 		Key:    aws.String(s.fullKey(key)),
 	})
 	if err != nil {
-		// Check if it's a not found error
-		if strings.Contains(err.Error(), "NotFound") || strings.Contains(err.Error(), "404") {
+		// Check if it's a not found error using AWS SDK error types
+		var notFound *s3types.NotFound
+		if errors.As(err, &notFound) {
+			return false, nil
+		}
+		// Also check for NoSuchKey which can be returned for missing objects
+		var noSuchKey *s3types.NoSuchKey
+		if errors.As(err, &noSuchKey) {
 			return false, nil
 		}
 		return false, fmt.Errorf("failed to check object existence %s: %w", key, err)
