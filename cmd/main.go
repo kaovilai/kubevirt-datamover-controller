@@ -43,6 +43,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
 	"github.com/migtools/kubevirt-datamover-controller/internal/controller"
+	"github.com/migtools/kubevirt-datamover-controller/pkg/common"
 	"github.com/migtools/kubevirt-datamover-controller/pkg/uploader"
 	// +kubebuilder:scaffold:imports
 )
@@ -105,8 +106,8 @@ func main() {
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
 	flag.IntVar(&maxConcurrentReconciles, "max-concurrent-reconciles", 3,
 		"Maximum number of concurrent reconciles for the KubeVirt DataUpload controller")
-	flag.StringVar(&datamoverImage, "datamover-image", "",
-		"Image to use for datamover pods. If not set, pods cannot be created.")
+	flag.StringVar(&datamoverImage, "datamover-image", common.DefaultDatamoverImage,
+		"Image to use for datamover pods")
 	flag.StringVar(&datamoverImagePullPolicy, "datamover-image-pull-policy", "IfNotPresent",
 		"Image pull policy for datamover pods (Always, IfNotPresent, Never)")
 	flag.StringVar(&oadpNamespace, "oadp-namespace", "openshift-adp",

@@ -72,6 +72,12 @@ const (
 	DataMoverKubeVirt = "kubevirt"
 )
 
+// Default images
+const (
+	// DefaultDatamoverImage is the default image for datamover pods.
+	DefaultDatamoverImage = "quay.io/konveyor/kubevirt-datamover-controller:latest"
+)
+
 // SnapshotType constants for DataUpload
 const (
 	// SnapshotTypeCSI is the snapshot type for CSI-based backups.

@@ -93,8 +93,11 @@ func buildDatamoverPod(config *DatamoverPodConfig) *corev1.Pod {
 	}
 
 	// Security context - follows Velero's pattern for CSI snapshot pods:
-	// - Run as root (UID 0) to access files written by other users
+	// - Run as root (UID 0) to access qcow2 files which may be owned by different users
+	//   (KubeVirt uses qemu user, and file ownership varies by storage provider)
 	// - Use spc_t SELinux type to bypass SELinux label checking for cross-namespace volumes
+	// - Uses velero service account which has the SCC (SecurityContextConstraints) needed
+	//   for privileged access on OpenShift
 	runAsUser := int64(0)
 	readOnlyRootFilesystem := true
 
