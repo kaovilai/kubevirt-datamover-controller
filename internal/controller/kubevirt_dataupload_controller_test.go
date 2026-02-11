@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+//nolint:goconst // Test files use repeated string literals for readability
 package controller
 
 import (
@@ -22,6 +23,7 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/migtools/kubevirt-datamover-controller/pkg/common"
+	velerov1 "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
 	velerov2alpha1 "github.com/vmware-tanzu/velero/pkg/apis/velero/v2alpha1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -215,7 +217,7 @@ func TestReconcile(t *testing.T) {
 			expectError:     false,
 		},
 		{
-			name: "prepared phase transitions to inprogress",
+			name: "prepared phase without VM annotations fails",
 			dataUpload: &velerov2alpha1.DataUpload{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "test-du",
@@ -228,8 +230,8 @@ func TestReconcile(t *testing.T) {
 					Phase: velerov2alpha1.DataUploadPhasePrepared,
 				},
 			},
-			expectedRequeue: true,
-			expectedPhase:   velerov2alpha1.DataUploadPhaseInProgress,
+			expectedRequeue: false,
+			expectedPhase:   velerov2alpha1.DataUploadPhaseFailed,
 			expectError:     false,
 		},
 	}
@@ -733,6 +735,7 @@ func strPtr(s string) *string {
 func TestHandleInProgress(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
 
 	du := &velerov2alpha1.DataUpload{
 		ObjectMeta: metav1.ObjectMeta{
@@ -747,9 +750,20 @@ func TestHandleInProgress(t *testing.T) {
 		},
 	}
 
+	// Create a running datamover pod in the OADP namespace
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      common.DatamoverPodNamePrefix + du.Name,
+			Namespace: "openshift-adp",
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+		},
+	}
+
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(du).
+		WithObjects(du, pod).
 		Build()
 
 	r := &KubeVirtDataUploadReconciler{
@@ -764,10 +778,9 @@ func TestHandleInProgress(t *testing.T) {
 	if err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
-	// handleInProgress is a placeholder for Phase 3
-	// Currently returns empty result (no requeue)
-	if result.RequeueAfter > 0 {
-		t.Errorf("expected no requeue from handleInProgress (not yet implemented), got RequeueAfter=%v", result.RequeueAfter)
+	// When pod is running, should requeue to check again
+	if result.RequeueAfter != RequeueAfterShort {
+		t.Errorf("expected RequeueAfter=%v when pod is running, got %v", RequeueAfterShort, result.RequeueAfter)
 	}
 }
 
@@ -913,5 +926,1087 @@ func TestAnnotationConstants(t *testing.T) {
 	}
 	if DefaultTempPVCSize != "10Gi" {
 		t.Errorf("expected DefaultTempPVCSize='10Gi', got '%s'", DefaultTempPVCSize)
+	}
+}
+
+func TestExtractPodFailureMessage(t *testing.T) {
+	tests := []struct {
+		name     string
+		pod      *corev1.Pod
+		expected string
+	}{
+		{
+			name: "container terminated with message",
+			pod: &corev1.Pod{
+				Status: corev1.PodStatus{
+					ContainerStatuses: []corev1.ContainerStatus{
+						{
+							Name: "uploader",
+							State: corev1.ContainerState{
+								Terminated: &corev1.ContainerStateTerminated{
+									Message: "Error: failed to upload files",
+								},
+							},
+						},
+					},
+				},
+			},
+			expected: "Error: failed to upload files",
+		},
+		{
+			name: "container terminated with reason only",
+			pod: &corev1.Pod{
+				Status: corev1.PodStatus{
+					ContainerStatuses: []corev1.ContainerStatus{
+						{
+							Name: "uploader",
+							State: corev1.ContainerState{
+								Terminated: &corev1.ContainerStateTerminated{
+									Reason: "OOMKilled",
+								},
+							},
+						},
+					},
+				},
+			},
+			expected: "OOMKilled",
+		},
+		{
+			name: "init container terminated with message",
+			pod: &corev1.Pod{
+				Status: corev1.PodStatus{
+					InitContainerStatuses: []corev1.ContainerStatus{
+						{
+							Name: "init",
+							State: corev1.ContainerState{
+								Terminated: &corev1.ContainerStateTerminated{
+									Message: "Init container failed",
+								},
+							},
+						},
+					},
+				},
+			},
+			expected: "Init container failed",
+		},
+		{
+			name: "pod condition with message",
+			pod: &corev1.Pod{
+				Status: corev1.PodStatus{
+					Conditions: []corev1.PodCondition{
+						{
+							Type:    corev1.PodScheduled,
+							Status:  corev1.ConditionFalse,
+							Message: "Insufficient memory",
+						},
+					},
+				},
+			},
+			expected: "Insufficient memory",
+		},
+		{
+			name: "no failure info",
+			pod: &corev1.Pod{
+				Status: corev1.PodStatus{},
+			},
+			expected: "unknown error",
+		},
+		{
+			name: "running container - no terminated state",
+			pod: &corev1.Pod{
+				Status: corev1.PodStatus{
+					ContainerStatuses: []corev1.ContainerStatus{
+						{
+							Name: "uploader",
+							State: corev1.ContainerState{
+								Running: &corev1.ContainerStateRunning{},
+							},
+						},
+					},
+				},
+			},
+			expected: "unknown error",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := extractPodFailureMessage(tt.pod)
+			if result != tt.expected {
+				t.Errorf("extractPodFailureMessage() = %q, want %q", result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestHandleInProgress_PodSucceeded(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	du := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-du",
+			Namespace: "openshift-adp",
+			Annotations: map[string]string{
+				common.AnnotationVMName:      "test-vm",
+				common.AnnotationVMNamespace: "test-ns",
+			},
+		},
+		Spec: velerov2alpha1.DataUploadSpec{
+			DataMover: common.DataMoverKubeVirt,
+		},
+		Status: velerov2alpha1.DataUploadStatus{
+			Phase: velerov2alpha1.DataUploadPhaseInProgress,
+		},
+	}
+
+	// Create a succeeded datamover pod
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      common.DatamoverPodNamePrefix + du.Name,
+			Namespace: "openshift-adp",
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodSucceeded,
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(du, pod).
+		Build()
+
+	r := &KubeVirtDataUploadReconciler{
+		Client:        fakeClient,
+		Scheme:        scheme,
+		Log:           logr.Discard(),
+		OADPNamespace: "openshift-adp",
+	}
+
+	result, err := r.handleInProgress(context.Background(), logr.Discard(), du)
+
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	if result.RequeueAfter != 0 {
+		t.Errorf("expected no requeue when pod succeeded, got RequeueAfter=%v", result.RequeueAfter)
+	}
+
+	// Verify phase transitioned to Completed
+	updatedDU := &velerov2alpha1.DataUpload{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{
+		Name:      du.Name,
+		Namespace: du.Namespace,
+	}, updatedDU); err != nil {
+		t.Fatalf("failed to get updated DataUpload: %v", err)
+	}
+
+	if updatedDU.Status.Phase != velerov2alpha1.DataUploadPhaseCompleted {
+		t.Errorf("expected phase=%s, got phase=%s", velerov2alpha1.DataUploadPhaseCompleted, updatedDU.Status.Phase)
+	}
+}
+
+func TestHandleInProgress_PodFailed(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	du := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-du",
+			Namespace: "openshift-adp",
+			Annotations: map[string]string{
+				common.AnnotationVMName:      "test-vm",
+				common.AnnotationVMNamespace: "test-ns",
+			},
+		},
+		Spec: velerov2alpha1.DataUploadSpec{
+			DataMover: common.DataMoverKubeVirt,
+		},
+		Status: velerov2alpha1.DataUploadStatus{
+			Phase: velerov2alpha1.DataUploadPhaseInProgress,
+		},
+	}
+
+	// Create a failed datamover pod
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      common.DatamoverPodNamePrefix + du.Name,
+			Namespace: "openshift-adp",
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodFailed,
+			ContainerStatuses: []corev1.ContainerStatus{
+				{
+					Name: "uploader",
+					State: corev1.ContainerState{
+						Terminated: &corev1.ContainerStateTerminated{
+							Message: "S3 upload failed: access denied",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(du, pod).
+		Build()
+
+	r := &KubeVirtDataUploadReconciler{
+		Client:        fakeClient,
+		Scheme:        scheme,
+		Log:           logr.Discard(),
+		OADPNamespace: "openshift-adp",
+	}
+
+	result, err := r.handleInProgress(context.Background(), logr.Discard(), du)
+
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	if result.RequeueAfter != 0 {
+		t.Errorf("expected no requeue when pod failed, got RequeueAfter=%v", result.RequeueAfter)
+	}
+
+	// Verify phase transitioned to Failed
+	updatedDU := &velerov2alpha1.DataUpload{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{
+		Name:      du.Name,
+		Namespace: du.Namespace,
+	}, updatedDU); err != nil {
+		t.Fatalf("failed to get updated DataUpload: %v", err)
+	}
+
+	if updatedDU.Status.Phase != velerov2alpha1.DataUploadPhaseFailed {
+		t.Errorf("expected phase=%s, got phase=%s", velerov2alpha1.DataUploadPhaseFailed, updatedDU.Status.Phase)
+	}
+}
+
+func TestHandleInProgress_PodNotFound(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	du := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-du",
+			Namespace: "openshift-adp",
+			Annotations: map[string]string{
+				common.AnnotationVMName:      "test-vm",
+				common.AnnotationVMNamespace: "test-ns",
+			},
+		},
+		Spec: velerov2alpha1.DataUploadSpec{
+			DataMover: common.DataMoverKubeVirt,
+		},
+		Status: velerov2alpha1.DataUploadStatus{
+			Phase: velerov2alpha1.DataUploadPhaseInProgress,
+		},
+	}
+
+	// No pod exists
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(du).
+		Build()
+
+	r := &KubeVirtDataUploadReconciler{
+		Client:        fakeClient,
+		Scheme:        scheme,
+		Log:           logr.Discard(),
+		OADPNamespace: "openshift-adp",
+	}
+
+	result, err := r.handleInProgress(context.Background(), logr.Discard(), du)
+
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	if result.RequeueAfter != 0 {
+		t.Errorf("expected no requeue when pod not found, got RequeueAfter=%v", result.RequeueAfter)
+	}
+
+	// Verify phase transitioned to Failed
+	updatedDU := &velerov2alpha1.DataUpload{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{
+		Name:      du.Name,
+		Namespace: du.Namespace,
+	}, updatedDU); err != nil {
+		t.Fatalf("failed to get updated DataUpload: %v", err)
+	}
+
+	if updatedDU.Status.Phase != velerov2alpha1.DataUploadPhaseFailed {
+		t.Errorf("expected phase=%s, got phase=%s", velerov2alpha1.DataUploadPhaseFailed, updatedDU.Status.Phase)
+	}
+}
+
+func TestCleanupDatamoverResources(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	du := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-du",
+			Namespace: "openshift-adp",
+			UID:       types.UID("test-uid"),
+		},
+		Spec: velerov2alpha1.DataUploadSpec{
+			DataMover: common.DataMoverKubeVirt,
+		},
+	}
+
+	// Create resources to be cleaned up
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      common.DatamoverPodNamePrefix + du.Name,
+			Namespace: "openshift-adp",
+		},
+	}
+
+	reboundPVC := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      common.ReboundPVCNamePrefix + du.Name,
+			Namespace: "openshift-adp",
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceStorage: resource.MustParse("1Gi"),
+				},
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(du, pod, reboundPVC).
+		Build()
+
+	r := &KubeVirtDataUploadReconciler{
+		Client:        fakeClient,
+		Scheme:        scheme,
+		Log:           logr.Discard(),
+		OADPNamespace: "openshift-adp",
+	}
+
+	// Call cleanup
+	r.cleanupDatamoverResources(context.Background(), logr.Discard(), du, "openshift-adp")
+
+	// Verify pod was deleted
+	deletedPod := &corev1.Pod{}
+	err := fakeClient.Get(context.Background(), types.NamespacedName{
+		Name:      pod.Name,
+		Namespace: pod.Namespace,
+	}, deletedPod)
+	if err == nil {
+		t.Error("expected pod to be deleted")
+	}
+
+	// Verify rebound PVC was deleted
+	deletedPVC := &corev1.PersistentVolumeClaim{}
+	err = fakeClient.Get(context.Background(), types.NamespacedName{
+		Name:      reboundPVC.Name,
+		Namespace: reboundPVC.Namespace,
+	}, deletedPVC)
+	if err == nil {
+		t.Error("expected rebound PVC to be deleted")
+	}
+}
+
+func TestGetDatamoverPodName(t *testing.T) {
+	du := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "my-dataupload",
+		},
+	}
+
+	expected := common.DatamoverPodNamePrefix + "my-dataupload"
+	result := getDatamoverPodName(du)
+
+	if result != expected {
+		t.Errorf("getDatamoverPodName() = %q, want %q", result, expected)
+	}
+}
+
+func TestGetVeleroBackupName(t *testing.T) {
+	tests := []struct {
+		name     string
+		du       *velerov2alpha1.DataUpload
+		expected string
+	}{
+		{
+			name: "with velero backup label",
+			du: &velerov2alpha1.DataUpload{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{
+						common.LabelVeleroBackupName: "my-velero-backup",
+					},
+				},
+			},
+			expected: "my-velero-backup",
+		},
+		{
+			name: "without velero backup label",
+			du: &velerov2alpha1.DataUpload{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{
+						"some-other-label": "value",
+					},
+				},
+			},
+			expected: "",
+		},
+		{
+			name: "nil labels",
+			du: &velerov2alpha1.DataUpload{
+				ObjectMeta: metav1.ObjectMeta{},
+			},
+			expected: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := getVeleroBackupName(tt.du)
+			if result != tt.expected {
+				t.Errorf("getVeleroBackupName() = %q, want %q", result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestBuildDatamoverPodConfig(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = velerov1.AddToScheme(scheme)
+
+	tests := []struct {
+		name           string
+		du             *velerov2alpha1.DataUpload
+		bsl            *velerov1.BackupStorageLocation
+		vmb            *kubevirtbackupv1alpha1.VirtualMachineBackup
+		vmRef          *common.VMReference
+		backupType     string
+		checkpointName string
+		datamoverImage string
+		expectError    bool
+		errorContains  string
+		validate       func(*testing.T, *DatamoverPodConfig)
+	}{
+		{
+			name: "valid config",
+			du: &velerov2alpha1.DataUpload{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-du",
+					Namespace: "openshift-adp",
+					UID:       types.UID("du-uid-123"),
+					Labels: map[string]string{
+						common.LabelVeleroBackupName: "velero-backup-001",
+					},
+				},
+			},
+			bsl: &velerov1.BackupStorageLocation{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "default",
+					Namespace: "openshift-adp",
+				},
+				Spec: velerov1.BackupStorageLocationSpec{
+					Provider: "aws",
+					StorageType: velerov1.StorageType{
+						ObjectStorage: &velerov1.ObjectStorageLocation{
+							Bucket: "my-bucket",
+							Prefix: "velero",
+						},
+					},
+					Config: map[string]string{
+						"region": "us-east-1",
+					},
+					Credential: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{
+							Name: "cloud-credentials",
+						},
+						Key: "cloud",
+					},
+				},
+			},
+			vmb: &kubevirtbackupv1alpha1.VirtualMachineBackup{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "vmb-test-du",
+					Namespace: "vm-ns",
+				},
+			},
+			vmRef:          &common.VMReference{Name: "my-vm", Namespace: "vm-ns"},
+			backupType:     "full",
+			checkpointName: "checkpoint-001",
+			datamoverImage: "quay.io/test/datamover:v1",
+			expectError:    false,
+			validate: func(t *testing.T, config *DatamoverPodConfig) {
+				if config.Name != common.DatamoverPodNamePrefix+"test-du" {
+					t.Errorf("Name = %q, want %q", config.Name, common.DatamoverPodNamePrefix+"test-du")
+				}
+				if config.Namespace != "vm-ns" {
+					t.Errorf("Namespace = %q, want %q", config.Namespace, "vm-ns")
+				}
+				if config.BSLBucket != "my-bucket" {
+					t.Errorf("BSLBucket = %q, want %q", config.BSLBucket, "my-bucket")
+				}
+				if config.BSLPrefix != "velero-kubevirt-datamover" {
+					t.Errorf("BSLPrefix = %q, want %q", config.BSLPrefix, "velero-kubevirt-datamover")
+				}
+				if config.BSLRegion != "us-east-1" {
+					t.Errorf("BSLRegion = %q, want %q", config.BSLRegion, "us-east-1")
+				}
+				if config.CredentialSecretName != "cloud-credentials" {
+					t.Errorf("CredentialSecretName = %q, want %q", config.CredentialSecretName, "cloud-credentials")
+				}
+				if config.VeleroBackupName != "velero-backup-001" {
+					t.Errorf("VeleroBackupName = %q, want %q", config.VeleroBackupName, "velero-backup-001")
+				}
+				if config.BackupType != "full" {
+					t.Errorf("BackupType = %q, want %q", config.BackupType, "full")
+				}
+				if config.CheckpointName != "checkpoint-001" {
+					t.Errorf("CheckpointName = %q, want %q", config.CheckpointName, "checkpoint-001")
+				}
+			},
+		},
+		{
+			name: "BSL without prefix",
+			du: &velerov2alpha1.DataUpload{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-du",
+					UID:  types.UID("du-uid"),
+				},
+			},
+			bsl: &velerov1.BackupStorageLocation{
+				Spec: velerov1.BackupStorageLocationSpec{
+					Provider: "aws",
+					StorageType: velerov1.StorageType{
+						ObjectStorage: &velerov1.ObjectStorageLocation{
+							Bucket: "my-bucket",
+							Prefix: "", // No prefix
+						},
+					},
+					Credential: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{
+							Name: "creds",
+						},
+					},
+				},
+			},
+			vmb:            &kubevirtbackupv1alpha1.VirtualMachineBackup{},
+			vmRef:          &common.VMReference{Name: "vm", Namespace: "ns"},
+			backupType:     "full",
+			checkpointName: "cp",
+			datamoverImage: "image:v1",
+			expectError:    false,
+			validate: func(t *testing.T, config *DatamoverPodConfig) {
+				if config.BSLPrefix != "kubevirt-datamover" {
+					t.Errorf("BSLPrefix = %q, want %q", config.BSLPrefix, "kubevirt-datamover")
+				}
+			},
+		},
+		{
+			name: "missing bucket",
+			du: &velerov2alpha1.DataUpload{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-du",
+				},
+			},
+			bsl: &velerov1.BackupStorageLocation{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "bsl-no-bucket",
+				},
+				Spec: velerov1.BackupStorageLocationSpec{
+					Provider: "aws",
+					StorageType: velerov1.StorageType{
+						ObjectStorage: &velerov1.ObjectStorageLocation{
+							Bucket: "", // Missing
+						},
+					},
+				},
+			},
+			vmb:           &kubevirtbackupv1alpha1.VirtualMachineBackup{},
+			vmRef:         &common.VMReference{Name: "vm", Namespace: "ns"},
+			expectError:   true,
+			errorContains: "no bucket configured",
+		},
+		{
+			name: "missing credential secret",
+			du: &velerov2alpha1.DataUpload{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-du",
+				},
+			},
+			bsl: &velerov1.BackupStorageLocation{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "bsl-no-creds",
+				},
+				Spec: velerov1.BackupStorageLocationSpec{
+					Provider: "aws",
+					StorageType: velerov1.StorageType{
+						ObjectStorage: &velerov1.ObjectStorageLocation{
+							Bucket: "bucket",
+						},
+					},
+					Credential: nil, // Missing
+				},
+			},
+			vmb:           &kubevirtbackupv1alpha1.VirtualMachineBackup{},
+			vmRef:         &common.VMReference{Name: "vm", Namespace: "ns"},
+			expectError:   true,
+			errorContains: "no credential secret configured",
+		},
+		{
+			name: "missing datamover image",
+			du: &velerov2alpha1.DataUpload{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-du",
+				},
+			},
+			bsl: &velerov1.BackupStorageLocation{
+				Spec: velerov1.BackupStorageLocationSpec{
+					Provider: "aws",
+					StorageType: velerov1.StorageType{
+						ObjectStorage: &velerov1.ObjectStorageLocation{
+							Bucket: "bucket",
+						},
+					},
+					Credential: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{
+							Name: "creds",
+						},
+					},
+				},
+			},
+			vmb:            &kubevirtbackupv1alpha1.VirtualMachineBackup{},
+			vmRef:          &common.VMReference{Name: "vm", Namespace: "ns"},
+			datamoverImage: "", // Missing
+			expectError:    true,
+			errorContains:  "datamover image not configured",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := &KubeVirtDataUploadReconciler{
+				DatamoverImage: tt.datamoverImage,
+			}
+
+			config, err := r.buildDatamoverPodConfig(
+				tt.du,
+				tt.bsl,
+				tt.vmb,
+				tt.vmRef,
+				tt.backupType,
+				tt.checkpointName,
+			)
+
+			if tt.expectError {
+				if err == nil {
+					t.Error("expected error but got none")
+				} else if tt.errorContains != "" && !contains(err.Error(), tt.errorContains) {
+					t.Errorf("error %q should contain %q", err.Error(), tt.errorContains)
+				}
+			} else {
+				if err != nil {
+					t.Errorf("unexpected error: %v", err)
+				}
+				if tt.validate != nil {
+					tt.validate(t, config)
+				}
+			}
+		})
+	}
+}
+
+// contains checks if s contains substr
+func contains(s, substr string) bool {
+	return len(s) >= len(substr) && (s == substr || len(s) > 0 && containsHelper(s, substr))
+}
+
+func containsHelper(s, substr string) bool {
+	for i := 0; i <= len(s)-len(substr); i++ {
+		if s[i:i+len(substr)] == substr {
+			return true
+		}
+	}
+	return false
+}
+
+func TestGetBackupStorageLocation(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = velerov1.AddToScheme(scheme)
+
+	tests := []struct {
+		name          string
+		du            *velerov2alpha1.DataUpload
+		bsl           *velerov1.BackupStorageLocation
+		expectError   bool
+		errorContains string
+	}{
+		{
+			name: "BSL found",
+			du: &velerov2alpha1.DataUpload{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-du",
+					Namespace: "openshift-adp",
+				},
+				Spec: velerov2alpha1.DataUploadSpec{
+					BackupStorageLocation: "default",
+				},
+			},
+			bsl: &velerov1.BackupStorageLocation{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "default",
+					Namespace: "openshift-adp",
+				},
+			},
+			expectError: false,
+		},
+		{
+			name: "BSL not found",
+			du: &velerov2alpha1.DataUpload{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-du",
+					Namespace: "openshift-adp",
+				},
+				Spec: velerov2alpha1.DataUploadSpec{
+					BackupStorageLocation: "nonexistent",
+				},
+			},
+			bsl:           nil,
+			expectError:   true,
+			errorContains: "failed to get BackupStorageLocation",
+		},
+		{
+			name: "empty BSL name",
+			du: &velerov2alpha1.DataUpload{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-du",
+					Namespace: "openshift-adp",
+				},
+				Spec: velerov2alpha1.DataUploadSpec{
+					BackupStorageLocation: "",
+				},
+			},
+			bsl:           nil,
+			expectError:   true,
+			errorContains: "no BackupStorageLocation specified",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			builder := fake.NewClientBuilder().WithScheme(scheme)
+			if tt.bsl != nil {
+				builder = builder.WithObjects(tt.bsl)
+			}
+			fakeClient := builder.Build()
+
+			r := &KubeVirtDataUploadReconciler{
+				Client:        fakeClient,
+				OADPNamespace: "openshift-adp",
+			}
+
+			bsl, err := r.getBackupStorageLocation(context.Background(), tt.du)
+
+			if tt.expectError {
+				if err == nil {
+					t.Error("expected error but got none")
+				} else if tt.errorContains != "" && !contains(err.Error(), tt.errorContains) {
+					t.Errorf("error %q should contain %q", err.Error(), tt.errorContains)
+				}
+			} else {
+				if err != nil {
+					t.Errorf("unexpected error: %v", err)
+				}
+				if bsl == nil {
+					t.Error("expected BSL but got nil")
+				}
+			}
+		})
+	}
+}
+
+func TestGetVMBackup(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = kubevirtbackupv1alpha1.AddToScheme(scheme)
+
+	tests := []struct {
+		name          string
+		du            *velerov2alpha1.DataUpload
+		vmb           *kubevirtbackupv1alpha1.VirtualMachineBackup
+		namespace     string
+		expectError   bool
+		errorContains string
+	}{
+		{
+			name: "VMB found",
+			du: &velerov2alpha1.DataUpload{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-du",
+				},
+			},
+			vmb: &kubevirtbackupv1alpha1.VirtualMachineBackup{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "vmb-test-du",
+					Namespace: "vm-ns",
+				},
+			},
+			namespace:   "vm-ns",
+			expectError: false,
+		},
+		{
+			name: "VMB not found",
+			du: &velerov2alpha1.DataUpload{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "test-du",
+				},
+			},
+			vmb:           nil,
+			namespace:     "vm-ns",
+			expectError:   true,
+			errorContains: "failed to get VirtualMachineBackup",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			builder := fake.NewClientBuilder().WithScheme(scheme)
+			if tt.vmb != nil {
+				builder = builder.WithObjects(tt.vmb)
+			}
+			fakeClient := builder.Build()
+
+			r := &KubeVirtDataUploadReconciler{
+				Client: fakeClient,
+			}
+
+			vmb, err := r.getVMBackup(context.Background(), tt.du, tt.namespace)
+
+			if tt.expectError {
+				if err == nil {
+					t.Error("expected error but got none")
+				} else if tt.errorContains != "" && !contains(err.Error(), tt.errorContains) {
+					t.Errorf("error %q should contain %q", err.Error(), tt.errorContains)
+				}
+			} else {
+				if err != nil {
+					t.Errorf("unexpected error: %v", err)
+				}
+				if vmb == nil {
+					t.Error("expected VMB but got nil")
+				}
+			}
+		})
+	}
+}
+
+func TestHandlePrepared(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = velerov1.AddToScheme(scheme)
+	_ = kubevirtbackupv1alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	tests := []struct {
+		name          string
+		setupObjects  func() []runtime.Object
+		du            *velerov2alpha1.DataUpload
+		datamoverImg  string
+		expectError   bool
+		expectedPhase velerov2alpha1.DataUploadPhase
+		expectRequeue bool
+	}{
+		{
+			name:         "creates datamover pod and transitions to InProgress",
+			datamoverImg: "quay.io/test/datamover:v1",
+			du: &velerov2alpha1.DataUpload{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-du",
+					Namespace: "openshift-adp",
+					UID:       types.UID("du-uid-123"),
+					Annotations: map[string]string{
+						common.AnnotationVMName:      "test-vm",
+						common.AnnotationVMNamespace: "vm-ns",
+					},
+					Labels: map[string]string{
+						common.LabelVeleroBackupName: "velero-backup",
+					},
+				},
+				Spec: velerov2alpha1.DataUploadSpec{
+					DataMover:             common.DataMoverKubeVirt,
+					BackupStorageLocation: "default",
+					SourceNamespace:       "vm-ns",
+				},
+				Status: velerov2alpha1.DataUploadStatus{
+					Phase: velerov2alpha1.DataUploadPhasePrepared,
+				},
+			},
+			setupObjects: func() []runtime.Object {
+				bsl := &velerov1.BackupStorageLocation{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "default",
+						Namespace: "openshift-adp",
+					},
+					Spec: velerov1.BackupStorageLocationSpec{
+						Provider: "aws",
+						StorageType: velerov1.StorageType{
+							ObjectStorage: &velerov1.ObjectStorageLocation{
+								Bucket: "test-bucket",
+								Prefix: "velero",
+							},
+						},
+						Config: map[string]string{"region": "us-east-1"},
+						Credential: &corev1.SecretKeySelector{
+							LocalObjectReference: corev1.LocalObjectReference{Name: "cloud-creds"},
+							Key:                  "cloud",
+						},
+					},
+				}
+
+				checkpointName := "checkpoint-001"
+				vmb := &kubevirtbackupv1alpha1.VirtualMachineBackup{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "vmb-test-du",
+						Namespace: "vm-ns",
+					},
+					Status: &kubevirtbackupv1alpha1.VirtualMachineBackupStatus{
+						Type:           kubevirtbackupv1alpha1.Full,
+						CheckpointName: &checkpointName,
+					},
+				}
+
+				// Pre-create the rebound PVC in OADP namespace (skips rebind step)
+				reboundPVC := &corev1.PersistentVolumeClaim{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      common.ReboundPVCNamePrefix + "test-du",
+						Namespace: "openshift-adp",
+					},
+					Spec: corev1.PersistentVolumeClaimSpec{
+						VolumeName:  "pv-123",
+						AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+						Resources: corev1.VolumeResourceRequirements{
+							Requests: corev1.ResourceList{
+								corev1.ResourceStorage: resource.MustParse("10Gi"),
+							},
+						},
+					},
+					Status: corev1.PersistentVolumeClaimStatus{
+						Phase: corev1.ClaimBound,
+					},
+				}
+
+				return []runtime.Object{bsl, vmb, reboundPVC}
+			},
+			expectError:   false,
+			expectedPhase: velerov2alpha1.DataUploadPhaseInProgress,
+			expectRequeue: true,
+		},
+		{
+			name:         "missing VM annotations fails",
+			datamoverImg: "quay.io/test/datamover:v1",
+			du: &velerov2alpha1.DataUpload{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-du",
+					Namespace: "openshift-adp",
+					// No VM annotations
+				},
+				Spec: velerov2alpha1.DataUploadSpec{
+					DataMover: common.DataMoverKubeVirt,
+				},
+				Status: velerov2alpha1.DataUploadStatus{
+					Phase: velerov2alpha1.DataUploadPhasePrepared,
+				},
+			},
+			setupObjects:  func() []runtime.Object { return nil },
+			expectError:   false,
+			expectedPhase: velerov2alpha1.DataUploadPhaseFailed,
+			expectRequeue: false,
+		},
+		{
+			name:         "missing BSL fails",
+			datamoverImg: "quay.io/test/datamover:v1",
+			du: &velerov2alpha1.DataUpload{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-du",
+					Namespace: "openshift-adp",
+					Annotations: map[string]string{
+						common.AnnotationVMName:      "test-vm",
+						common.AnnotationVMNamespace: "vm-ns",
+					},
+				},
+				Spec: velerov2alpha1.DataUploadSpec{
+					DataMover:             common.DataMoverKubeVirt,
+					BackupStorageLocation: "nonexistent",
+				},
+				Status: velerov2alpha1.DataUploadStatus{
+					Phase: velerov2alpha1.DataUploadPhasePrepared,
+				},
+			},
+			setupObjects:  func() []runtime.Object { return nil },
+			expectError:   false,
+			expectedPhase: velerov2alpha1.DataUploadPhaseFailed,
+			expectRequeue: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			builder := fake.NewClientBuilder().WithScheme(scheme).WithObjects(tt.du)
+
+			if tt.setupObjects != nil {
+				for _, obj := range tt.setupObjects() {
+					builder = builder.WithRuntimeObjects(obj)
+				}
+			}
+
+			fakeClient := builder.Build()
+
+			r := &KubeVirtDataUploadReconciler{
+				Client:         fakeClient,
+				Scheme:         scheme,
+				Log:            logr.Discard(),
+				OADPNamespace:  "openshift-adp",
+				DatamoverImage: tt.datamoverImg,
+			}
+
+			result, err := r.handlePrepared(context.Background(), logr.Discard(), tt.du)
+
+			if tt.expectError && err == nil {
+				t.Error("expected error but got none")
+			}
+			if !tt.expectError && err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+
+			if tt.expectRequeue && result.RequeueAfter == 0 {
+				t.Error("expected requeue but got none")
+			}
+			if !tt.expectRequeue && result.RequeueAfter > 0 {
+				t.Errorf("expected no requeue, got RequeueAfter=%v", result.RequeueAfter)
+			}
+
+			// Check phase
+			updatedDU := &velerov2alpha1.DataUpload{}
+			if err := fakeClient.Get(context.Background(), types.NamespacedName{
+				Name:      tt.du.Name,
+				Namespace: tt.du.Namespace,
+			}, updatedDU); err != nil {
+				t.Fatalf("failed to get updated DataUpload: %v", err)
+			}
+
+			if updatedDU.Status.Phase != tt.expectedPhase {
+				t.Errorf("expected phase=%s, got phase=%s", tt.expectedPhase, updatedDU.Status.Phase)
+			}
+		})
 	}
 }

@@ -17,8 +17,10 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"flag"
+	"fmt"
 	"os"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
@@ -27,6 +29,7 @@ import (
 
 	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
 	velerov2alpha1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v2alpha1"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -40,6 +43,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
 	"github.com/migtools/kubevirt-datamover-controller/internal/controller"
+	"github.com/migtools/kubevirt-datamover-controller/pkg/common"
+	"github.com/migtools/kubevirt-datamover-controller/pkg/uploader"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -60,6 +65,16 @@ func init() {
 
 // nolint:gocyclo
 func main() {
+	// Check for subcommand dispatch before parsing flags
+	if len(os.Args) > 1 && os.Args[1] == "upload" {
+		// Run uploader mode
+		if err := uploader.Run(context.Background()); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	var metricsAddr string
 	var metricsCertPath, metricsCertName, metricsCertKey string
 	var webhookCertPath, webhookCertName, webhookCertKey string
@@ -68,6 +83,9 @@ func main() {
 	var secureMetrics bool
 	var enableHTTP2 bool
 	var maxConcurrentReconciles int
+	var datamoverImage string
+	var datamoverImagePullPolicy string
+	var oadpNamespace string
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
@@ -88,11 +106,23 @@ func main() {
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
 	flag.IntVar(&maxConcurrentReconciles, "max-concurrent-reconciles", 3,
 		"Maximum number of concurrent reconciles for the KubeVirt DataUpload controller")
+	flag.StringVar(&datamoverImage, "datamover-image", common.DefaultDatamoverImage,
+		"Image to use for datamover pods")
+	flag.StringVar(&datamoverImagePullPolicy, "datamover-image-pull-policy", "IfNotPresent",
+		"Image pull policy for datamover pods (Always, IfNotPresent, Never)")
+	flag.StringVar(&oadpNamespace, "oadp-namespace", "openshift-adp",
+		"Namespace where OADP/Velero resources are located")
 	opts := zap.Options{
 		Development: true,
 	}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
+
+	// Allow DATAMOVER_IMAGE env var to override the default
+	// This enables kustomize to set the image via environment variable
+	if envImage := os.Getenv("DATAMOVER_IMAGE"); envImage != "" && datamoverImage == common.DefaultDatamoverImage {
+		datamoverImage = envImage
+	}
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 
@@ -189,10 +219,13 @@ func main() {
 
 	// Setup KubeVirt DataUpload controller
 	if err = (&controller.KubeVirtDataUploadReconciler{
-		Client:                  mgr.GetClient(),
-		Scheme:                  mgr.GetScheme(),
-		Log:                     ctrl.Log.WithName("controllers").WithName("KubeVirtDataUpload"),
-		MaxConcurrentReconciles: maxConcurrentReconciles,
+		Client:                   mgr.GetClient(),
+		Scheme:                   mgr.GetScheme(),
+		Log:                      ctrl.Log.WithName("controllers").WithName("KubeVirtDataUpload"),
+		MaxConcurrentReconciles:  maxConcurrentReconciles,
+		DatamoverImage:           datamoverImage,
+		DatamoverImagePullPolicy: corev1.PullPolicy(datamoverImagePullPolicy),
+		OADPNamespace:            oadpNamespace,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "KubeVirtDataUpload")
 		os.Exit(1)

@@ -25,6 +25,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -34,7 +35,7 @@ import (
 )
 
 // namespace where the project is deployed in
-const namespace = "kubevirt-datamover-system"
+const namespace = "openshift-adp"
 
 // serviceAccountName created for the project
 const serviceAccountName = "kubevirt-datamover-controller-manager"
@@ -54,8 +55,11 @@ var _ = Describe("Manager", Ordered, func() {
 	BeforeAll(func() {
 		By("creating manager namespace")
 		cmd := exec.Command("kubectl", "create", "ns", namespace)
-		_, err := utils.Run(cmd)
-		Expect(err).NotTo(HaveOccurred(), "Failed to create namespace")
+		output, err := utils.Run(cmd)
+		// Ignore AlreadyExists error - namespace may already exist (e.g., openshift-adp)
+		if err != nil && !strings.Contains(output, "already exists") {
+			Expect(err).NotTo(HaveOccurred(), "Failed to create namespace")
+		}
 
 		By("labeling the namespace to enforce the restricted security policy")
 		cmd = exec.Command("kubectl", "label", "--overwrite", "ns", namespace,

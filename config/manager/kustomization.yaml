@@ -1,2 +1,19 @@
 resources:
 - manager.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+images:
+- name: controller
+  newName: quay.io/konveyor/kubevirt-datamover-controller
+  newTag: latest
+replacements:
+- source:
+    fieldPath: spec.template.spec.containers.[name=manager].image
+    kind: Deployment
+    name: controller-manager
+  targets:
+  - fieldPaths:
+    - spec.template.spec.containers.[name=manager].env.[name=DATAMOVER_IMAGE].value
+    select:
+      kind: Deployment
+      name: controller-manager
