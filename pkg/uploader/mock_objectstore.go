@@ -32,6 +32,8 @@ import (
 var _ velero.ObjectStore = (*MockObjectStore)(nil)
 
 // MockObjectStore is an in-memory implementation of velero.ObjectStore for testing.
+// It is exported so that other packages (e.g., controller tests) can reuse it
+// instead of maintaining their own duplicate mock.
 type MockObjectStore struct {
 	mu      sync.RWMutex
 	objects map[string][]byte // key -> data
