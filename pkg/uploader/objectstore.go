@@ -48,18 +48,22 @@ type S3ObjectStore struct {
 }
 
 // NewS3ObjectStore creates a new S3ObjectStore.
-// For standalone use without calling Init().
-func NewS3ObjectStore(bucket, prefix, region, credentialsFile string) (*S3ObjectStore, error) {
+// credentialsData contains the raw credential file content (INI-style with
+// aws_access_key_id and aws_secret_access_key). Pass nil to use default
+// AWS credential chain (env vars, instance profile, etc.).
+func NewS3ObjectStore(bucket, prefix, region string, credentialsData []byte) (*S3ObjectStore, error) {
 	store := &S3ObjectStore{
 		bucket: bucket,
 		prefix: prefix,
 	}
 
 	configMap := map[string]string{
-		"bucket":          bucket,
-		"prefix":          prefix,
-		"region":          region,
-		"credentialsFile": credentialsFile,
+		"bucket": bucket,
+		"prefix": prefix,
+		"region": region,
+	}
+	if len(credentialsData) > 0 {
+		configMap["credentialsData"] = string(credentialsData)
 	}
 
 	if err := store.Init(configMap); err != nil {
@@ -71,12 +75,12 @@ func NewS3ObjectStore(bucket, prefix, region, credentialsFile string) (*S3Object
 
 // Init initializes the ObjectStore with the provided config.
 // This implements velero.ObjectStore.Init().
-// Expected config keys: bucket, prefix, region, credentialsFile
+// Expected config keys: bucket, prefix, region, and either credentialsData
+// (raw credential content) or credentialsFile (path to credentials file).
 func (s *S3ObjectStore) Init(configMap map[string]string) error {
 	bucket := configMap["bucket"]
 	prefix := configMap["prefix"]
 	region := configMap["region"]
-	credentialsFile := configMap["credentialsFile"]
 
 	if bucket == "" {
 		return fmt.Errorf("bucket is required in config")
@@ -94,9 +98,15 @@ func (s *S3ObjectStore) Init(configMap map[string]string) error {
 		opts = append(opts, config.WithRegion(region))
 	}
 
-	// Load credentials from file if specified
-	if credentialsFile != "" {
-		creds, err := loadAWSCredentialsFromFile(credentialsFile)
+	// Load credentials: prefer in-memory data, fall back to file path
+	if credData := configMap["credentialsData"]; credData != "" {
+		creds, err := ParseAWSCredentials([]byte(credData))
+		if err != nil {
+			return fmt.Errorf("failed to parse credentials: %w", err)
+		}
+		opts = append(opts, config.WithCredentialsProvider(creds))
+	} else if credFile := configMap["credentialsFile"]; credFile != "" {
+		creds, err := loadAWSCredentialsFromFile(credFile)
 		if err != nil {
 			return fmt.Errorf("failed to load credentials: %w", err)
 		}
@@ -288,14 +298,10 @@ func (s *S3ObjectStore) GetObjectBytes(key string) ([]byte, error) {
 	return io.ReadAll(reader)
 }
 
-// loadAWSCredentialsFromFile loads AWS credentials from a Velero-style credentials file.
-// The file format is INI-style with [default] profile containing aws_access_key_id and aws_secret_access_key.
-func loadAWSCredentialsFromFile(path string) (aws.CredentialsProvider, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read credentials file: %w", err)
-	}
-
+// ParseAWSCredentials parses AWS credentials from raw INI-style content.
+// The expected format contains aws_access_key_id and aws_secret_access_key
+// key=value pairs (with optional [default] section header).
+func ParseAWSCredentials(data []byte) (aws.CredentialsProvider, error) {
 	var accessKeyID, secretAccessKey string
 
 	for line := range strings.SplitSeq(string(data), "\n") {
@@ -314,26 +320,49 @@ func loadAWSCredentialsFromFile(path string) (aws.CredentialsProvider, error) {
 	}
 
 	if accessKeyID == "" || secretAccessKey == "" {
-		return nil, fmt.Errorf("credentials file missing aws_access_key_id or aws_secret_access_key")
+		return nil, fmt.Errorf(
+			"credentials data missing aws_access_key_id or aws_secret_access_key",
+		)
 	}
 
-	return credentials.NewStaticCredentialsProvider(accessKeyID, secretAccessKey, ""), nil
+	return credentials.NewStaticCredentialsProvider(
+		accessKeyID, secretAccessKey, "",
+	), nil
+}
+
+// loadAWSCredentialsFromFile loads AWS credentials from a file path.
+// Used by the datamover pod where credentials are mounted as a volume.
+func loadAWSCredentialsFromFile(path string) (aws.CredentialsProvider, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read credentials file: %w", err)
+	}
+	return ParseAWSCredentials(data)
 }
 
 // InitObjectStore creates an ObjectStore based on the provider type.
-// Returns a velero.ObjectStore implementation.
+// If CredentialsData is set, it is used directly. Otherwise, CredentialsFile
+// is read from disk (used by the datamover pod where credentials are volume-mounted).
 func InitObjectStore(cfg *UploaderConfig) (velero.ObjectStore, error) {
 	if cfg.BSLProvider == "" {
 		return nil, fmt.Errorf("BSL provider is required but was empty")
 	}
 
+	// Resolve credentials: prefer in-memory data, fall back to reading file
+	credData := cfg.CredentialsData
+	if len(credData) == 0 && cfg.CredentialsFile != "" {
+		var err error
+		credData, err = os.ReadFile(cfg.CredentialsFile)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read credentials file %s: %w",
+				cfg.CredentialsFile, err)
+		}
+	}
+
 	switch strings.ToLower(cfg.BSLProvider) {
 	case "aws":
 		return NewS3ObjectStore(
-			cfg.BSLBucket,
-			cfg.BSLPrefix,
-			cfg.BSLRegion,
-			cfg.CredentialsFile,
+			cfg.BSLBucket, cfg.BSLPrefix, cfg.BSLRegion, credData,
 		)
 	case "gcp":
 		// TODO: Implement GCP Cloud Storage support (issue #11)
@@ -344,10 +373,7 @@ func InitObjectStore(cfg *UploaderConfig) (velero.ObjectStore, error) {
 	default:
 		// Try S3-compatible for unknown providers
 		return NewS3ObjectStore(
-			cfg.BSLBucket,
-			cfg.BSLPrefix,
-			cfg.BSLRegion,
-			cfg.CredentialsFile,
+			cfg.BSLBucket, cfg.BSLPrefix, cfg.BSLRegion, credData,
 		)
 	}
 }

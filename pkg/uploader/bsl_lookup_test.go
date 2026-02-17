@@ -20,6 +20,7 @@ package uploader
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -450,6 +451,105 @@ func TestLookupLatestCheckpoint_ChainNotStartingWithFull(t *testing.T) {
 	}
 }
 
+func TestLookupLatestCheckpoint_CorruptedEmptyObjectPath(t *testing.T) {
+	// End-to-end test: a checkpoint with an empty ObjectPath (corrupt index)
+	// should cause the chain to be marked as broken, returning Found=false
+	// with a message indicating the corruption reason.
+	store := NewMockObjectStore("test-bucket", "")
+
+	vmIndex := VMIndex{
+		VMName:    "test-vm",
+		Namespace: "test-ns",
+		Checkpoints: []CheckpointEntry{
+			{
+				ID:       "cp-001",
+				Type:     "full",
+				VMBackup: "vmb-001",
+				Files: []CheckpointFile{
+					{
+						Filename:   "vmb-001-disk0.qcow2",
+						DiskName:   "root-disk",
+						ObjectPath: "", // Corrupt: empty ObjectPath
+					},
+				},
+			},
+		},
+	}
+	indexData, _ := json.Marshal(vmIndex)
+	_ = store.PutObjectBytes("checkpoints/test-ns/test-vm/index.json", indexData)
+
+	result, err := LookupLatestCheckpoint(context.Background(), store, "test-bucket", "test-ns", "test-vm")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if result.Found {
+		t.Error("expected Found=false when checkpoint has empty ObjectPath (corrupt index)")
+	}
+
+	// Verify the message contains the corruption reason for debugging
+	if !strings.Contains(result.Message, "empty object path") {
+		t.Errorf("expected message to contain 'empty object path' for debugging, got: %q",
+			result.Message)
+	}
+}
+
+func TestLookupLatestCheckpoint_CorruptedEmptyObjectPath_FallsBackToEarlier(t *testing.T) {
+	// When the latest checkpoint has a corrupt file (empty ObjectPath),
+	// the chain walker should fall back to the previous valid checkpoint.
+	store := NewMockObjectStore("test-bucket", "")
+
+	vmIndex := VMIndex{
+		VMName:    "test-vm",
+		Namespace: "test-ns",
+		Checkpoints: []CheckpointEntry{
+			{
+				ID:       "cp-001",
+				Type:     "full",
+				VMBackup: "vmb-001",
+				Files: []CheckpointFile{
+					{
+						Filename:   "vmb-001-disk0.qcow2",
+						DiskName:   "root-disk",
+						ObjectPath: "checkpoints/test-ns/test-vm/cp-001/vmb-001-disk0.qcow2",
+					},
+				},
+			},
+			{
+				ID:       "cp-002",
+				Type:     "incremental",
+				Parent:   "cp-001",
+				VMBackup: "vmb-002",
+				Files: []CheckpointFile{
+					{
+						Filename:   "vmb-002-disk0.qcow2",
+						DiskName:   "root-disk",
+						ObjectPath: "", // Corrupt: empty ObjectPath
+					},
+				},
+			},
+		},
+	}
+	indexData, _ := json.Marshal(vmIndex)
+	_ = store.PutObjectBytes("checkpoints/test-ns/test-vm/index.json", indexData)
+
+	// Only the full backup file exists (incremental is corrupt)
+	_ = store.PutObjectBytes("checkpoints/test-ns/test-vm/cp-001/vmb-001-disk0.qcow2", []byte("full"))
+
+	result, err := LookupLatestCheckpoint(context.Background(), store, "test-bucket", "test-ns", "test-vm")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Should fall back to the full backup checkpoint (cp-001)
+	if !result.Found {
+		t.Fatalf("expected Found=true (fallback to cp-001), got Found=false: %s", result.Message)
+	}
+	if result.LatestCheckpoint != "cp-001" {
+		t.Errorf("expected LatestCheckpoint=cp-001 (fallback), got %q", result.LatestCheckpoint)
+	}
+}
+
 func TestValidateCheckpointFiles(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -488,15 +588,15 @@ func TestValidateCheckpointFiles(t *testing.T) {
 			expectError: false,
 		},
 		{
-			name: "file with empty object path is skipped",
+			name: "file with empty object path returns error",
 			files: []CheckpointFile{
-				{Filename: "disk0.qcow2", ObjectPath: ""},
+				{Filename: "disk0.qcow2", DiskName: "root-disk", ObjectPath: ""},
 				{Filename: "disk1.qcow2", ObjectPath: "path/to/disk1.qcow2"},
 			},
 			storeFiles: map[string]string{
 				"path/to/disk1.qcow2": "data1",
 			},
-			expectError: false,
+			expectError: true,
 		},
 	}
 
@@ -507,7 +607,7 @@ func TestValidateCheckpointFiles(t *testing.T) {
 				_ = store.PutObjectBytes(path, []byte(content))
 			}
 
-			err := validateCheckpointFiles(store, "test-bucket", tt.files)
+			err := validateCheckpointFiles(context.Background(), store, "test-bucket", tt.files)
 
 			if tt.expectError && err == nil {
 				t.Error("expected error but got none")
@@ -516,6 +616,50 @@ func TestValidateCheckpointFiles(t *testing.T) {
 				t.Errorf("unexpected error: %v", err)
 			}
 		})
+	}
+}
+
+func TestValidateCheckpointFiles_ParallelMultipleDisks(t *testing.T) {
+	store := NewMockObjectStore("test-bucket", "")
+	files := make([]CheckpointFile, 10)
+	for i := range 10 {
+		path := fmt.Sprintf("checkpoints/ns/vm/cp1/disk%d.qcow2", i)
+		files[i] = CheckpointFile{
+			Filename:   fmt.Sprintf("disk%d.qcow2", i),
+			DiskName:   fmt.Sprintf("disk-%d", i),
+			ObjectPath: path,
+		}
+		_ = store.PutObjectBytes(path, []byte("data"))
+	}
+
+	err := validateCheckpointFiles(context.Background(), store, "test-bucket", files)
+	if err != nil {
+		t.Errorf("unexpected error with 10 valid files: %v", err)
+	}
+}
+
+func TestValidateCheckpointFiles_ParallelFirstErrorCancels(t *testing.T) {
+	store := NewMockObjectStore("test-bucket", "")
+	files := make([]CheckpointFile, 10)
+	for i := range 10 {
+		path := fmt.Sprintf("checkpoints/ns/vm/cp1/disk%d.qcow2", i)
+		files[i] = CheckpointFile{
+			Filename:   fmt.Sprintf("disk%d.qcow2", i),
+			DiskName:   fmt.Sprintf("disk-%d", i),
+			ObjectPath: path,
+		}
+		// Only add half the files to the store - the others will be "missing"
+		if i%2 == 0 {
+			_ = store.PutObjectBytes(path, []byte("data"))
+		}
+	}
+
+	err := validateCheckpointFiles(context.Background(), store, "test-bucket", files)
+	if err == nil {
+		t.Error("expected error for missing files but got none")
+	}
+	if !strings.Contains(err.Error(), "not found in BSL") {
+		t.Errorf("expected 'not found in BSL' error, got: %v", err)
 	}
 }
 

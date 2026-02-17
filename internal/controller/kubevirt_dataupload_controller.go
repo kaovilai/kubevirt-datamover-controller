@@ -20,7 +20,6 @@ package controller
 import (
 	"context"
 	"fmt"
-	"os"
 	"strings"
 	"time"
 
@@ -220,6 +219,26 @@ func (r *KubeVirtDataUploadReconciler) handleAccepted(ctx context.Context, logge
 		return ctrl.Result{}, nil
 	}
 
+	// Step 0: Verify BSL exists before creating any resources.
+	// If BSL is unavailable, creating PVC/VMBT/VMB would be wasteful since
+	// the DataUpload will fail in Prepared phase anyway.
+	if du.Spec.BackupStorageLocation != "" {
+		if _, err := r.getBackupStorageLocation(ctx, du); err != nil {
+			if errors.IsNotFound(err) {
+				logger.Error(err, "BackupStorageLocation not found")
+				if updateErr := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed,
+					fmt.Sprintf("BackupStorageLocation not found: %v", err)); updateErr != nil {
+					return ctrl.Result{}, updateErr
+				}
+				return ctrl.Result{}, nil
+			}
+			// Transient error (network, API server issue) - requeue without creating resources
+			logger.Info("BSL temporarily unavailable, will retry before creating resources",
+				"reason", err.Error())
+			return ctrl.Result{RequeueAfter: RequeueAfterLong}, nil
+		}
+	}
+
 	// Step 1: Create or get temporary PVC for backup output
 	pvc, err := r.ensureTempPVC(ctx, logger, du, vmRef.Namespace)
 	if err != nil {
@@ -243,7 +262,7 @@ func (r *KubeVirtDataUploadReconciler) handleAccepted(ctx context.Context, logge
 	vmb, created, err := r.ensureVMBackup(ctx, logger, du, vmbt, pvc.Name, vmRef.Namespace, forceFullBackup)
 	if err != nil {
 		// Check if the error is due to another VMB being in progress for the same VM.
-		// KubeVirt's admission webhook only allows one VMB per VM at a time.
+		// KubeVirt's admission webhook only allows one active (non-terminal) VMB per VM.
 		// Requeue with a longer delay instead of returning an error (which causes
 		// exponential backoff retry storm).
 		if strings.Contains(err.Error(), "in progress for source") {
@@ -342,16 +361,18 @@ func (r *KubeVirtDataUploadReconciler) validateBSLCheckpoint(ctx context.Context
 	var checkpointLookup *uploader.CheckpointLookupResult
 	bsl, bslErr := r.getBackupStorageLocation(ctx, du)
 	if bslErr != nil {
-		// BSL lookup failure is non-fatal during Accepted phase.
-		// We proceed with full backup. BSL is required later in Prepared phase.
-		logger.Info("BSL not available for checkpoint lookup, will perform full backup",
+		// BSL lookup failure is non-fatal. VMBT is left as-is: if it already has
+		// a valid checkpoint, KubeVirt will use it for incremental backup.
+		// Validation will be retried on the next reconcile.
+		logger.Info("BSL not available for checkpoint lookup, skipping validation",
 			"reason", bslErr.Error())
 	} else {
 		var err error
 		checkpointLookup, err = r.lookupCheckpointFromBSL(ctx, bsl, vmRef.Namespace, vmRef.Name)
 		if err != nil {
-			// Checkpoint lookup failure is non-fatal - fall back to full backup
-			logger.Info("Checkpoint lookup failed, will perform full backup",
+			// Checkpoint lookup failure is non-fatal. VMBT is left as-is
+			// and validation will be retried on the next reconcile.
+			logger.Info("Checkpoint lookup failed, skipping validation",
 				"reason", err.Error())
 		} else if checkpointLookup != nil {
 			logger.Info("Checkpoint lookup completed",
@@ -1092,12 +1113,11 @@ func (r *KubeVirtDataUploadReconciler) lookupCheckpointFromBSL(ctx context.Conte
 		return nil, fmt.Errorf("BSL %s has no credential configured", bsl.Name)
 	}
 
-	// Get credentials from BSL secret
-	credFile, cleanup, err := r.getCredentialsFromBSL(ctx, bsl)
+	// Get credentials from BSL secret (in-memory, no temp file)
+	credData, err := r.getCredentialsFromBSL(ctx, bsl)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get BSL credentials: %w", err)
 	}
-	defer cleanup()
 
 	// Initialize object store using provider dispatch
 	factory := r.ObjectStoreFactory
@@ -1115,7 +1135,7 @@ func (r *KubeVirtDataUploadReconciler) lookupCheckpointFromBSL(ctx context.Conte
 		BSLBucket:       cfg.Bucket,
 		BSLPrefix:       cfg.Prefix,
 		BSLRegion:       cfg.Region,
-		CredentialsFile: credFile,
+		CredentialsData: credData,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize object store: %w", err)
@@ -1130,14 +1150,13 @@ func (r *KubeVirtDataUploadReconciler) lookupCheckpointFromBSL(ctx context.Conte
 	return result, nil
 }
 
-// getCredentialsFromBSL reads the BSL credential secret and writes it to a temporary file.
-// Returns the temp file path, a cleanup function to remove the file, and any error.
-// The caller must call the cleanup function when done.
-func (r *KubeVirtDataUploadReconciler) getCredentialsFromBSL(ctx context.Context, bsl *velerov1.BackupStorageLocation) (string, func(), error) {
-	noopCleanup := func() {}
-
+// getCredentialsFromBSL reads the BSL credential secret and returns the raw
+// credential bytes. The credentials are kept in memory and never written to disk.
+func (r *KubeVirtDataUploadReconciler) getCredentialsFromBSL(
+	ctx context.Context, bsl *velerov1.BackupStorageLocation,
+) ([]byte, error) {
 	if bsl.Spec.Credential == nil {
-		return "", noopCleanup, fmt.Errorf("BSL %s has no credential configured", bsl.Name)
+		return nil, fmt.Errorf("BSL %s has no credential configured", bsl.Name)
 	}
 
 	secretName := bsl.Spec.Credential.Name
@@ -1154,39 +1173,24 @@ func (r *KubeVirtDataUploadReconciler) getCredentialsFromBSL(ctx context.Context
 
 	// Fetch the secret
 	secret := &corev1.Secret{}
-	if err := r.Get(ctx, types.NamespacedName{Name: secretName, Namespace: namespace}, secret); err != nil {
-		return "", noopCleanup, fmt.Errorf("failed to get credential secret %s/%s: %w", namespace, secretName, err)
+	if err := r.Get(ctx, types.NamespacedName{
+		Name: secretName, Namespace: namespace,
+	}, secret); err != nil {
+		return nil, fmt.Errorf(
+			"failed to get credential secret %s/%s: %w",
+			namespace, secretName, err,
+		)
 	}
 
 	credData, ok := secret.Data[secretKey]
 	if !ok {
-		return "", noopCleanup, fmt.Errorf("credential secret %s/%s does not contain key %q", namespace, secretName, secretKey)
+		return nil, fmt.Errorf(
+			"credential secret %s/%s does not contain key %q",
+			namespace, secretName, secretKey,
+		)
 	}
 
-	// Write to a temporary file with restrictive permissions (contains credentials)
-	tmpFile, err := os.CreateTemp("", "bsl-creds-*")
-	if err != nil {
-		return "", noopCleanup, fmt.Errorf("failed to create temp credentials file: %w", err)
-	}
-
-	if err := os.Chmod(tmpFile.Name(), 0600); err != nil {
-		_ = tmpFile.Close()
-		_ = os.Remove(tmpFile.Name())
-		return "", noopCleanup, fmt.Errorf("failed to set permissions on temp credentials file: %w", err)
-	}
-
-	if _, err := tmpFile.Write(credData); err != nil {
-		_ = tmpFile.Close()
-		_ = os.Remove(tmpFile.Name())
-		return "", noopCleanup, fmt.Errorf("failed to write credentials to temp file: %w", err)
-	}
-	_ = tmpFile.Close()
-
-	cleanup := func() {
-		_ = os.Remove(tmpFile.Name())
-	}
-
-	return tmpFile.Name(), cleanup, nil
+	return credData, nil
 }
 
 // clearVMBTCheckpoint removes the checkpoint from the VMBT status, forcing KubeVirt

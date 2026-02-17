@@ -102,7 +102,13 @@ type UploaderConfig struct {
 	BSLPrefix   string
 	BSLRegion   string
 
-	// Credentials file path
+	// CredentialsData holds raw credential content (INI-style).
+	// Used by the controller to pass credentials from K8s Secrets directly
+	// without writing to a temp file. Takes precedence over CredentialsFile.
+	CredentialsData []byte
+
+	// CredentialsFile is the path to a credentials file on disk.
+	// Used by the datamover pod where credentials are volume-mounted.
 	CredentialsFile string
 
 	// VM context

@@ -23,6 +23,7 @@ import (
 	"strings"
 
 	velero "github.com/vmware-tanzu/velero/pkg/plugin/velero"
+	"golang.org/x/sync/errgroup"
 )
 
 // CheckpointLookupResult holds the result of looking up the latest checkpoint from BSL.
@@ -169,10 +170,12 @@ func validateCheckpointChain(
 		// Walk from the latest (end) toward the full backup (start)
 		// If we find a broken link, try the checkpoint before it
 		brokenAt := -1
+		var brokenReason string
 		for i := len(chain) - 1; i >= 0; i-- {
 			cp := chain[i]
-			if err := validateCheckpointFiles(store, bucket, cp.Files); err != nil {
+			if err := validateCheckpointFiles(ctx, store, bucket, cp.Files); err != nil {
 				brokenAt = i
+				brokenReason = err.Error()
 				break
 			}
 		}
@@ -193,8 +196,8 @@ func validateCheckpointChain(
 			// Even the full backup has missing files - no valid chain possible
 			return &CheckpointLookupResult{
 				Found: false,
-				Message: fmt.Sprintf("full backup checkpoint %q has missing files",
-					chain[0].ID),
+				Message: fmt.Sprintf("full backup checkpoint %q is broken: %s",
+					chain[0].ID, brokenReason),
 			}, nil
 		}
 
@@ -206,20 +209,30 @@ func validateCheckpointChain(
 // validateCheckpointFiles checks that all qcow2 files in a checkpoint exist in BSL.
 // The ObjectPath in each CheckpointFile is expected to be a relative key (without
 // the store prefix), matching how the uploader writes them via the same ObjectStore.
-func validateCheckpointFiles(store velero.ObjectStore, bucket string, files []CheckpointFile) error {
-	for _, f := range files {
-		if f.ObjectPath == "" {
-			continue
-		}
+// File existence checks are performed in parallel using errgroup for efficiency
+// when VMs have multiple disks.
+func validateCheckpointFiles(
+	_ context.Context, store velero.ObjectStore, bucket string, files []CheckpointFile,
+) error {
+	var g errgroup.Group
 
-		exists, err := store.ObjectExists(bucket, f.ObjectPath)
-		if err != nil {
-			return fmt.Errorf("failed to check file %s: %w", f.ObjectPath, err)
-		}
-		if !exists {
-			return fmt.Errorf("file %s not found in BSL", f.ObjectPath)
-		}
+	for _, f := range files {
+		file := f
+		g.Go(func() error {
+			if file.ObjectPath == "" {
+				return fmt.Errorf("checkpoint file has empty object path (disk: %s)", file.DiskName)
+			}
+
+			exists, err := store.ObjectExists(bucket, file.ObjectPath)
+			if err != nil {
+				return fmt.Errorf("failed to check file %s: %w", file.ObjectPath, err)
+			}
+			if !exists {
+				return fmt.Errorf("file %s not found in BSL", file.ObjectPath)
+			}
+			return nil
+		})
 	}
 
-	return nil
+	return g.Wait()
 }
