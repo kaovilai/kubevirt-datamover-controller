@@ -4519,3 +4519,303 @@ func TestHandleAccepted_StaleCheckpointSetsForceFullOnVMB(t *testing.T) {
 			updatedVMBT.Status.LatestCheckpoint.Name)
 	}
 }
+
+func TestValidateBSLCheckpoint_ForceFullOnVMBTUpdateFailure(t *testing.T) {
+	// When BSL lookup returns Found=true with a valid checkpoint but the VMBT
+	// status update fails (e.g., conflict), forceFullBackup must be set to true.
+	// Otherwise, KubeVirt creates an incremental backup on a broken chain.
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = velerov1.AddToScheme(scheme)
+	_ = kubevirtbackupv1alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	vmName := "test-vm"
+	vmNamespace := "test-ns"
+	duName := "test-du-vmbt-fail"
+
+	du := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      duName,
+			Namespace: vmNamespace,
+			UID:       types.UID("test-uid"),
+			Annotations: map[string]string{
+				common.AnnotationVMName:      vmName,
+				common.AnnotationVMNamespace: vmNamespace,
+			},
+		},
+		Spec: velerov2alpha1.DataUploadSpec{
+			DataMover:             common.DataMoverKubeVirt,
+			SourceNamespace:       vmNamespace,
+			BackupStorageLocation: "default",
+		},
+		Status: velerov2alpha1.DataUploadStatus{
+			Phase: velerov2alpha1.DataUploadPhaseAccepted,
+		},
+	}
+
+	bsl := &velerov1.BackupStorageLocation{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "default",
+			Namespace: vmNamespace,
+		},
+		Spec: velerov1.BackupStorageLocationSpec{
+			Provider: "aws",
+			StorageType: velerov1.StorageType{
+				ObjectStorage: &velerov1.ObjectStorageLocation{
+					Bucket: "test-bucket",
+					Prefix: "velero",
+				},
+			},
+			Config: map[string]string{"region": "us-east-1"},
+			Credential: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "cloud-creds"},
+				Key:                  "cloud",
+			},
+		},
+	}
+
+	credSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "cloud-creds",
+			Namespace: vmNamespace,
+		},
+		Data: map[string][]byte{
+			"cloud": []byte("[default]\naws_access_key_id=AKID\naws_secret_access_key=SECRET\n"),
+		},
+	}
+
+	// Create VMBT — will be deleted from the client before calling validateBSLCheckpoint
+	// to force the Status().Update() call to fail
+	vmbt := &kubevirtbackupv1alpha1.VirtualMachineBackupTracker{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "vmbt-" + vmName,
+			Namespace: vmNamespace,
+		},
+		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupTrackerSpec{
+			Source: corev1.TypedLocalObjectReference{
+				APIGroup: strPtr("kubevirt.io"),
+				Kind:     "VirtualMachine",
+				Name:     vmName,
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(du, bsl, credSecret).
+		WithStatusSubresource(&kubevirtbackupv1alpha1.VirtualMachineBackupTracker{}).
+		Build()
+
+	// Mock object store with a valid checkpoint chain
+	mockStore := uploader.NewMockObjectStore("test-bucket", "velero-kubevirt-datamover")
+	vmIndex := uploader.VMIndex{
+		VMName:    vmName,
+		Namespace: vmNamespace,
+		Checkpoints: []uploader.CheckpointEntry{
+			{
+				ID:       "cp-001",
+				Type:     "full",
+				VMBackup: "vmb-001",
+				Files: []uploader.CheckpointFile{
+					{
+						Filename:   "vmb-001-disk0.qcow2",
+						ObjectPath: "checkpoints/test-ns/test-vm/cp-001/vmb-001-disk0.qcow2",
+					},
+				},
+			},
+		},
+	}
+	indexData, _ := json.Marshal(vmIndex)
+	_ = mockStore.PutObjectBytes("checkpoints/test-ns/test-vm/index.json", indexData)
+	_ = mockStore.PutObjectBytes("checkpoints/test-ns/test-vm/cp-001/vmb-001-disk0.qcow2", []byte("full"))
+
+	r := &KubeVirtDataUploadReconciler{
+		Client:        fakeClient,
+		Scheme:        scheme,
+		Log:           logr.Discard(),
+		OADPNamespace: vmNamespace,
+		ObjectStoreFactory: func(_ *uploader.UploaderConfig) (velero.ObjectStore, error) {
+			return mockStore, nil
+		},
+	}
+
+	vmRef := &common.VMReference{Name: vmName, Namespace: vmNamespace}
+
+	// Call validateBSLCheckpoint with a VMBT that doesn't exist in the fake client.
+	// This causes Status().Update() to fail, triggering the forceFullBackup path.
+	forceFullBackup := r.validateBSLCheckpoint(context.Background(), logr.Discard(), du, vmbt, vmRef)
+
+	if !forceFullBackup {
+		t.Error("expected forceFullBackup=true when VMBT status update fails")
+	}
+}
+
+func TestValidateBSLCheckpoint_ForceFullOnChainFallback(t *testing.T) {
+	// When the BSL checkpoint chain is broken mid-way and falls back to an
+	// older checkpoint, forceFullBackup must be true. We can't safely assume
+	// KubeVirt's CBT can produce a correct incremental since the older checkpoint.
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = velerov1.AddToScheme(scheme)
+	_ = kubevirtbackupv1alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	vmName := "test-vm"
+	vmNamespace := "test-ns"
+	duName := "test-du-chain-fallback"
+
+	du := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      duName,
+			Namespace: vmNamespace,
+			UID:       types.UID("test-uid"),
+			Annotations: map[string]string{
+				common.AnnotationVMName:      vmName,
+				common.AnnotationVMNamespace: vmNamespace,
+			},
+		},
+		Spec: velerov2alpha1.DataUploadSpec{
+			DataMover:             common.DataMoverKubeVirt,
+			SourceNamespace:       vmNamespace,
+			BackupStorageLocation: "default",
+		},
+		Status: velerov2alpha1.DataUploadStatus{
+			Phase: velerov2alpha1.DataUploadPhaseAccepted,
+		},
+	}
+
+	bsl := &velerov1.BackupStorageLocation{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "default",
+			Namespace: vmNamespace,
+		},
+		Spec: velerov1.BackupStorageLocationSpec{
+			Provider: "aws",
+			StorageType: velerov1.StorageType{
+				ObjectStorage: &velerov1.ObjectStorageLocation{
+					Bucket: "test-bucket",
+					Prefix: "velero",
+				},
+			},
+			Config: map[string]string{"region": "us-east-1"},
+			Credential: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "cloud-creds"},
+				Key:                  "cloud",
+			},
+		},
+	}
+
+	credSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "cloud-creds",
+			Namespace: vmNamespace,
+		},
+		Data: map[string][]byte{
+			"cloud": []byte("[default]\naws_access_key_id=AKID\naws_secret_access_key=SECRET\n"),
+		},
+	}
+
+	// VMBT with checkpoint set to cp-003 (the latest in the chain).
+	// BSL will return cp-001 as latest valid (because cp-002 is broken).
+	// The mismatch triggers forceFullBackup.
+	now := metav1.Now()
+	vmbt := &kubevirtbackupv1alpha1.VirtualMachineBackupTracker{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "vmbt-" + vmName,
+			Namespace: vmNamespace,
+		},
+		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupTrackerSpec{
+			Source: corev1.TypedLocalObjectReference{
+				APIGroup: strPtr("kubevirt.io"),
+				Kind:     "VirtualMachine",
+				Name:     vmName,
+			},
+		},
+		Status: &kubevirtbackupv1alpha1.VirtualMachineBackupTrackerStatus{
+			LatestCheckpoint: &kubevirtbackupv1alpha1.BackupCheckpoint{
+				Name:         "cp-003",
+				CreationTime: &now,
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(du, bsl, credSecret, vmbt).
+		WithStatusSubresource(&kubevirtbackupv1alpha1.VirtualMachineBackupTracker{}).
+		Build()
+
+	// Mock object store: chain cp-001(Full) -> cp-002(Inc) -> cp-003(Inc)
+	// cp-002's file is missing → chain falls back to cp-001
+	mockStore := uploader.NewMockObjectStore("test-bucket", "velero-kubevirt-datamover")
+	vmIndex := uploader.VMIndex{
+		VMName:    vmName,
+		Namespace: vmNamespace,
+		Checkpoints: []uploader.CheckpointEntry{
+			{
+				ID:       "cp-001",
+				Type:     "full",
+				VMBackup: "vmb-001",
+				Files: []uploader.CheckpointFile{
+					{ObjectPath: "checkpoints/test-ns/test-vm/cp-001/disk.qcow2"},
+				},
+			},
+			{
+				ID:       "cp-002",
+				Type:     "incremental",
+				Parent:   "cp-001",
+				VMBackup: "vmb-002",
+				Files: []uploader.CheckpointFile{
+					{ObjectPath: "checkpoints/test-ns/test-vm/cp-002/disk.qcow2"},
+				},
+			},
+			{
+				ID:       "cp-003",
+				Type:     "incremental",
+				Parent:   "cp-002",
+				VMBackup: "vmb-003",
+				Files: []uploader.CheckpointFile{
+					{ObjectPath: "checkpoints/test-ns/test-vm/cp-003/disk.qcow2"},
+				},
+			},
+		},
+	}
+	indexData, _ := json.Marshal(vmIndex)
+	_ = mockStore.PutObjectBytes("checkpoints/test-ns/test-vm/index.json", indexData)
+	// Create files for cp-001 and cp-003 but NOT cp-002 (mid-chain break)
+	_ = mockStore.PutObjectBytes("checkpoints/test-ns/test-vm/cp-001/disk.qcow2", []byte("full"))
+	_ = mockStore.PutObjectBytes("checkpoints/test-ns/test-vm/cp-003/disk.qcow2", []byte("inc2"))
+
+	r := &KubeVirtDataUploadReconciler{
+		Client:        fakeClient,
+		Scheme:        scheme,
+		Log:           logr.Discard(),
+		OADPNamespace: vmNamespace,
+		ObjectStoreFactory: func(_ *uploader.UploaderConfig) (velero.ObjectStore, error) {
+			return mockStore, nil
+		},
+	}
+
+	vmRef := &common.VMReference{Name: vmName, Namespace: vmNamespace}
+
+	forceFullBackup := r.validateBSLCheckpoint(context.Background(), logr.Discard(), du, vmbt, vmRef)
+
+	if !forceFullBackup {
+		t.Error("expected forceFullBackup=true when BSL chain falls back to older checkpoint")
+	}
+
+	// Verify VMBT checkpoint was cleared
+	var updatedVMBT kubevirtbackupv1alpha1.VirtualMachineBackupTracker
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{
+		Name:      vmbt.Name,
+		Namespace: vmNamespace,
+	}, &updatedVMBT); err != nil {
+		t.Fatalf("failed to get updated VMBT: %v", err)
+	}
+
+	if updatedVMBT.Status != nil && updatedVMBT.Status.LatestCheckpoint != nil {
+		t.Errorf("expected VMBT checkpoint to be cleared after chain fallback, got %q",
+			updatedVMBT.Status.LatestCheckpoint.Name)
+	}
+}

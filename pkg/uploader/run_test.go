@@ -250,6 +250,7 @@ func TestUpdateVMIndex(t *testing.T) {
 		config         *UploaderConfig
 		files          []CheckpointFile
 		existingIndex  *VMIndex
+		setupStore     func(*MockObjectStore) // optional: customize store after standard setup
 		expectError    bool
 		validateResult func(*testing.T, *MockObjectStore)
 	}{
@@ -317,7 +318,18 @@ func TestUpdateVMIndex(t *testing.T) {
 				VMName:    "test-vm",
 				Namespace: "test-ns",
 				Checkpoints: []CheckpointEntry{
-					{ID: "cp-001", Type: "full", VMBackup: "vmb-test"},
+					{
+						ID:       "cp-001",
+						Type:     "full",
+						VMBackup: "vmb-test",
+						Files: []CheckpointFile{
+							{
+								Filename:   "vmb-test-disk1.qcow2",
+								DiskName:   "disk1",
+								ObjectPath: "checkpoints/test-ns/test-vm/cp-001/vmb-test-disk1.qcow2",
+							},
+						},
+					},
 				},
 			},
 			expectError: false,
@@ -338,6 +350,99 @@ func TestUpdateVMIndex(t *testing.T) {
 					t.Error("incremental checkpoint should have parent")
 				}
 			},
+		},
+		{
+			name: "incremental with mid-chain break returns error",
+			config: &UploaderConfig{
+				BSLBucket:        "test-bucket",
+				VMName:           "test-vm",
+				VMNamespace:      "test-ns",
+				CheckpointName:   "cp-004",
+				BackupType:       "incremental",
+				VMBName:          "vmb-test-4",
+				VeleroBackupName: "backup-004",
+			},
+			files: []CheckpointFile{
+				{
+					Filename:   "vmb-test-4-disk1.qcow2",
+					DiskName:   "disk1",
+					Size:       256,
+					ObjectPath: "checkpoints/test-ns/test-vm/cp-004/vmb-test-4-disk1.qcow2",
+				},
+			},
+			existingIndex: &VMIndex{
+				VMName:    "test-vm",
+				Namespace: "test-ns",
+				Checkpoints: []CheckpointEntry{
+					{
+						ID:       "cp-001",
+						Type:     "full",
+						VMBackup: "vmb-test",
+						Files: []CheckpointFile{
+							{ObjectPath: "checkpoints/test-ns/test-vm/cp-001/vmb-test-disk1.qcow2"},
+						},
+					},
+					{
+						ID:       "cp-002",
+						Type:     "incremental",
+						Parent:   "cp-001",
+						VMBackup: "vmb-test-2",
+						Files: []CheckpointFile{
+							{ObjectPath: "checkpoints/test-ns/test-vm/cp-002/vmb-test-2-disk1.qcow2"},
+						},
+					},
+					{
+						ID:       "cp-003",
+						Type:     "incremental",
+						Parent:   "cp-002",
+						VMBackup: "vmb-test-3",
+						Files: []CheckpointFile{
+							{ObjectPath: "checkpoints/test-ns/test-vm/cp-003/vmb-test-3-disk1.qcow2"},
+						},
+					},
+				},
+			},
+			setupStore: func(store *MockObjectStore) {
+				// Delete cp-002's file to simulate mid-chain break
+				_ = store.DeleteObject("test-bucket", "checkpoints/test-ns/test-vm/cp-002/vmb-test-2-disk1.qcow2")
+			},
+			expectError: true, // Chain fell back — uploader rejects incremental as safety net
+		},
+		{
+			name: "incremental fails when no valid chain exists",
+			config: &UploaderConfig{
+				BSLBucket:        "test-bucket",
+				VMName:           "test-vm",
+				VMNamespace:      "test-ns",
+				CheckpointName:   "cp-002",
+				BackupType:       "incremental",
+				VMBName:          "vmb-test-2",
+				VeleroBackupName: "backup-002",
+			},
+			files: []CheckpointFile{
+				{
+					Filename:   "vmb-test-2-disk1.qcow2",
+					DiskName:   "disk1",
+					Size:       512,
+					ObjectPath: "checkpoints/test-ns/test-vm/cp-002/vmb-test-2-disk1.qcow2",
+				},
+			},
+			existingIndex: &VMIndex{
+				VMName:    "test-vm",
+				Namespace: "test-ns",
+				Checkpoints: []CheckpointEntry{
+					{
+						ID:       "cp-001",
+						Type:     "incremental",
+						Parent:   "cp-000", // cp-000 doesn't exist - broken chain
+						VMBackup: "vmb-test",
+						Files: []CheckpointFile{
+							{ObjectPath: "checkpoints/test-ns/test-vm/cp-001/vmb-test-disk1.qcow2"},
+						},
+					},
+				},
+			},
+			expectError: true,
 		},
 		{
 			name: "deduplicates checkpoint if already exists",
@@ -398,6 +503,20 @@ func TestUpdateVMIndex(t *testing.T) {
 				indexPath := fmt.Sprintf("checkpoints/%s/%s/index.json",
 					tt.config.VMNamespace, tt.config.VMName)
 				_ = store.PutObjectBytes(indexPath, data)
+
+				// Create S3 objects for existing checkpoint files so chain validation passes
+				for _, cp := range tt.existingIndex.Checkpoints {
+					for _, f := range cp.Files {
+						if f.ObjectPath != "" {
+							_ = store.PutObjectBytes(f.ObjectPath, []byte("fake-qcow2"))
+						}
+					}
+				}
+			}
+
+			// Optional: customize the store (e.g., delete specific files for break tests)
+			if tt.setupStore != nil {
+				tt.setupStore(store)
 			}
 
 			// Call the real updateVMIndex function with MockObjectStore

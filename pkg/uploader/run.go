@@ -236,7 +236,9 @@ func extractDiskName(filename string) string {
 }
 
 // updateVMIndex creates or updates the per-VM index.json file.
-func updateVMIndex(_ context.Context, store velero.ObjectStore, config *UploaderConfig, files []CheckpointFile) error {
+func updateVMIndex(
+	ctx context.Context, store velero.ObjectStore, config *UploaderConfig, files []CheckpointFile,
+) error {
 	indexPath := fmt.Sprintf("checkpoints/%s/%s/index.json", config.VMNamespace, config.VMName)
 
 	// Try to load existing index
@@ -291,10 +293,25 @@ func updateVMIndex(_ context.Context, store velero.ObjectStore, config *Uploader
 		ReferencedBy: referencedBy,
 	}
 
-	// For incremental backups, set parent checkpoint
+	// For incremental backups, validate the S3 chain and set parent checkpoint
 	if strings.ToLower(config.BackupType) == BackupTypeIncremental && len(vmIndex.Checkpoints) > 0 {
-		// Use the most recent checkpoint as parent
-		checkpoint.Parent = vmIndex.Checkpoints[len(vmIndex.Checkpoints)-1].ID
+		latestCP := vmIndex.Checkpoints[len(vmIndex.Checkpoints)-1]
+		result, err := validateCheckpointChain(ctx, store, config.BSLBucket, vmIndex.Checkpoints, latestCP.ID)
+		if err != nil {
+			return fmt.Errorf("failed to validate checkpoint chain: %w", err)
+		}
+		if !result.Found {
+			return fmt.Errorf("incremental backup requested but no valid parent chain exists: %s", result.Message)
+		}
+		// If the chain fell back to an older checkpoint, the controller should have
+		// forced a full backup. Reject the incremental as a safety net.
+		if result.LatestCheckpoint != latestCP.ID {
+			return fmt.Errorf(
+				"checkpoint chain is broken: latest valid checkpoint is %s but expected %s; "+
+					"a full backup should have been performed instead",
+				result.LatestCheckpoint, latestCP.ID)
+		}
+		checkpoint.Parent = result.LatestCheckpoint
 	}
 
 	// Append new checkpoint (avoid duplicates)

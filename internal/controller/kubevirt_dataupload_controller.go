@@ -390,12 +390,31 @@ func (r *KubeVirtDataUploadReconciler) validateBSLCheckpoint(ctx context.Context
 		vmbt.Status.LatestCheckpoint.Name != ""
 
 	if checkpointLookup != nil && checkpointLookup.Found {
-		// Valid checkpoint chain found in BSL - set it on VMBT for incremental backup
-		if err := r.updateVMBTCheckpoint(ctx, logger, vmbt, checkpointLookup.LatestCheckpoint); err != nil {
-			// Non-fatal: if we can't update the VMBT, KubeVirt will do a full backup
-			logger.Info("Failed to update VMBT with checkpoint, will perform full backup",
+		// A valid checkpoint chain exists in BSL. Check whether it matches
+		// the VMBT's current checkpoint or is a fallback to an older one.
+		bslMatchesVMBT := !vmbtHasCheckpoint ||
+			vmbt.Status.LatestCheckpoint.Name == checkpointLookup.LatestCheckpoint
+
+		if !bslMatchesVMBT {
+			// The chain was broken mid-way and BSL fell back to an older checkpoint
+			// (e.g., VMBT has du-5 but BSL found chain-6 as last valid).
+			// Forcing a full backup is safer than assuming KubeVirt's CBT can produce
+			// a correct incremental since an arbitrary older checkpoint.
+			logger.Info("BSL checkpoint chain fell back to an older checkpoint, forcing full backup",
+				"vmbtCheckpoint", vmbt.Status.LatestCheckpoint.Name,
+				"bslCheckpoint", checkpointLookup.LatestCheckpoint,
+				"chainLength", checkpointLookup.ChainLength)
+			if err := r.clearVMBTCheckpoint(ctx, logger, vmbt); err != nil {
+				logger.Error(err, "Failed to clear VMBT checkpoint after chain fallback")
+			}
+			forceFullBackup = true
+		} else if err := r.updateVMBTCheckpoint(ctx, logger, vmbt, checkpointLookup.LatestCheckpoint); err != nil {
+			// VMBT still has stale/no checkpoint; KubeVirt may create an incremental
+			// on a broken chain. Force full backup as defense-in-depth.
+			logger.Info("Failed to update VMBT with checkpoint, will force full backup",
 				"checkpoint", checkpointLookup.LatestCheckpoint,
 				"reason", err.Error())
+			forceFullBackup = true
 		} else {
 			logger.Info("Updated VMBT with latest checkpoint from BSL",
 				"checkpoint", checkpointLookup.LatestCheckpoint,

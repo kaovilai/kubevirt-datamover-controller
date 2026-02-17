@@ -550,6 +550,77 @@ func TestLookupLatestCheckpoint_CorruptedEmptyObjectPath_FallsBackToEarlier(t *t
 	}
 }
 
+func TestValidateCheckpointChain_MidChainBreak(t *testing.T) {
+	// Chain: Full(cp1) -> Inc(cp2) -> Inc(cp3) -> Inc(cp4) -> Inc(cp5)
+	// cp3 files deleted from S3
+	// Expected: validateCheckpointChain returns Found=true, LatestCheckpoint=cp2
+	store := NewMockObjectStore("test-bucket", "")
+
+	checkpoints := []CheckpointEntry{
+		{
+			ID:   "cp-001",
+			Type: "full",
+			Files: []CheckpointFile{
+				{ObjectPath: "checkpoints/ns/vm/cp-001/disk.qcow2"},
+			},
+		},
+		{
+			ID:     "cp-002",
+			Type:   "incremental",
+			Parent: "cp-001",
+			Files: []CheckpointFile{
+				{ObjectPath: "checkpoints/ns/vm/cp-002/disk.qcow2"},
+			},
+		},
+		{
+			ID:     "cp-003",
+			Type:   "incremental",
+			Parent: "cp-002",
+			Files: []CheckpointFile{
+				{ObjectPath: "checkpoints/ns/vm/cp-003/disk.qcow2"},
+			},
+		},
+		{
+			ID:     "cp-004",
+			Type:   "incremental",
+			Parent: "cp-003",
+			Files: []CheckpointFile{
+				{ObjectPath: "checkpoints/ns/vm/cp-004/disk.qcow2"},
+			},
+		},
+		{
+			ID:     "cp-005",
+			Type:   "incremental",
+			Parent: "cp-004",
+			Files: []CheckpointFile{
+				{ObjectPath: "checkpoints/ns/vm/cp-005/disk.qcow2"},
+			},
+		},
+	}
+
+	// Create files for all checkpoints EXCEPT cp-003
+	_ = store.PutObjectBytes("checkpoints/ns/vm/cp-001/disk.qcow2", []byte("full"))
+	_ = store.PutObjectBytes("checkpoints/ns/vm/cp-002/disk.qcow2", []byte("inc1"))
+	// cp-003 is missing - mid-chain break
+	_ = store.PutObjectBytes("checkpoints/ns/vm/cp-004/disk.qcow2", []byte("inc3"))
+	_ = store.PutObjectBytes("checkpoints/ns/vm/cp-005/disk.qcow2", []byte("inc4"))
+
+	result, err := validateCheckpointChain(context.Background(), store, "test-bucket", checkpoints, "cp-005")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if !result.Found {
+		t.Fatalf("expected Found=true (fallback to cp-002), got Found=false: %s", result.Message)
+	}
+	if result.LatestCheckpoint != "cp-002" {
+		t.Errorf("expected LatestCheckpoint=cp-002, got %q", result.LatestCheckpoint)
+	}
+	if result.ChainLength != 2 {
+		t.Errorf("expected ChainLength=2, got %d", result.ChainLength)
+	}
+}
+
 func TestValidateCheckpointFiles(t *testing.T) {
 	tests := []struct {
 		name        string
