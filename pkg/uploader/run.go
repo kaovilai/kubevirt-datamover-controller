@@ -29,6 +29,12 @@ import (
 	"time"
 
 	velero "github.com/vmware-tanzu/velero/pkg/plugin/velero"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	kubevirtbackupv1alpha1 "kubevirt.io/api/backup/v1alpha1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	restcfg "sigs.k8s.io/controller-runtime/pkg/client/config"
 )
 
 // Helper functions for working with velero.ObjectStore interface
@@ -81,8 +87,21 @@ func Run(ctx context.Context) error {
 
 	fmt.Printf("Uploaded %d qcow2 files\n", len(files))
 
-	// Update VM index
-	if err := updateVMIndex(ctx, store, config, files); err != nil {
+	// Create K8s client once — reused for archiving and cleanup
+	k8sClient, err := newKubeClient()
+	if err != nil {
+		return fmt.Errorf("failed to create K8s client: %w", err)
+	}
+
+	// Archive VMB/VMBT CRs to S3 (FATAL if fails — index references must be valid)
+	archived, err := archiveKubeResources(ctx, store, k8sClient, config)
+	if err != nil {
+		return fmt.Errorf("failed to archive Kube resources: %w", err)
+	}
+	fmt.Println("Kube resources archived to S3")
+
+	// Update VM index (references the archived paths)
+	if err := updateVMIndex(ctx, store, config, files, archived); err != nil {
 		return fmt.Errorf("failed to update VM index: %w", err)
 	}
 
@@ -94,6 +113,10 @@ func Run(ctx context.Context) error {
 	}
 
 	fmt.Println("Backup manifests updated")
+
+	// Delete VMB/VMBT from cluster (non-fatal — S3 is now source of truth)
+	cleanupKubeResources(ctx, k8sClient, config)
+
 	fmt.Println("Upload completed successfully")
 
 	return nil
@@ -115,6 +138,7 @@ func LoadConfigFromEnv() (*UploaderConfig, error) {
 		DataUploadName:   os.Getenv(EnvDataUploadName),
 		DataUploadUID:    os.Getenv(EnvDataUploadUID),
 		VMBName:          os.Getenv(EnvVMBName),
+		VMBTName:         os.Getenv(EnvVMBTName),
 		SourcePVCPath:    os.Getenv(EnvSourcePVCPath),
 	}
 
@@ -127,6 +151,9 @@ func LoadConfigFromEnv() (*UploaderConfig, error) {
 	}
 	if config.BackupType == "" {
 		config.BackupType = "full"
+	}
+	if config.VMBTName == "" && config.VMName != "" {
+		config.VMBTName = "vmbt-" + config.VMName
 	}
 
 	// Validate required fields
@@ -236,8 +263,11 @@ func extractDiskName(filename string) string {
 }
 
 // updateVMIndex creates or updates the per-VM index.json file.
+// The archived parameter provides S3 paths for the VMB/VMBT JSON files
+// that were uploaded by archiveKubeResources — these are stored on the
+// checkpoint entry so the index always references valid objects.
 func updateVMIndex(
-	ctx context.Context, store velero.ObjectStore, config *UploaderConfig, files []CheckpointFile,
+	ctx context.Context, store velero.ObjectStore, config *UploaderConfig, files []CheckpointFile, archived *archivedPaths,
 ) error {
 	indexPath := fmt.Sprintf("checkpoints/%s/%s/index.json", config.VMNamespace, config.VMName)
 
@@ -284,13 +314,15 @@ func updateVMIndex(
 	}
 
 	checkpoint := CheckpointEntry{
-		ID:           config.CheckpointName,
-		Type:         config.BackupType,
-		Timestamp:    time.Now().UTC(),
-		VMBackup:     config.VMBName,
-		Files:        files,
-		PVCs:         pvcNames,
-		ReferencedBy: referencedBy,
+		ID:             config.CheckpointName,
+		Type:           config.BackupType,
+		Timestamp:      time.Now().UTC(),
+		VMBackup:       config.VMBName,
+		Files:          files,
+		PVCs:           pvcNames,
+		ReferencedBy:   referencedBy,
+		VMBObjectPath:  archived.VMBObjectPath,
+		VMBTObjectPath: archived.VMBTObjectPath,
 	}
 
 	// For incremental backups, validate the S3 chain and set parent checkpoint
@@ -456,6 +488,148 @@ func updateBackupManifests(_ context.Context, store velero.ObjectStore, config *
 	}
 
 	return nil
+}
+
+// archivedPaths holds the S3 paths where VMB and VMBT CRs were archived.
+// These paths are passed to updateVMIndex so the checkpoint entry references them.
+type archivedPaths struct {
+	VMBObjectPath  string
+	VMBTObjectPath string
+}
+
+// archiveKubeResources fetches VMB and VMBT CRs from the K8s API and uploads them
+// as JSON to S3 alongside the qcow2 files. This is a fatal step — if archiving fails,
+// we don't update index.json, ensuring references in the index are always valid.
+//
+// S3 paths (both in the checkpoint directory):
+//   - VMB:  checkpoints/<ns>/<vm>/<checkpoint>/vmb.json
+//   - VMBT: checkpoints/<ns>/<vm>/<checkpoint>/vmbt.json
+func archiveKubeResources(
+	ctx context.Context, store velero.ObjectStore, k8sClient client.Client, cfg *UploaderConfig,
+) (*archivedPaths, error) {
+	paths := &archivedPaths{}
+
+	// Fetch and archive VMB
+	if cfg.VMBName != "" {
+		vmb := &kubevirtbackupv1alpha1.VirtualMachineBackup{}
+		if err := k8sClient.Get(ctx, types.NamespacedName{
+			Name: cfg.VMBName, Namespace: cfg.VMNamespace,
+		}, vmb); err != nil {
+			return nil, fmt.Errorf("failed to fetch VMB %s/%s: %w", cfg.VMNamespace, cfg.VMBName, err)
+		}
+
+		data, err := json.MarshalIndent(vmb, "", "  ")
+		if err != nil {
+			return nil, fmt.Errorf("failed to serialize VMB: %w", err)
+		}
+
+		paths.VMBObjectPath = fmt.Sprintf("checkpoints/%s/%s/%s/vmb.json",
+			cfg.VMNamespace, cfg.VMName, cfg.CheckpointName)
+		if err := putObjectBytes(store, cfg.BSLBucket, paths.VMBObjectPath, data); err != nil {
+			return nil, fmt.Errorf("failed to upload vmb.json: %w", err)
+		}
+		fmt.Printf("Archived VMB to %s\n", paths.VMBObjectPath)
+	}
+
+	// Fetch and archive VMBT (stored per-checkpoint for audit trail).
+	// Set LatestCheckpoint to the current VMB's checkpoint before archiving.
+	// KubeVirt does NOT update VMBT.Status.LatestCheckpoint — that is our
+	// responsibility. The archived VMBT with the correct checkpoint is used
+	// by prepareVMBackupTracker to set up the next incremental backup.
+	if cfg.VMBTName != "" {
+		vmbt := &kubevirtbackupv1alpha1.VirtualMachineBackupTracker{}
+		if err := k8sClient.Get(ctx, types.NamespacedName{
+			Name: cfg.VMBTName, Namespace: cfg.VMNamespace,
+		}, vmbt); err != nil {
+			return nil, fmt.Errorf("failed to fetch VMBT %s/%s: %w",
+				cfg.VMNamespace, cfg.VMBTName, err)
+		}
+
+		// Set LatestCheckpoint to the current checkpoint so the next backup
+		// can use it for incremental. This is the checkpoint created by the
+		// VMB that just completed.
+		if cfg.CheckpointName != "" {
+			vmbt.Status = &kubevirtbackupv1alpha1.VirtualMachineBackupTrackerStatus{
+				LatestCheckpoint: &kubevirtbackupv1alpha1.BackupCheckpoint{
+					Name: cfg.CheckpointName,
+				},
+			}
+			fmt.Printf("Set VMBT LatestCheckpoint to %s before archiving\n",
+				cfg.CheckpointName)
+		}
+
+		data, err := json.MarshalIndent(vmbt, "", "  ")
+		if err != nil {
+			return nil, fmt.Errorf("failed to serialize VMBT: %w", err)
+		}
+
+		paths.VMBTObjectPath = fmt.Sprintf("checkpoints/%s/%s/%s/vmbt.json",
+			cfg.VMNamespace, cfg.VMName, cfg.CheckpointName)
+		if err := putObjectBytes(store, cfg.BSLBucket, paths.VMBTObjectPath, data); err != nil {
+			return nil, fmt.Errorf("failed to upload vmbt.json: %w", err)
+		}
+		fmt.Printf("Archived VMBT to %s\n", paths.VMBTObjectPath)
+	}
+
+	return paths, nil
+}
+
+// cleanupKubeResources deletes VMB and VMBT CRs from the cluster after they have
+// been archived to S3. This is non-fatal — if deletion fails, we log a warning
+// but don't fail the upload. Stale CRs will be cleaned up on the next backup cycle
+// (prepareVMBackupTracker deletes before recreating).
+func cleanupKubeResources(ctx context.Context, k8sClient client.Client, cfg *UploaderConfig) {
+	// Delete VMB by constructing a minimal object with just name/namespace.
+	// No need to Get first — Delete with NotFound is a no-op.
+	if cfg.VMBName != "" {
+		vmb := &kubevirtbackupv1alpha1.VirtualMachineBackup{}
+		vmb.Name = cfg.VMBName
+		vmb.Namespace = cfg.VMNamespace
+		if err := k8sClient.Delete(ctx, vmb); err != nil {
+			if !apierrors.IsNotFound(err) {
+				fmt.Printf("Warning: failed to delete VMB %s/%s: %v\n",
+					cfg.VMNamespace, cfg.VMBName, err)
+			}
+		} else {
+			fmt.Printf("Deleted VMB %s/%s from cluster\n", cfg.VMNamespace, cfg.VMBName)
+		}
+	}
+
+	// Delete VMBT
+	if cfg.VMBTName != "" {
+		vmbt := &kubevirtbackupv1alpha1.VirtualMachineBackupTracker{}
+		vmbt.Name = cfg.VMBTName
+		vmbt.Namespace = cfg.VMNamespace
+		if err := k8sClient.Delete(ctx, vmbt); err != nil {
+			if !apierrors.IsNotFound(err) {
+				fmt.Printf("Warning: failed to delete VMBT %s/%s: %v\n",
+					cfg.VMNamespace, cfg.VMBTName, err)
+			}
+		} else {
+			fmt.Printf("Deleted VMBT %s/%s from cluster\n", cfg.VMNamespace, cfg.VMBTName)
+		}
+	}
+}
+
+// newKubeClient creates an in-cluster Kubernetes client with KubeVirt backup types registered.
+// Extracted as a variable to allow overriding in tests.
+var newKubeClient = func() (client.Client, error) {
+	scheme := runtime.NewScheme()
+	if err := kubevirtbackupv1alpha1.AddToScheme(scheme); err != nil {
+		return nil, fmt.Errorf("failed to register KubeVirt backup scheme: %w", err)
+	}
+
+	restConfig, err := restcfg.GetConfig()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get in-cluster config: %w", err)
+	}
+
+	k8sClient, err := client.New(restConfig, client.Options{Scheme: scheme})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create K8s client: %w", err)
+	}
+
+	return k8sClient, nil
 }
 
 // buildCheckpointChain builds the ordered list of checkpoints needed for restore.

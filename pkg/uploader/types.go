@@ -26,18 +26,21 @@ limitations under the License.
 //	│   └── <namespace>/
 //	│       └── <vm-name>/
 //	│           ├── <checkpoint-id>/
-//	│           │   └── <vmb-name>-<disk-name>.qcow2   # Backup data files
-//	│           └── index.json                         # Per-VM checkpoint index
+//	│           │   ├── <vmb-name>-<disk-name>.qcow2   # Backup data files
+//	│           │   ├── vmb.json                        # Archived VMB CR
+//	│           │   └── vmbt.json                       # Archived VMBT CR
+//	│           └── index.json                          # Per-VM checkpoint index
 //	└── manifests/
 //	    └── <velero-backup-name>/
-//	        ├── index.json                             # Per-backup manifest
-//	        └── <namespace>-<vm-name>.json             # Per-VM backup manifest
+//	        ├── index.json                              # Per-backup manifest
+//	        └── <namespace>-<vm-name>.json              # Per-VM backup manifest
 //
 // # File Relationships
 //
 // 1. Per-VM Index (checkpoints/<ns>/<vm>/index.json):
 //   - Tracks all checkpoints for a single VM across all backups
 //   - Each checkpoint has an "id", "parent" (for incremental), and "referencedBy" (backup names)
+//   - Each checkpoint references its archived VMB/VMBT via "vmbObjectPath" and "vmbtObjectPath"
 //   - Used by the controller to determine the latest checkpoint for incremental backups
 //
 // 2. Per-Backup Manifest (manifests/<backup>/index.json):
@@ -48,6 +51,12 @@ limitations under the License.
 //   - Contains the full checkpoint chain needed to restore a specific VM
 //   - Chain starts from the base (full) backup and includes all incrementals
 //   - Self-contained: restore can be performed using only this file
+//
+// 4. Archived VMB/VMBT (checkpoints/<ns>/<vm>/<checkpoint>/vmb.json, vmbt.json):
+//   - JSON serialization of the KubeVirt VMB and VMBT CRs at backup time
+//   - VMB and VMBT are deleted from the cluster after archival to S3
+//   - The controller recreates VMBT from the archived vmbt.json before each backup,
+//     restoring Status.LatestCheckpoint to enable incremental backups
 //
 // # Incremental Backup Chain
 //
@@ -80,6 +89,7 @@ const (
 	EnvDataUploadName   = "KUBEVIRT_DM_DATAUPLOAD_NAME"
 	EnvDataUploadUID    = "KUBEVIRT_DM_DATAUPLOAD_UID"
 	EnvVMBName          = "KUBEVIRT_DM_VMB_NAME"
+	EnvVMBTName         = "KUBEVIRT_DM_VMBT_NAME"
 )
 
 // Default paths and values
@@ -122,6 +132,7 @@ type UploaderConfig struct {
 	DataUploadName   string
 	DataUploadUID    string
 	VMBName          string
+	VMBTName         string
 
 	// Source PVC mount path
 	SourcePVCPath string
@@ -169,6 +180,12 @@ type CheckpointEntry struct {
 
 	// ReferencedBy is a list of Velero backup names that reference this checkpoint (design field)
 	ReferencedBy []string `json:"referencedBy"`
+
+	// VMBObjectPath is the S3 path to the archived VMB CR JSON for this checkpoint
+	VMBObjectPath string `json:"vmbObjectPath,omitempty"`
+
+	// VMBTObjectPath is the S3 path to the archived VMBT CR JSON for this checkpoint
+	VMBTObjectPath string `json:"vmbtObjectPath,omitempty"`
 }
 
 // VMIndex is the per-VM index structure stored at checkpoints/<ns>/<vm>/index.json.

@@ -181,14 +181,24 @@ func validateCheckpointChain(
 		}
 
 		if brokenAt == -1 {
-			// All files in the chain are valid
+			// All files in the chain are valid.
+			// IsChainValid is true only if this is the original target (no fallback
+			// to a shorter chain). When a fallback occurred, the found chain is
+			// valid but the overall checkpoint chain is considered broken because
+			// the latest checkpoint in the index could not be used.
+			isOriginalTarget := currentTargetID == targetID
+			msg := fmt.Sprintf("valid checkpoint chain found: %d checkpoints, latest=%s",
+				len(chain), currentTargetID)
+			if !isOriginalTarget {
+				msg = fmt.Sprintf("checkpoint chain fell back from %s to %s (%d checkpoints valid)",
+					targetID, currentTargetID, len(chain))
+			}
 			return &CheckpointLookupResult{
 				Found:            true,
 				LatestCheckpoint: currentTargetID,
-				IsChainValid:     true,
+				IsChainValid:     isOriginalTarget,
 				ChainLength:      len(chain),
-				Message: fmt.Sprintf("valid checkpoint chain found: %d checkpoints, latest=%s",
-					len(chain), currentTargetID),
+				Message:          msg,
 			}, nil
 		}
 
