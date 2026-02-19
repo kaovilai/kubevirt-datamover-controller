@@ -4600,10 +4600,17 @@ func TestValidateBSLCheckpoint_ForceFullOnChainFallback(t *testing.T) {
 
 	vmRef := &common.VMReference{Name: vmName, Namespace: vmNamespace}
 
-	forceFullBackup := r.validateBSLCheckpoint(context.Background(), logr.Discard(), du, vmRef)
+	forceFullBackup, checkpointLookup := r.validateBSLCheckpoint(context.Background(), logr.Discard(), du, vmRef)
 
 	if !forceFullBackup {
 		t.Error("expected forceFullBackup=true when BSL chain falls back to older checkpoint")
+	}
+
+	if checkpointLookup == nil {
+		t.Fatal("expected checkpointLookup to be returned")
+	}
+	if !checkpointLookup.Found {
+		t.Error("expected checkpointLookup.Found=true (fell back to valid chain)")
 	}
 
 }

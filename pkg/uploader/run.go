@@ -641,15 +641,21 @@ func buildCheckpointChain(checkpoints []CheckpointEntry, targetID string) []Chec
 		cpMap[cp.ID] = cp
 	}
 
-	// Build chain by following parents
+	// Build chain by following parents.
+	// Track visited IDs to guard against cycles in corrupted index data.
 	var chain []CheckpointEntry
+	visited := make(map[string]bool)
 	currentID := targetID
 
 	for currentID != "" {
+		if visited[currentID] {
+			break
+		}
 		cp, ok := cpMap[currentID]
 		if !ok {
 			break
 		}
+		visited[currentID] = true
 		// Prepend to chain (oldest first)
 		chain = append([]CheckpointEntry{cp}, chain...)
 		currentID = cp.Parent

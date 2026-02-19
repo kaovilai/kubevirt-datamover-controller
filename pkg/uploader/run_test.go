@@ -1088,6 +1088,28 @@ func TestBuildCheckpointChain(t *testing.T) {
 			expectFirst: "cp-002",
 			expectLast:  "cp-003",
 		},
+		{
+			name: "cycle in parent references",
+			checkpoints: []CheckpointEntry{
+				{ID: "cp-001", Type: "full", Parent: "cp-003"},        // cycle: cp-001 → cp-003
+				{ID: "cp-002", Type: "incremental", Parent: "cp-001"}, // cp-002 → cp-001
+				{ID: "cp-003", Type: "incremental", Parent: "cp-002"}, // cp-003 → cp-002
+			},
+			targetID:    "cp-003",
+			expectLen:   3, // Should terminate after visiting all 3 (cycle detected on revisit)
+			expectFirst: "cp-001",
+			expectLast:  "cp-003",
+		},
+		{
+			name: "self-referencing checkpoint",
+			checkpoints: []CheckpointEntry{
+				{ID: "cp-001", Type: "full", Parent: "cp-001"}, // points to itself
+			},
+			targetID:    "cp-001",
+			expectLen:   1,
+			expectFirst: "cp-001",
+			expectLast:  "cp-001",
+		},
 	}
 
 	for _, tt := range tests {

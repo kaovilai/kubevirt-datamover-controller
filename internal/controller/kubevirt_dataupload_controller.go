@@ -254,40 +254,78 @@ func (r *KubeVirtDataUploadReconciler) handleAccepted(ctx context.Context, logge
 	}
 	logger.Info("Temporary PVC ready", "pvc", pvc.Name)
 
-	// Step 2: Prepare VirtualMachineBackupTracker (recreate from S3 state)
-	vmbt, err := r.prepareVMBackupTracker(ctx, logger, du, vmRef.Name, vmRef.Namespace)
-	if err != nil {
-		logger.Error(err, "Failed to prepare VirtualMachineBackupTracker")
-		return ctrl.Result{}, err
+	// Check if VMB already exists. If it does, the VMBT is already in the right
+	// state (set before VMB creation) and we can skip straight to monitoring.
+	// This avoids deleting/recreating the VMBT while an active VMB references it.
+	vmbName := fmt.Sprintf("%s%s", common.VMBackupNamePrefix, du.Name)
+	existingVMB := &kubevirtbackupv1alpha1.VirtualMachineBackup{}
+	vmbExists := false
+	if err := r.Get(ctx, types.NamespacedName{Name: vmbName, Namespace: vmRef.Namespace}, existingVMB); err == nil {
+		vmbExists = true
+	} else if !errors.IsNotFound(err) {
+		return ctrl.Result{}, fmt.Errorf("failed to check for existing VMB: %w", err)
 	}
-	logger.Info("VirtualMachineBackupTracker ready", "vmbt", vmbt.Name)
 
-	// Step 3: Determine backup mode (full vs incremental).
-	forceFullBackup := r.resolveBackupMode(ctx, logger, du, vmRef)
-
-	// Step 4: Create VirtualMachineBackup if it doesn't exist
-	vmb, created, err := r.ensureVMBackup(ctx, logger, du, vmbt, pvc.Name, vmRef.Namespace, forceFullBackup)
-	if err != nil {
-		// Check if the error is due to another VMB being in progress for the same VM.
-		// KubeVirt's admission webhook only allows one active (non-terminal) VMB per VM.
-		// Requeue with a longer delay instead of returning an error (which causes
-		// exponential backoff retry storm).
-		if strings.Contains(err.Error(), "in progress for source") {
-			logger.Info("Another VirtualMachineBackup is in progress for this VM, will retry",
-				"reason", err.Error())
-			return ctrl.Result{RequeueAfter: RequeueAfterLong}, nil
+	var vmb *kubevirtbackupv1alpha1.VirtualMachineBackup
+	if vmbExists {
+		// VMB already exists — skip VMBT preparation and backup mode resolution.
+		// The VMBT was set up before this VMB was created and should not be disturbed.
+		vmb = existingVMB
+		logger.V(1).Info("VirtualMachineBackup already exists, skipping VMBT preparation", "vmb", vmb.Name)
+	} else {
+		// Step 2: Prepare VirtualMachineBackupTracker (recreate from S3 state)
+		vmbt, err := r.prepareVMBackupTracker(ctx, logger, du, vmRef.Name, vmRef.Namespace)
+		if err != nil {
+			logger.Error(err, "Failed to prepare VirtualMachineBackupTracker")
+			return ctrl.Result{}, err
 		}
-		logger.Error(err, "Failed to ensure VirtualMachineBackup")
-		return ctrl.Result{}, err
+		logger.Info("VirtualMachineBackupTracker ready", "vmbt", vmbt.Name)
+
+		// Step 3: Determine backup mode (full vs incremental).
+		forceFullBackup, checkpointLookup := r.resolveBackupMode(ctx, logger, du, vmRef)
+
+		// Step 3b: Cross-check VMBT checkpoint against BSL chain validation result.
+		// The VMBT's LatestCheckpoint (restored from archived vmbt.json) must agree
+		// with the BSL chain validation (which independently walks the S3 index).
+		// If they diverge, the archived VMBT is stale — force a full backup.
+		if !forceFullBackup && checkpointLookup != nil && checkpointLookup.Found {
+			vmbtCheckpoint := ""
+			if vmbt.Status != nil && vmbt.Status.LatestCheckpoint != nil {
+				vmbtCheckpoint = vmbt.Status.LatestCheckpoint.Name
+			}
+			if vmbtCheckpoint != checkpointLookup.LatestCheckpoint {
+				logger.Info("VMBT checkpoint does not match BSL chain validation result, forcing full backup",
+					"vmbtCheckpoint", vmbtCheckpoint,
+					"bslLatestCheckpoint", checkpointLookup.LatestCheckpoint)
+				forceFullBackup = true
+			}
+		}
+
+		// Step 4: Create VirtualMachineBackup
+		var created bool
+		vmb, created, err = r.ensureVMBackup(ctx, logger, du, vmbt, pvc.Name, vmRef.Namespace, forceFullBackup)
+		if err != nil {
+			// Check if the error is due to another VMB being in progress for the same VM.
+			// KubeVirt's admission webhook only allows one active (non-terminal) VMB per VM.
+			// Requeue with a longer delay instead of returning an error (which causes
+			// exponential backoff retry storm).
+			if strings.Contains(err.Error(), "in progress for source") {
+				logger.Info("Another VirtualMachineBackup is in progress for this VM, will retry",
+					"reason", err.Error())
+				return ctrl.Result{RequeueAfter: RequeueAfterLong}, nil
+			}
+			logger.Error(err, "Failed to ensure VirtualMachineBackup")
+			return ctrl.Result{}, err
+		}
+
+		if created {
+			logger.Info("Created VirtualMachineBackup", "vmb", vmb.Name)
+			// Requeue to check status
+			return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
+		}
 	}
 
-	if created {
-		logger.Info("Created VirtualMachineBackup", "vmb", vmb.Name)
-		// Requeue to check status
-		return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
-	}
-
-	// Step 6: Check VMB status
+	// Step 5: Check VMB status
 	if vmb.Status == nil {
 		logger.Info("VirtualMachineBackup status not yet available, requeuing")
 		return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
@@ -325,15 +363,16 @@ func (r *KubeVirtDataUploadReconciler) handleAccepted(ctx context.Context, logge
 }
 
 // resolveBackupMode determines whether to force a full backup or allow incremental.
-// Returns true when ForceFullBackup should be set on the VMB.
+// Returns (forceFullBackup, checkpointLookup) where checkpointLookup is the BSL
+// chain validation result (nil if BSL was unreachable or validation was skipped).
 // This covers two scenarios:
 //  1. User explicitly requested force-full-backup via annotation on DataUpload.
 //  2. BSL checkpoint validation found a broken chain, requiring a forced full backup.
-func (r *KubeVirtDataUploadReconciler) resolveBackupMode(ctx context.Context, logger logr.Logger, du *velerov2alpha1.DataUpload, vmRef *common.VMReference) bool {
+func (r *KubeVirtDataUploadReconciler) resolveBackupMode(ctx context.Context, logger logr.Logger, du *velerov2alpha1.DataUpload, vmRef *common.VMReference) (bool, *uploader.CheckpointLookupResult) {
 	// Check if force full backup is requested via annotation.
 	if du.Annotations[common.AnnotationForceFullBackup] == bslValidatedValue {
 		logger.Info("Force full backup requested via annotation, skipping BSL checkpoint lookup")
-		return true
+		return true, nil
 	}
 
 	// Validate checkpoint chain in BSL for incremental backup support.
@@ -342,7 +381,7 @@ func (r *KubeVirtDataUploadReconciler) resolveBackupMode(ctx context.Context, lo
 	// each new backup.
 	if du.Annotations[common.AnnotationBSLValidated] == bslValidatedValue {
 		logger.V(1).Info("BSL validation already completed for this DataUpload")
-		return false
+		return false, nil
 	}
 
 	return r.validateBSLCheckpoint(ctx, logger, du, vmRef)
@@ -350,9 +389,11 @@ func (r *KubeVirtDataUploadReconciler) resolveBackupMode(ctx context.Context, lo
 
 // validateBSLCheckpoint queries the BSL for a valid checkpoint chain and determines
 // whether a forced full backup is required because the chain is broken.
+// Returns (forceFullBackup, checkpointLookup) where checkpointLookup is the BSL
+// chain validation result (nil if BSL was unreachable or lookup failed).
 // It does NOT modify VMBT status — ForceFullBackup on the VMB is the sole mechanism
 // for forcing full backups.
-func (r *KubeVirtDataUploadReconciler) validateBSLCheckpoint(ctx context.Context, logger logr.Logger, du *velerov2alpha1.DataUpload, vmRef *common.VMReference) bool {
+func (r *KubeVirtDataUploadReconciler) validateBSLCheckpoint(ctx context.Context, logger logr.Logger, du *velerov2alpha1.DataUpload, vmRef *common.VMReference) (bool, *uploader.CheckpointLookupResult) {
 	forceFullBackup := false
 
 	var checkpointLookup *uploader.CheckpointLookupResult
@@ -417,7 +458,7 @@ func (r *KubeVirtDataUploadReconciler) validateBSLCheckpoint(ctx context.Context
 		}
 	}
 
-	return forceFullBackup
+	return forceFullBackup, checkpointLookup
 }
 
 // handlePrepared processes DataUploads in Prepared phase
