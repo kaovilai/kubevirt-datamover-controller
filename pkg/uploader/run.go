@@ -28,6 +28,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-logr/logr"
 	velero "github.com/vmware-tanzu/velero/pkg/plugin/velero"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -55,8 +56,8 @@ func getObjectBytes(store velero.ObjectStore, bucket, key string) ([]byte, error
 }
 
 // Run is the main entrypoint for the uploader.
-func Run(ctx context.Context) error {
-	fmt.Println("Starting kubevirt datamover uploader...")
+func Run(ctx context.Context, logger logr.Logger) error {
+	logger.Info("Starting kubevirt datamover uploader")
 
 	// Load configuration from environment
 	config, err := LoadConfigFromEnv()
@@ -64,8 +65,10 @@ func Run(ctx context.Context) error {
 		return fmt.Errorf("failed to load config: %w", err)
 	}
 
-	fmt.Printf("Config loaded: VM=%s/%s, checkpoint=%s, type=%s\n",
-		config.VMNamespace, config.VMName, config.CheckpointName, config.BackupType)
+	logger.Info("Config loaded",
+		"vm", config.VMNamespace+"/"+config.VMName,
+		"checkpoint", config.CheckpointName,
+		"type", config.BackupType)
 
 	// Initialize object store - returns velero.ObjectStore interface
 	store, err := InitObjectStore(config)
@@ -73,10 +76,10 @@ func Run(ctx context.Context) error {
 		return fmt.Errorf("failed to initialize object store: %w", err)
 	}
 
-	fmt.Printf("Object store initialized: bucket=%s, prefix=%s\n", config.BSLBucket, config.BSLPrefix)
+	logger.Info("Object store initialized", "bucket", config.BSLBucket, "prefix", config.BSLPrefix)
 
 	// Upload qcow2 files
-	files, err := uploadQcow2Files(ctx, store, config)
+	files, err := uploadQcow2Files(ctx, store, config, logger)
 	if err != nil {
 		return fmt.Errorf("failed to upload qcow2 files: %w", err)
 	}
@@ -85,7 +88,7 @@ func Run(ctx context.Context) error {
 		return fmt.Errorf("no qcow2 files found in %s", config.SourcePVCPath)
 	}
 
-	fmt.Printf("Uploaded %d qcow2 files\n", len(files))
+	logger.Info("Uploaded qcow2 files", "count", len(files))
 
 	// Create K8s client once — reused for archiving and cleanup
 	k8sClient, err := newKubeClient()
@@ -94,30 +97,30 @@ func Run(ctx context.Context) error {
 	}
 
 	// Archive VMB/VMBT CRs to S3 (FATAL if fails — index references must be valid)
-	archived, err := archiveKubeResources(ctx, store, k8sClient, config)
+	archived, err := archiveKubeResources(ctx, store, k8sClient, config, logger)
 	if err != nil {
 		return fmt.Errorf("failed to archive Kube resources: %w", err)
 	}
-	fmt.Println("Kube resources archived to S3")
+	logger.Info("Kube resources archived to S3")
 
 	// Update VM index (references the archived paths)
-	if err := updateVMIndex(ctx, store, config, files, archived); err != nil {
+	if err := updateVMIndex(ctx, store, config, files, archived, logger); err != nil {
 		return fmt.Errorf("failed to update VM index: %w", err)
 	}
 
-	fmt.Println("VM index updated")
+	logger.Info("VM index updated")
 
 	// Update backup manifests
-	if err := updateBackupManifests(ctx, store, config); err != nil {
+	if err := updateBackupManifests(ctx, store, config, logger); err != nil {
 		return fmt.Errorf("failed to update backup manifests: %w", err)
 	}
 
-	fmt.Println("Backup manifests updated")
+	logger.Info("Backup manifests updated")
 
 	// Delete VMB/VMBT from cluster (non-fatal — S3 is now source of truth)
-	cleanupKubeResources(ctx, k8sClient, config)
+	cleanupKubeResources(ctx, k8sClient, config, logger)
 
-	fmt.Println("Upload completed successfully")
+	logger.Info("Upload completed successfully")
 
 	return nil
 }
@@ -183,7 +186,9 @@ func LoadConfigFromEnv() (*UploaderConfig, error) {
 }
 
 // uploadQcow2Files walks the source path and uploads all qcow2 files.
-func uploadQcow2Files(_ context.Context, store velero.ObjectStore, config *UploaderConfig) ([]CheckpointFile, error) {
+func uploadQcow2Files(
+	_ context.Context, store velero.ObjectStore, config *UploaderConfig, logger logr.Logger,
+) ([]CheckpointFile, error) {
 	var files []CheckpointFile
 
 	err := filepath.WalkDir(config.SourcePVCPath, func(path string, d fs.DirEntry, err error) error {
@@ -217,7 +222,7 @@ func uploadQcow2Files(_ context.Context, store velero.ObjectStore, config *Uploa
 			return fmt.Errorf("failed to open file %s: %w", path, err)
 		}
 
-		fmt.Printf("Uploading %s (%d bytes) to %s\n", d.Name(), info.Size(), objectPath)
+		logger.Info("Uploading file", "filename", d.Name(), "size", info.Size(), "objectPath", objectPath)
 
 		// Upload file using velero.ObjectStore interface
 		uploadErr := store.PutObject(config.BSLBucket, objectPath, file)
@@ -267,7 +272,8 @@ func extractDiskName(filename string) string {
 // that were uploaded by archiveKubeResources — these are stored on the
 // checkpoint entry so the index always references valid objects.
 func updateVMIndex(
-	ctx context.Context, store velero.ObjectStore, config *UploaderConfig, files []CheckpointFile, archived *archivedPaths,
+	ctx context.Context, store velero.ObjectStore, config *UploaderConfig,
+	files []CheckpointFile, archived *archivedPaths, logger logr.Logger,
 ) error {
 	indexPath := fmt.Sprintf("checkpoints/%s/%s/index.json", config.VMNamespace, config.VMName)
 
@@ -286,7 +292,7 @@ func updateVMIndex(
 			return fmt.Errorf("failed to read existing VM index: %w", err)
 		}
 		if err := json.Unmarshal(data, &vmIndex); err != nil {
-			fmt.Printf("Warning: failed to parse existing index, creating new: %v\n", err)
+			logger.Info("Failed to parse existing index, creating new", "reason", err.Error())
 			vmIndex = VMIndex{}
 		}
 	} else {
@@ -376,9 +382,11 @@ func updateVMIndex(
 }
 
 // updateBackupManifests creates/updates the per-backup manifest files.
-func updateBackupManifests(_ context.Context, store velero.ObjectStore, config *UploaderConfig) error {
+func updateBackupManifests(
+	_ context.Context, store velero.ObjectStore, config *UploaderConfig, logger logr.Logger,
+) error {
 	if config.VeleroBackupName == "" {
-		fmt.Println("Warning: no Velero backup name provided, skipping manifest update")
+		logger.Info("No Velero backup name provided, skipping manifest update")
 		return nil
 	}
 
@@ -402,7 +410,7 @@ func updateBackupManifests(_ context.Context, store velero.ObjectStore, config *
 
 	// Validate that the chain starts with a full backup (required for restore)
 	if strings.ToLower(chain[0].Type) != BackupTypeFull {
-		fmt.Printf("Warning: checkpoint chain does not start with a full backup (starts with %q)\n", chain[0].Type)
+		logger.Info("Checkpoint chain does not start with a full backup", "startsWithType", chain[0].Type)
 		// This is a warning, not an error - the chain might be valid if this is the first backup
 		// and it's marked as incremental by mistake, or the user knows what they're doing
 	}
@@ -424,7 +432,7 @@ func updateBackupManifests(_ context.Context, store velero.ObjectStore, config *
 			return fmt.Errorf("failed to read existing backup manifest: %w", err)
 		}
 		if err := json.Unmarshal(data, &backupManifest); err != nil {
-			fmt.Printf("Warning: failed to parse existing backup manifest, creating new: %v\n", err)
+			logger.Info("Failed to parse existing backup manifest, creating new", "reason", err.Error())
 			backupManifest = BackupManifest{}
 		}
 	} else {
@@ -505,7 +513,7 @@ type archivedPaths struct {
 //   - VMB:  checkpoints/<ns>/<vm>/<checkpoint>/vmb.json
 //   - VMBT: checkpoints/<ns>/<vm>/<checkpoint>/vmbt.json
 func archiveKubeResources(
-	ctx context.Context, store velero.ObjectStore, k8sClient client.Client, cfg *UploaderConfig,
+	ctx context.Context, store velero.ObjectStore, k8sClient client.Client, cfg *UploaderConfig, logger logr.Logger,
 ) (*archivedPaths, error) {
 	paths := &archivedPaths{}
 
@@ -528,7 +536,7 @@ func archiveKubeResources(
 		if err := putObjectBytes(store, cfg.BSLBucket, paths.VMBObjectPath, data); err != nil {
 			return nil, fmt.Errorf("failed to upload vmb.json: %w", err)
 		}
-		fmt.Printf("Archived VMB to %s\n", paths.VMBObjectPath)
+		logger.Info("Archived VMB", "path", paths.VMBObjectPath)
 	}
 
 	// Fetch and archive VMBT (stored per-checkpoint for audit trail).
@@ -554,8 +562,8 @@ func archiveKubeResources(
 					Name: cfg.CheckpointName,
 				},
 			}
-			fmt.Printf("Set VMBT LatestCheckpoint to %s before archiving\n",
-				cfg.CheckpointName)
+			logger.Info("Set VMBT LatestCheckpoint before archiving",
+				"latestCheckpoint", cfg.CheckpointName)
 		}
 
 		data, err := json.MarshalIndent(vmbt, "", "  ")
@@ -568,7 +576,7 @@ func archiveKubeResources(
 		if err := putObjectBytes(store, cfg.BSLBucket, paths.VMBTObjectPath, data); err != nil {
 			return nil, fmt.Errorf("failed to upload vmbt.json: %w", err)
 		}
-		fmt.Printf("Archived VMBT to %s\n", paths.VMBTObjectPath)
+		logger.Info("Archived VMBT", "path", paths.VMBTObjectPath)
 	}
 
 	return paths, nil
@@ -578,7 +586,7 @@ func archiveKubeResources(
 // been archived to S3. This is non-fatal — if deletion fails, we log a warning
 // but don't fail the upload. Stale CRs will be cleaned up on the next backup cycle
 // (prepareVMBackupTracker deletes before recreating).
-func cleanupKubeResources(ctx context.Context, k8sClient client.Client, cfg *UploaderConfig) {
+func cleanupKubeResources(ctx context.Context, k8sClient client.Client, cfg *UploaderConfig, logger logr.Logger) {
 	// Delete VMB by constructing a minimal object with just name/namespace.
 	// No need to Get first — Delete with NotFound is a no-op.
 	if cfg.VMBName != "" {
@@ -587,11 +595,11 @@ func cleanupKubeResources(ctx context.Context, k8sClient client.Client, cfg *Upl
 		vmb.Namespace = cfg.VMNamespace
 		if err := k8sClient.Delete(ctx, vmb); err != nil {
 			if !apierrors.IsNotFound(err) {
-				fmt.Printf("Warning: failed to delete VMB %s/%s: %v\n",
-					cfg.VMNamespace, cfg.VMBName, err)
+				logger.Info("Failed to delete VMB from cluster",
+					"vmb", cfg.VMNamespace+"/"+cfg.VMBName, "reason", err.Error())
 			}
 		} else {
-			fmt.Printf("Deleted VMB %s/%s from cluster\n", cfg.VMNamespace, cfg.VMBName)
+			logger.Info("Deleted VMB from cluster", "vmb", cfg.VMNamespace+"/"+cfg.VMBName)
 		}
 	}
 
@@ -602,11 +610,11 @@ func cleanupKubeResources(ctx context.Context, k8sClient client.Client, cfg *Upl
 		vmbt.Namespace = cfg.VMNamespace
 		if err := k8sClient.Delete(ctx, vmbt); err != nil {
 			if !apierrors.IsNotFound(err) {
-				fmt.Printf("Warning: failed to delete VMBT %s/%s: %v\n",
-					cfg.VMNamespace, cfg.VMBTName, err)
+				logger.Info("Failed to delete VMBT from cluster",
+					"vmbt", cfg.VMNamespace+"/"+cfg.VMBTName, "reason", err.Error())
 			}
 		} else {
-			fmt.Printf("Deleted VMBT %s/%s from cluster\n", cfg.VMNamespace, cfg.VMBTName)
+			logger.Info("Deleted VMBT from cluster", "vmbt", cfg.VMNamespace+"/"+cfg.VMBTName)
 		}
 	}
 }

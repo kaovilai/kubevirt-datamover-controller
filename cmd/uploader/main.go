@@ -23,10 +23,13 @@ import (
 	"os"
 
 	"github.com/migtools/kubevirt-datamover-controller/pkg/uploader"
+	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 )
 
 func main() {
-	if err := uploader.Run(context.Background()); err != nil {
+	logger := zap.New(zap.UseDevMode(false))
+
+	if err := uploader.Run(context.Background(), logger); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}

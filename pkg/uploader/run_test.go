@@ -25,6 +25,7 @@ import (
 	"os"
 	"testing"
 
+	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -554,7 +555,7 @@ func TestUpdateVMIndex(t *testing.T) {
 				tt.setupStore(store)
 			}
 
-			err := updateVMIndex(context.Background(), store, tt.config, tt.files, tt.archived)
+			err := updateVMIndex(context.Background(), store, tt.config, tt.files, tt.archived, logr.Discard())
 
 			if tt.expectError {
 				if err == nil {
@@ -896,7 +897,7 @@ func TestArchiveKubeResources(t *testing.T) {
 				WithObjects(tt.objects...).
 				Build()
 
-			paths, err := archiveKubeResources(context.Background(), store, fakeClient, tt.config)
+			paths, err := archiveKubeResources(context.Background(), store, fakeClient, tt.config, logr.Discard())
 
 			if tt.expectError {
 				if err == nil {
@@ -995,7 +996,7 @@ func TestCleanupKubeResources(t *testing.T) {
 				Build()
 
 			// cleanupKubeResources is non-fatal (no error return)
-			cleanupKubeResources(context.Background(), fakeClient, tt.config)
+			cleanupKubeResources(context.Background(), fakeClient, tt.config, logr.Discard())
 
 			// Verify objects were deleted (for the first test case)
 			if tt.config.VMBName != "" && len(tt.objects) > 0 {
