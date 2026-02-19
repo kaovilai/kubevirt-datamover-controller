@@ -28,7 +28,14 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-logr/logr"
 	velero "github.com/vmware-tanzu/velero/pkg/plugin/velero"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	kubevirtbackupv1alpha1 "kubevirt.io/api/backup/v1alpha1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	restcfg "sigs.k8s.io/controller-runtime/pkg/client/config"
 )
 
 // Helper functions for working with velero.ObjectStore interface
@@ -49,8 +56,8 @@ func getObjectBytes(store velero.ObjectStore, bucket, key string) ([]byte, error
 }
 
 // Run is the main entrypoint for the uploader.
-func Run(ctx context.Context) error {
-	fmt.Println("Starting kubevirt datamover uploader...")
+func Run(ctx context.Context, logger logr.Logger) error {
+	logger.Info("Starting kubevirt datamover uploader")
 
 	// Load configuration from environment
 	config, err := LoadConfigFromEnv()
@@ -58,8 +65,10 @@ func Run(ctx context.Context) error {
 		return fmt.Errorf("failed to load config: %w", err)
 	}
 
-	fmt.Printf("Config loaded: VM=%s/%s, checkpoint=%s, type=%s\n",
-		config.VMNamespace, config.VMName, config.CheckpointName, config.BackupType)
+	logger.Info("Config loaded",
+		"vm", config.VMNamespace+"/"+config.VMName,
+		"checkpoint", config.CheckpointName,
+		"type", config.BackupType)
 
 	// Initialize object store - returns velero.ObjectStore interface
 	store, err := InitObjectStore(config)
@@ -67,10 +76,10 @@ func Run(ctx context.Context) error {
 		return fmt.Errorf("failed to initialize object store: %w", err)
 	}
 
-	fmt.Printf("Object store initialized: bucket=%s, prefix=%s\n", config.BSLBucket, config.BSLPrefix)
+	logger.Info("Object store initialized", "bucket", config.BSLBucket, "prefix", config.BSLPrefix)
 
 	// Upload qcow2 files
-	files, err := uploadQcow2Files(ctx, store, config)
+	files, err := uploadQcow2Files(ctx, store, config, logger)
 	if err != nil {
 		return fmt.Errorf("failed to upload qcow2 files: %w", err)
 	}
@@ -79,22 +88,39 @@ func Run(ctx context.Context) error {
 		return fmt.Errorf("no qcow2 files found in %s", config.SourcePVCPath)
 	}
 
-	fmt.Printf("Uploaded %d qcow2 files\n", len(files))
+	logger.Info("Uploaded qcow2 files", "count", len(files))
 
-	// Update VM index
-	if err := updateVMIndex(ctx, store, config, files); err != nil {
+	// Create K8s client once — reused for archiving and cleanup
+	k8sClient, err := newKubeClient()
+	if err != nil {
+		return fmt.Errorf("failed to create K8s client: %w", err)
+	}
+
+	// Archive VMB/VMBT CRs to S3 (FATAL if fails — index references must be valid)
+	archived, err := archiveKubeResources(ctx, store, k8sClient, config, logger)
+	if err != nil {
+		return fmt.Errorf("failed to archive Kube resources: %w", err)
+	}
+	logger.Info("Kube resources archived to S3")
+
+	// Update VM index (references the archived paths)
+	if err := updateVMIndex(ctx, store, config, files, archived, logger); err != nil {
 		return fmt.Errorf("failed to update VM index: %w", err)
 	}
 
-	fmt.Println("VM index updated")
+	logger.Info("VM index updated")
 
 	// Update backup manifests
-	if err := updateBackupManifests(ctx, store, config); err != nil {
+	if err := updateBackupManifests(ctx, store, config, logger); err != nil {
 		return fmt.Errorf("failed to update backup manifests: %w", err)
 	}
 
-	fmt.Println("Backup manifests updated")
-	fmt.Println("Upload completed successfully")
+	logger.Info("Backup manifests updated")
+
+	// Delete VMB/VMBT from cluster (non-fatal — S3 is now source of truth)
+	cleanupKubeResources(ctx, k8sClient, config, logger)
+
+	logger.Info("Upload completed successfully")
 
 	return nil
 }
@@ -115,6 +141,7 @@ func LoadConfigFromEnv() (*UploaderConfig, error) {
 		DataUploadName:   os.Getenv(EnvDataUploadName),
 		DataUploadUID:    os.Getenv(EnvDataUploadUID),
 		VMBName:          os.Getenv(EnvVMBName),
+		VMBTName:         os.Getenv(EnvVMBTName),
 		SourcePVCPath:    os.Getenv(EnvSourcePVCPath),
 	}
 
@@ -127,6 +154,9 @@ func LoadConfigFromEnv() (*UploaderConfig, error) {
 	}
 	if config.BackupType == "" {
 		config.BackupType = "full"
+	}
+	if config.VMBTName == "" && config.VMName != "" {
+		config.VMBTName = "vmbt-" + config.VMName
 	}
 
 	// Validate required fields
@@ -156,7 +186,9 @@ func LoadConfigFromEnv() (*UploaderConfig, error) {
 }
 
 // uploadQcow2Files walks the source path and uploads all qcow2 files.
-func uploadQcow2Files(_ context.Context, store velero.ObjectStore, config *UploaderConfig) ([]CheckpointFile, error) {
+func uploadQcow2Files(
+	_ context.Context, store velero.ObjectStore, config *UploaderConfig, logger logr.Logger,
+) ([]CheckpointFile, error) {
 	var files []CheckpointFile
 
 	err := filepath.WalkDir(config.SourcePVCPath, func(path string, d fs.DirEntry, err error) error {
@@ -190,7 +222,7 @@ func uploadQcow2Files(_ context.Context, store velero.ObjectStore, config *Uploa
 			return fmt.Errorf("failed to open file %s: %w", path, err)
 		}
 
-		fmt.Printf("Uploading %s (%d bytes) to %s\n", d.Name(), info.Size(), objectPath)
+		logger.Info("Uploading file", "filename", d.Name(), "size", info.Size(), "objectPath", objectPath)
 
 		// Upload file using velero.ObjectStore interface
 		uploadErr := store.PutObject(config.BSLBucket, objectPath, file)
@@ -236,7 +268,13 @@ func extractDiskName(filename string) string {
 }
 
 // updateVMIndex creates or updates the per-VM index.json file.
-func updateVMIndex(_ context.Context, store velero.ObjectStore, config *UploaderConfig, files []CheckpointFile) error {
+// The archived parameter provides S3 paths for the VMB/VMBT JSON files
+// that were uploaded by archiveKubeResources — these are stored on the
+// checkpoint entry so the index always references valid objects.
+func updateVMIndex(
+	ctx context.Context, store velero.ObjectStore, config *UploaderConfig,
+	files []CheckpointFile, archived *archivedPaths, logger logr.Logger,
+) error {
 	indexPath := fmt.Sprintf("checkpoints/%s/%s/index.json", config.VMNamespace, config.VMName)
 
 	// Try to load existing index
@@ -254,7 +292,7 @@ func updateVMIndex(_ context.Context, store velero.ObjectStore, config *Uploader
 			return fmt.Errorf("failed to read existing VM index: %w", err)
 		}
 		if err := json.Unmarshal(data, &vmIndex); err != nil {
-			fmt.Printf("Warning: failed to parse existing index, creating new: %v\n", err)
+			logger.Info("Failed to parse existing index, creating new", "reason", err.Error())
 			vmIndex = VMIndex{}
 		}
 	} else {
@@ -282,19 +320,36 @@ func updateVMIndex(_ context.Context, store velero.ObjectStore, config *Uploader
 	}
 
 	checkpoint := CheckpointEntry{
-		ID:           config.CheckpointName,
-		Type:         config.BackupType,
-		Timestamp:    time.Now().UTC(),
-		VMBackup:     config.VMBName,
-		Files:        files,
-		PVCs:         pvcNames,
-		ReferencedBy: referencedBy,
+		ID:             config.CheckpointName,
+		Type:           config.BackupType,
+		Timestamp:      time.Now().UTC(),
+		VMBackup:       config.VMBName,
+		Files:          files,
+		PVCs:           pvcNames,
+		ReferencedBy:   referencedBy,
+		VMBObjectPath:  archived.VMBObjectPath,
+		VMBTObjectPath: archived.VMBTObjectPath,
 	}
 
-	// For incremental backups, set parent checkpoint
+	// For incremental backups, validate the S3 chain and set parent checkpoint
 	if strings.ToLower(config.BackupType) == BackupTypeIncremental && len(vmIndex.Checkpoints) > 0 {
-		// Use the most recent checkpoint as parent
-		checkpoint.Parent = vmIndex.Checkpoints[len(vmIndex.Checkpoints)-1].ID
+		latestCP := vmIndex.Checkpoints[len(vmIndex.Checkpoints)-1]
+		result, err := validateCheckpointChain(ctx, store, config.BSLBucket, vmIndex.Checkpoints, latestCP.ID)
+		if err != nil {
+			return fmt.Errorf("failed to validate checkpoint chain: %w", err)
+		}
+		if !result.Found {
+			return fmt.Errorf("incremental backup requested but no valid parent chain exists: %s", result.Message)
+		}
+		// If the chain fell back to an older checkpoint, the controller should have
+		// forced a full backup. Reject the incremental as a safety net.
+		if result.LatestCheckpoint != latestCP.ID {
+			return fmt.Errorf(
+				"checkpoint chain is broken: latest valid checkpoint is %s but expected %s; "+
+					"a full backup should have been performed instead",
+				result.LatestCheckpoint, latestCP.ID)
+		}
+		checkpoint.Parent = result.LatestCheckpoint
 	}
 
 	// Append new checkpoint (avoid duplicates)
@@ -327,9 +382,11 @@ func updateVMIndex(_ context.Context, store velero.ObjectStore, config *Uploader
 }
 
 // updateBackupManifests creates/updates the per-backup manifest files.
-func updateBackupManifests(_ context.Context, store velero.ObjectStore, config *UploaderConfig) error {
+func updateBackupManifests(
+	_ context.Context, store velero.ObjectStore, config *UploaderConfig, logger logr.Logger,
+) error {
 	if config.VeleroBackupName == "" {
-		fmt.Println("Warning: no Velero backup name provided, skipping manifest update")
+		logger.Info("No Velero backup name provided, skipping manifest update")
 		return nil
 	}
 
@@ -353,7 +410,7 @@ func updateBackupManifests(_ context.Context, store velero.ObjectStore, config *
 
 	// Validate that the chain starts with a full backup (required for restore)
 	if strings.ToLower(chain[0].Type) != BackupTypeFull {
-		fmt.Printf("Warning: checkpoint chain does not start with a full backup (starts with %q)\n", chain[0].Type)
+		logger.Info("Checkpoint chain does not start with a full backup", "startsWithType", chain[0].Type)
 		// This is a warning, not an error - the chain might be valid if this is the first backup
 		// and it's marked as incremental by mistake, or the user knows what they're doing
 	}
@@ -375,7 +432,7 @@ func updateBackupManifests(_ context.Context, store velero.ObjectStore, config *
 			return fmt.Errorf("failed to read existing backup manifest: %w", err)
 		}
 		if err := json.Unmarshal(data, &backupManifest); err != nil {
-			fmt.Printf("Warning: failed to parse existing backup manifest, creating new: %v\n", err)
+			logger.Info("Failed to parse existing backup manifest, creating new", "reason", err.Error())
 			backupManifest = BackupManifest{}
 		}
 	} else {
@@ -441,6 +498,148 @@ func updateBackupManifests(_ context.Context, store velero.ObjectStore, config *
 	return nil
 }
 
+// archivedPaths holds the S3 paths where VMB and VMBT CRs were archived.
+// These paths are passed to updateVMIndex so the checkpoint entry references them.
+type archivedPaths struct {
+	VMBObjectPath  string
+	VMBTObjectPath string
+}
+
+// archiveKubeResources fetches VMB and VMBT CRs from the K8s API and uploads them
+// as JSON to S3 alongside the qcow2 files. This is a fatal step — if archiving fails,
+// we don't update index.json, ensuring references in the index are always valid.
+//
+// S3 paths (both in the checkpoint directory):
+//   - VMB:  checkpoints/<ns>/<vm>/<checkpoint>/vmb.json
+//   - VMBT: checkpoints/<ns>/<vm>/<checkpoint>/vmbt.json
+func archiveKubeResources(
+	ctx context.Context, store velero.ObjectStore, k8sClient client.Client, cfg *UploaderConfig, logger logr.Logger,
+) (*archivedPaths, error) {
+	paths := &archivedPaths{}
+
+	// Fetch and archive VMB
+	if cfg.VMBName != "" {
+		vmb := &kubevirtbackupv1alpha1.VirtualMachineBackup{}
+		if err := k8sClient.Get(ctx, types.NamespacedName{
+			Name: cfg.VMBName, Namespace: cfg.VMNamespace,
+		}, vmb); err != nil {
+			return nil, fmt.Errorf("failed to fetch VMB %s/%s: %w", cfg.VMNamespace, cfg.VMBName, err)
+		}
+
+		data, err := json.MarshalIndent(vmb, "", "  ")
+		if err != nil {
+			return nil, fmt.Errorf("failed to serialize VMB: %w", err)
+		}
+
+		paths.VMBObjectPath = fmt.Sprintf("checkpoints/%s/%s/%s/vmb.json",
+			cfg.VMNamespace, cfg.VMName, cfg.CheckpointName)
+		if err := putObjectBytes(store, cfg.BSLBucket, paths.VMBObjectPath, data); err != nil {
+			return nil, fmt.Errorf("failed to upload vmb.json: %w", err)
+		}
+		logger.Info("Archived VMB", "path", paths.VMBObjectPath)
+	}
+
+	// Fetch and archive VMBT (stored per-checkpoint for audit trail).
+	// Set LatestCheckpoint to the current VMB's checkpoint before archiving.
+	// KubeVirt does NOT update VMBT.Status.LatestCheckpoint — that is our
+	// responsibility. The archived VMBT with the correct checkpoint is used
+	// by prepareVMBackupTracker to set up the next incremental backup.
+	if cfg.VMBTName != "" {
+		vmbt := &kubevirtbackupv1alpha1.VirtualMachineBackupTracker{}
+		if err := k8sClient.Get(ctx, types.NamespacedName{
+			Name: cfg.VMBTName, Namespace: cfg.VMNamespace,
+		}, vmbt); err != nil {
+			return nil, fmt.Errorf("failed to fetch VMBT %s/%s: %w",
+				cfg.VMNamespace, cfg.VMBTName, err)
+		}
+
+		// Set LatestCheckpoint to the current checkpoint so the next backup
+		// can use it for incremental. This is the checkpoint created by the
+		// VMB that just completed.
+		if cfg.CheckpointName != "" {
+			vmbt.Status = &kubevirtbackupv1alpha1.VirtualMachineBackupTrackerStatus{
+				LatestCheckpoint: &kubevirtbackupv1alpha1.BackupCheckpoint{
+					Name: cfg.CheckpointName,
+				},
+			}
+			logger.Info("Set VMBT LatestCheckpoint before archiving",
+				"latestCheckpoint", cfg.CheckpointName)
+		}
+
+		data, err := json.MarshalIndent(vmbt, "", "  ")
+		if err != nil {
+			return nil, fmt.Errorf("failed to serialize VMBT: %w", err)
+		}
+
+		paths.VMBTObjectPath = fmt.Sprintf("checkpoints/%s/%s/%s/vmbt.json",
+			cfg.VMNamespace, cfg.VMName, cfg.CheckpointName)
+		if err := putObjectBytes(store, cfg.BSLBucket, paths.VMBTObjectPath, data); err != nil {
+			return nil, fmt.Errorf("failed to upload vmbt.json: %w", err)
+		}
+		logger.Info("Archived VMBT", "path", paths.VMBTObjectPath)
+	}
+
+	return paths, nil
+}
+
+// cleanupKubeResources deletes VMB and VMBT CRs from the cluster after they have
+// been archived to S3. This is non-fatal — if deletion fails, we log a warning
+// but don't fail the upload. Stale CRs will be cleaned up on the next backup cycle
+// (prepareVMBackupTracker deletes before recreating).
+func cleanupKubeResources(ctx context.Context, k8sClient client.Client, cfg *UploaderConfig, logger logr.Logger) {
+	// Delete VMB by constructing a minimal object with just name/namespace.
+	// No need to Get first — Delete with NotFound is a no-op.
+	if cfg.VMBName != "" {
+		vmb := &kubevirtbackupv1alpha1.VirtualMachineBackup{}
+		vmb.Name = cfg.VMBName
+		vmb.Namespace = cfg.VMNamespace
+		if err := k8sClient.Delete(ctx, vmb); err != nil {
+			if !apierrors.IsNotFound(err) {
+				logger.Info("Failed to delete VMB from cluster",
+					"vmb", cfg.VMNamespace+"/"+cfg.VMBName, "reason", err.Error())
+			}
+		} else {
+			logger.Info("Deleted VMB from cluster", "vmb", cfg.VMNamespace+"/"+cfg.VMBName)
+		}
+	}
+
+	// Delete VMBT
+	if cfg.VMBTName != "" {
+		vmbt := &kubevirtbackupv1alpha1.VirtualMachineBackupTracker{}
+		vmbt.Name = cfg.VMBTName
+		vmbt.Namespace = cfg.VMNamespace
+		if err := k8sClient.Delete(ctx, vmbt); err != nil {
+			if !apierrors.IsNotFound(err) {
+				logger.Info("Failed to delete VMBT from cluster",
+					"vmbt", cfg.VMNamespace+"/"+cfg.VMBTName, "reason", err.Error())
+			}
+		} else {
+			logger.Info("Deleted VMBT from cluster", "vmbt", cfg.VMNamespace+"/"+cfg.VMBTName)
+		}
+	}
+}
+
+// newKubeClient creates an in-cluster Kubernetes client with KubeVirt backup types registered.
+// Extracted as a variable to allow overriding in tests.
+var newKubeClient = func() (client.Client, error) {
+	scheme := runtime.NewScheme()
+	if err := kubevirtbackupv1alpha1.AddToScheme(scheme); err != nil {
+		return nil, fmt.Errorf("failed to register KubeVirt backup scheme: %w", err)
+	}
+
+	restConfig, err := restcfg.GetConfig()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get in-cluster config: %w", err)
+	}
+
+	k8sClient, err := client.New(restConfig, client.Options{Scheme: scheme})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create K8s client: %w", err)
+	}
+
+	return k8sClient, nil
+}
+
 // buildCheckpointChain builds the ordered list of checkpoints needed for restore.
 // Starting from the target checkpoint, follows parent references back to the base full backup.
 func buildCheckpointChain(checkpoints []CheckpointEntry, targetID string) []CheckpointEntry {
@@ -450,15 +649,21 @@ func buildCheckpointChain(checkpoints []CheckpointEntry, targetID string) []Chec
 		cpMap[cp.ID] = cp
 	}
 
-	// Build chain by following parents
+	// Build chain by following parents.
+	// Track visited IDs to guard against cycles in corrupted index data.
 	var chain []CheckpointEntry
+	visited := make(map[string]bool)
 	currentID := targetID
 
 	for currentID != "" {
+		if visited[currentID] {
+			break
+		}
 		cp, ok := cpMap[currentID]
 		if !ok {
 			break
 		}
+		visited[currentID] = true
 		// Prepend to chain (oldest first)
 		chain = append([]CheckpointEntry{cp}, chain...)
 		currentID = cp.Parent

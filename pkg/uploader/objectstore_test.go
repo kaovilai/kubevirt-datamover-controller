@@ -78,73 +78,62 @@ func TestS3ObjectStoreFullKey(t *testing.T) {
 	}
 }
 
-func TestLoadAWSCredentialsFromFile(t *testing.T) {
+func TestParseAWSCredentials(t *testing.T) {
 	tests := []struct {
 		name        string
-		content     string
+		data        []byte
 		expectError bool
-		errorMsg    string
 	}{
 		{
-			name: "valid credentials",
-			content: `[default]
-aws_access_key_id = AKIAIOSFODNN7EXAMPLE
-aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
-`,
+			name: "valid credentials with section header",
+			data: []byte("[default]\n" +
+				"aws_access_key_id = AKIAIOSFODNN7EXAMPLE\n" +
+				"aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\n"),
 			expectError: false,
 		},
 		{
 			name: "valid credentials without section header",
-			content: `aws_access_key_id = AKIAIOSFODNN7EXAMPLE
-aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
-`,
+			data: []byte("aws_access_key_id = AKIAIOSFODNN7EXAMPLE\n" +
+				"aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\n"),
 			expectError: false,
 		},
 		{
 			name: "valid credentials with extra whitespace",
-			content: `
-  aws_access_key_id   =   AKIAIOSFODNN7EXAMPLE
-  aws_secret_access_key   =   wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
-
-`,
+			data: []byte("\n" +
+				"  aws_access_key_id   =   AKIAIOSFODNN7EXAMPLE\n" +
+				"  aws_secret_access_key   =   wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\n\n"),
 			expectError: false,
 		},
 		{
 			name:        "missing access key id",
-			content:     `aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY`,
+			data:        []byte("aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"),
 			expectError: true,
-			errorMsg:    "missing aws_access_key_id or aws_secret_access_key",
 		},
 		{
 			name:        "missing secret access key",
-			content:     `aws_access_key_id = AKIAIOSFODNN7EXAMPLE`,
+			data:        []byte("aws_access_key_id = AKIAIOSFODNN7EXAMPLE"),
 			expectError: true,
-			errorMsg:    "missing aws_access_key_id or aws_secret_access_key",
 		},
 		{
-			name:        "empty file",
-			content:     "",
+			name:        "empty data",
+			data:        []byte(""),
 			expectError: true,
-			errorMsg:    "missing aws_access_key_id or aws_secret_access_key",
+		},
+		{
+			name:        "nil data",
+			data:        nil,
+			expectError: true,
 		},
 		{
 			name:        "empty values",
-			content:     "aws_access_key_id =\naws_secret_access_key =",
+			data:        []byte("aws_access_key_id =\naws_secret_access_key ="),
 			expectError: true,
-			errorMsg:    "missing aws_access_key_id or aws_secret_access_key",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Create temp file
-			tmpDir := t.TempDir()
-			tmpFile := filepath.Join(tmpDir, "credentials")
-			if err := os.WriteFile(tmpFile, []byte(tt.content), 0600); err != nil {
-				t.Fatalf("failed to create temp file: %v", err)
-			}
-
-			creds, err := loadAWSCredentialsFromFile(tmpFile)
+			creds, err := ParseAWSCredentials(tt.data)
 
 			if tt.expectError {
 				if err == nil {
@@ -159,6 +148,24 @@ aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
 				}
 			}
 		})
+	}
+}
+
+func TestLoadAWSCredentialsFromFile(t *testing.T) {
+	// Test that file-based loading still works (used by datamover pod)
+	tmpDir := t.TempDir()
+	tmpFile := filepath.Join(tmpDir, "credentials")
+	content := "[default]\naws_access_key_id = AKID\naws_secret_access_key = SECRET\n"
+	if err := os.WriteFile(tmpFile, []byte(content), 0600); err != nil {
+		t.Fatalf("failed to create temp file: %v", err)
+	}
+
+	creds, err := loadAWSCredentialsFromFile(tmpFile)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if creds == nil {
+		t.Error("expected credentials provider but got nil")
 	}
 }
 

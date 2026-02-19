@@ -56,6 +56,7 @@ type DatamoverPodConfig struct {
 	DataUploadName   string
 	DataUploadUID    string
 	VMBName          string
+	VMBTName         string
 
 	// Source PVC
 	SourcePVCName string
@@ -90,6 +91,7 @@ func buildDatamoverPod(config *DatamoverPodConfig) *corev1.Pod {
 		{Name: uploader.EnvDataUploadName, Value: config.DataUploadName},
 		{Name: uploader.EnvDataUploadUID, Value: config.DataUploadUID},
 		{Name: uploader.EnvVMBName, Value: config.VMBName},
+		{Name: uploader.EnvVMBTName, Value: config.VMBTName},
 	}
 
 	// Security context - follows Velero's pattern for CSI snapshot pods:

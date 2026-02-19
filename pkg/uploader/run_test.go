@@ -24,6 +24,14 @@ import (
 	"fmt"
 	"os"
 	"testing"
+
+	"github.com/go-logr/logr"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	kubevirtbackupv1alpha1 "kubevirt.io/api/backup/v1alpha1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
 func TestExtractDiskName(t *testing.T) {
@@ -249,7 +257,9 @@ func TestUpdateVMIndex(t *testing.T) {
 		name           string
 		config         *UploaderConfig
 		files          []CheckpointFile
+		archived       *archivedPaths
 		existingIndex  *VMIndex
+		setupStore     func(*MockObjectStore) // optional: customize store after standard setup
 		expectError    bool
 		validateResult func(*testing.T, *MockObjectStore)
 	}{
@@ -272,6 +282,10 @@ func TestUpdateVMIndex(t *testing.T) {
 					ObjectPath: "checkpoints/test-ns/test-vm/cp-001/vmb-test-disk1.qcow2",
 				},
 			},
+			archived: &archivedPaths{
+				VMBObjectPath:  "checkpoints/test-ns/test-vm/cp-001/vmb.json",
+				VMBTObjectPath: "checkpoints/test-ns/test-vm/cp-001/vmbt.json",
+			},
 			existingIndex: nil,
 			expectError:   false,
 			validateResult: func(t *testing.T, store *MockObjectStore) {
@@ -291,6 +305,19 @@ func TestUpdateVMIndex(t *testing.T) {
 				}
 				if !containsBytes(data, "disk1") {
 					t.Error("index should contain PVC name")
+				}
+				// Verify archived paths are referenced
+				if !containsBytes(data, "vmbObjectPath") {
+					t.Error("index should contain vmbObjectPath")
+				}
+				if !containsBytes(data, "vmbtObjectPath") {
+					t.Error("index should contain vmbtObjectPath")
+				}
+				if !containsBytes(data, "checkpoints/test-ns/test-vm/cp-001/vmb.json") {
+					t.Error("index should reference correct vmb.json path")
+				}
+				if !containsBytes(data, "checkpoints/test-ns/test-vm/cp-001/vmbt.json") {
+					t.Error("index should reference correct vmbt.json path")
 				}
 			},
 		},
@@ -313,11 +340,26 @@ func TestUpdateVMIndex(t *testing.T) {
 					ObjectPath: "checkpoints/test-ns/test-vm/cp-002/vmb-test-2-disk1.qcow2",
 				},
 			},
+			archived: &archivedPaths{
+				VMBObjectPath:  "checkpoints/test-ns/test-vm/cp-002/vmb.json",
+				VMBTObjectPath: "checkpoints/test-ns/test-vm/cp-002/vmbt.json",
+			},
 			existingIndex: &VMIndex{
 				VMName:    "test-vm",
 				Namespace: "test-ns",
 				Checkpoints: []CheckpointEntry{
-					{ID: "cp-001", Type: "full", VMBackup: "vmb-test"},
+					{
+						ID:       "cp-001",
+						Type:     "full",
+						VMBackup: "vmb-test",
+						Files: []CheckpointFile{
+							{
+								Filename:   "vmb-test-disk1.qcow2",
+								DiskName:   "disk1",
+								ObjectPath: "checkpoints/test-ns/test-vm/cp-001/vmb-test-disk1.qcow2",
+							},
+						},
+					},
 				},
 			},
 			expectError: false,
@@ -340,6 +382,101 @@ func TestUpdateVMIndex(t *testing.T) {
 			},
 		},
 		{
+			name: "incremental with mid-chain break returns error",
+			config: &UploaderConfig{
+				BSLBucket:        "test-bucket",
+				VMName:           "test-vm",
+				VMNamespace:      "test-ns",
+				CheckpointName:   "cp-004",
+				BackupType:       "incremental",
+				VMBName:          "vmb-test-4",
+				VeleroBackupName: "backup-004",
+			},
+			files: []CheckpointFile{
+				{
+					Filename:   "vmb-test-4-disk1.qcow2",
+					DiskName:   "disk1",
+					Size:       256,
+					ObjectPath: "checkpoints/test-ns/test-vm/cp-004/vmb-test-4-disk1.qcow2",
+				},
+			},
+			archived: &archivedPaths{},
+			existingIndex: &VMIndex{
+				VMName:    "test-vm",
+				Namespace: "test-ns",
+				Checkpoints: []CheckpointEntry{
+					{
+						ID:       "cp-001",
+						Type:     "full",
+						VMBackup: "vmb-test",
+						Files: []CheckpointFile{
+							{ObjectPath: "checkpoints/test-ns/test-vm/cp-001/vmb-test-disk1.qcow2"},
+						},
+					},
+					{
+						ID:       "cp-002",
+						Type:     "incremental",
+						Parent:   "cp-001",
+						VMBackup: "vmb-test-2",
+						Files: []CheckpointFile{
+							{ObjectPath: "checkpoints/test-ns/test-vm/cp-002/vmb-test-2-disk1.qcow2"},
+						},
+					},
+					{
+						ID:       "cp-003",
+						Type:     "incremental",
+						Parent:   "cp-002",
+						VMBackup: "vmb-test-3",
+						Files: []CheckpointFile{
+							{ObjectPath: "checkpoints/test-ns/test-vm/cp-003/vmb-test-3-disk1.qcow2"},
+						},
+					},
+				},
+			},
+			setupStore: func(store *MockObjectStore) {
+				// Delete cp-002's file to simulate mid-chain break
+				_ = store.DeleteObject("test-bucket", "checkpoints/test-ns/test-vm/cp-002/vmb-test-2-disk1.qcow2")
+			},
+			expectError: true, // Chain fell back — uploader rejects incremental as safety net
+		},
+		{
+			name: "incremental fails when no valid chain exists",
+			config: &UploaderConfig{
+				BSLBucket:        "test-bucket",
+				VMName:           "test-vm",
+				VMNamespace:      "test-ns",
+				CheckpointName:   "cp-002",
+				BackupType:       "incremental",
+				VMBName:          "vmb-test-2",
+				VeleroBackupName: "backup-002",
+			},
+			files: []CheckpointFile{
+				{
+					Filename:   "vmb-test-2-disk1.qcow2",
+					DiskName:   "disk1",
+					Size:       512,
+					ObjectPath: "checkpoints/test-ns/test-vm/cp-002/vmb-test-2-disk1.qcow2",
+				},
+			},
+			archived: &archivedPaths{},
+			existingIndex: &VMIndex{
+				VMName:    "test-vm",
+				Namespace: "test-ns",
+				Checkpoints: []CheckpointEntry{
+					{
+						ID:       "cp-001",
+						Type:     "incremental",
+						Parent:   "cp-000", // cp-000 doesn't exist - broken chain
+						VMBackup: "vmb-test",
+						Files: []CheckpointFile{
+							{ObjectPath: "checkpoints/test-ns/test-vm/cp-001/vmb-test-disk1.qcow2"},
+						},
+					},
+				},
+			},
+			expectError: true,
+		},
+		{
 			name: "deduplicates checkpoint if already exists",
 			config: &UploaderConfig{
 				BSLBucket:        "test-bucket",
@@ -357,6 +494,10 @@ func TestUpdateVMIndex(t *testing.T) {
 					Size:       2048,
 					ObjectPath: "checkpoints/test-ns/test-vm/cp-001/vmb-test-disk1.qcow2",
 				},
+			},
+			archived: &archivedPaths{
+				VMBObjectPath:  "checkpoints/test-ns/test-vm/cp-001/vmb.json",
+				VMBTObjectPath: "checkpoints/test-ns/test-vm/cp-001/vmbt.json",
 			},
 			existingIndex: &VMIndex{
 				VMName:    "test-vm",
@@ -398,11 +539,23 @@ func TestUpdateVMIndex(t *testing.T) {
 				indexPath := fmt.Sprintf("checkpoints/%s/%s/index.json",
 					tt.config.VMNamespace, tt.config.VMName)
 				_ = store.PutObjectBytes(indexPath, data)
+
+				// Create S3 objects for existing checkpoint files so chain validation passes
+				for _, cp := range tt.existingIndex.Checkpoints {
+					for _, f := range cp.Files {
+						if f.ObjectPath != "" {
+							_ = store.PutObjectBytes(f.ObjectPath, []byte("fake-qcow2"))
+						}
+					}
+				}
 			}
 
-			// Call the real updateVMIndex function with MockObjectStore
-			// This is possible now because updateVMIndex accepts velero.ObjectStore interface
-			err := updateVMIndex(context.Background(), store, tt.config, tt.files)
+			// Optional: customize the store (e.g., delete specific files for break tests)
+			if tt.setupStore != nil {
+				tt.setupStore(store)
+			}
+
+			err := updateVMIndex(context.Background(), store, tt.config, tt.files, tt.archived, logr.Discard())
 
 			if tt.expectError {
 				if err == nil {
@@ -557,6 +710,317 @@ func TestUpdateBackupManifests(t *testing.T) {
 	}
 }
 
+func TestArchiveKubeResources(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = kubevirtbackupv1alpha1.AddToScheme(scheme)
+
+	apiGroup := "kubevirt.io"
+	backupAPIGroup := "backup.kubevirt.io"
+
+	tests := []struct {
+		name           string
+		config         *UploaderConfig
+		objects        []client.Object
+		expectError    bool
+		validateResult func(*testing.T, *MockObjectStore, *archivedPaths)
+	}{
+		{
+			name: "archives VMB and VMBT to checkpoint dir",
+			config: &UploaderConfig{
+				BSLBucket:      "test-bucket",
+				VMName:         "test-vm",
+				VMNamespace:    "test-ns",
+				CheckpointName: "cp-001",
+				VMBName:        "vmb-test",
+				VMBTName:       "vmbt-test-vm",
+			},
+			objects: []client.Object{
+				&kubevirtbackupv1alpha1.VirtualMachineBackup{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "vmb-test",
+						Namespace: "test-ns",
+					},
+					Spec: kubevirtbackupv1alpha1.VirtualMachineBackupSpec{
+						Source: corev1.TypedLocalObjectReference{
+							APIGroup: &backupAPIGroup,
+							Kind:     "VirtualMachineBackupTracker",
+							Name:     "vmbt-test-vm",
+						},
+					},
+				},
+				&kubevirtbackupv1alpha1.VirtualMachineBackupTracker{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "vmbt-test-vm",
+						Namespace: "test-ns",
+					},
+					Spec: kubevirtbackupv1alpha1.VirtualMachineBackupTrackerSpec{
+						Source: corev1.TypedLocalObjectReference{
+							APIGroup: &apiGroup,
+							Kind:     "VirtualMachine",
+							Name:     "test-vm",
+						},
+					},
+					// No Status — KubeVirt doesn't set LatestCheckpoint.
+					// archiveKubeResources sets it from cfg.CheckpointName before archiving.
+				},
+			},
+			expectError: false,
+			validateResult: func(t *testing.T, store *MockObjectStore, paths *archivedPaths) {
+				// Verify vmb.json was uploaded to checkpoint dir
+				vmbData, err := store.GetObjectBytes("checkpoints/test-ns/test-vm/cp-001/vmb.json")
+				if err != nil {
+					t.Fatalf("vmb.json not found in store: %v", err)
+				}
+				if !containsBytes(vmbData, "vmb-test") {
+					t.Error("vmb.json should contain VMB name")
+				}
+
+				// Verify vmbt.json was uploaded to checkpoint dir (not VM level)
+				vmbtData, err := store.GetObjectBytes("checkpoints/test-ns/test-vm/cp-001/vmbt.json")
+				if err != nil {
+					t.Fatalf("vmbt.json not found in store: %v", err)
+				}
+				if !containsBytes(vmbtData, "vmbt-test-vm") {
+					t.Error("vmbt.json should contain VMBT name")
+				}
+
+				// Verify that archiveKubeResources set LatestCheckpoint in the archived VMBT.
+				// KubeVirt does NOT update this field — our code sets it in-memory before serializing.
+				var archivedVMBT kubevirtbackupv1alpha1.VirtualMachineBackupTracker
+				if err := json.Unmarshal(vmbtData, &archivedVMBT); err != nil {
+					t.Fatalf("failed to unmarshal archived vmbt.json: %v", err)
+				}
+				if archivedVMBT.Status == nil || archivedVMBT.Status.LatestCheckpoint == nil {
+					t.Fatal("archived VMBT should have Status.LatestCheckpoint set")
+				}
+				if archivedVMBT.Status.LatestCheckpoint.Name != "cp-001" {
+					t.Errorf("archived VMBT LatestCheckpoint.Name = %q, want %q",
+						archivedVMBT.Status.LatestCheckpoint.Name, "cp-001")
+				}
+
+				// Verify returned paths
+				if paths.VMBObjectPath != "checkpoints/test-ns/test-vm/cp-001/vmb.json" {
+					t.Errorf("VMBObjectPath = %q, want checkpoints/test-ns/test-vm/cp-001/vmb.json", paths.VMBObjectPath)
+				}
+				if paths.VMBTObjectPath != "checkpoints/test-ns/test-vm/cp-001/vmbt.json" {
+					t.Errorf("VMBTObjectPath = %q, want checkpoints/test-ns/test-vm/cp-001/vmbt.json", paths.VMBTObjectPath)
+				}
+			},
+		},
+		{
+			name: "fails when VMB not found (fatal)",
+			config: &UploaderConfig{
+				BSLBucket:      "test-bucket",
+				VMName:         "test-vm",
+				VMNamespace:    "test-ns",
+				CheckpointName: "cp-001",
+				VMBName:        "vmb-nonexistent",
+				VMBTName:       "vmbt-test-vm",
+			},
+			objects: []client.Object{
+				&kubevirtbackupv1alpha1.VirtualMachineBackupTracker{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "vmbt-test-vm",
+						Namespace: "test-ns",
+					},
+					Spec: kubevirtbackupv1alpha1.VirtualMachineBackupTrackerSpec{
+						Source: corev1.TypedLocalObjectReference{
+							APIGroup: &apiGroup,
+							Kind:     "VirtualMachine",
+							Name:     "test-vm",
+						},
+					},
+				},
+			},
+			expectError: true,
+		},
+		{
+			name: "fails when VMBT not found (fatal)",
+			config: &UploaderConfig{
+				BSLBucket:      "test-bucket",
+				VMName:         "test-vm",
+				VMNamespace:    "test-ns",
+				CheckpointName: "cp-001",
+				VMBName:        "vmb-test",
+				VMBTName:       "vmbt-nonexistent",
+			},
+			objects: []client.Object{
+				&kubevirtbackupv1alpha1.VirtualMachineBackup{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "vmb-test",
+						Namespace: "test-ns",
+					},
+					Spec: kubevirtbackupv1alpha1.VirtualMachineBackupSpec{
+						Source: corev1.TypedLocalObjectReference{
+							APIGroup: &backupAPIGroup,
+							Kind:     "VirtualMachineBackupTracker",
+							Name:     "vmbt-test-vm",
+						},
+					},
+				},
+			},
+			expectError: true,
+		},
+		{
+			name: "handles empty VMBName and VMBTName",
+			config: &UploaderConfig{
+				BSLBucket:      "test-bucket",
+				VMName:         "test-vm",
+				VMNamespace:    "test-ns",
+				CheckpointName: "cp-001",
+				VMBName:        "",
+				VMBTName:       "",
+			},
+			objects:     []client.Object{},
+			expectError: false,
+			validateResult: func(t *testing.T, store *MockObjectStore, paths *archivedPaths) {
+				objs := store.GetAllObjects()
+				if len(objs) != 0 {
+					t.Errorf("expected no objects uploaded when names are empty, got %d", len(objs))
+				}
+				if paths.VMBObjectPath != "" {
+					t.Errorf("VMBObjectPath should be empty, got %q", paths.VMBObjectPath)
+				}
+				if paths.VMBTObjectPath != "" {
+					t.Errorf("VMBTObjectPath should be empty, got %q", paths.VMBTObjectPath)
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := NewMockObjectStore("test-bucket", "")
+
+			fakeClient := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(tt.objects...).
+				Build()
+
+			paths, err := archiveKubeResources(context.Background(), store, fakeClient, tt.config, logr.Discard())
+
+			if tt.expectError {
+				if err == nil {
+					t.Error("expected error but got none")
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			if tt.validateResult != nil {
+				tt.validateResult(t, store, paths)
+			}
+		})
+	}
+}
+
+func TestCleanupKubeResources(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = kubevirtbackupv1alpha1.AddToScheme(scheme)
+
+	apiGroup := "kubevirt.io"
+	backupAPIGroup := "backup.kubevirt.io"
+
+	tests := []struct {
+		name    string
+		config  *UploaderConfig
+		objects []client.Object
+	}{
+		{
+			name: "deletes VMB and VMBT from cluster",
+			config: &UploaderConfig{
+				VMName:      "test-vm",
+				VMNamespace: "test-ns",
+				VMBName:     "vmb-test",
+				VMBTName:    "vmbt-test-vm",
+			},
+			objects: []client.Object{
+				&kubevirtbackupv1alpha1.VirtualMachineBackup{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "vmb-test",
+						Namespace: "test-ns",
+					},
+					Spec: kubevirtbackupv1alpha1.VirtualMachineBackupSpec{
+						Source: corev1.TypedLocalObjectReference{
+							APIGroup: &backupAPIGroup,
+							Kind:     "VirtualMachineBackupTracker",
+							Name:     "vmbt-test-vm",
+						},
+					},
+				},
+				&kubevirtbackupv1alpha1.VirtualMachineBackupTracker{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "vmbt-test-vm",
+						Namespace: "test-ns",
+					},
+					Spec: kubevirtbackupv1alpha1.VirtualMachineBackupTrackerSpec{
+						Source: corev1.TypedLocalObjectReference{
+							APIGroup: &apiGroup,
+							Kind:     "VirtualMachine",
+							Name:     "test-vm",
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "handles already deleted VMB/VMBT gracefully",
+			config: &UploaderConfig{
+				VMName:      "test-vm",
+				VMNamespace: "test-ns",
+				VMBName:     "vmb-nonexistent",
+				VMBTName:    "vmbt-nonexistent",
+			},
+			objects: []client.Object{},
+		},
+		{
+			name: "handles empty names gracefully",
+			config: &UploaderConfig{
+				VMName:      "test-vm",
+				VMNamespace: "test-ns",
+				VMBName:     "",
+				VMBTName:    "",
+			},
+			objects: []client.Object{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fakeClient := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(tt.objects...).
+				Build()
+
+			// cleanupKubeResources is non-fatal (no error return)
+			cleanupKubeResources(context.Background(), fakeClient, tt.config, logr.Discard())
+
+			// Verify objects were deleted (for the first test case)
+			if tt.config.VMBName != "" && len(tt.objects) > 0 {
+				vmb := &kubevirtbackupv1alpha1.VirtualMachineBackup{}
+				getErr := fakeClient.Get(context.Background(), client.ObjectKey{
+					Name: tt.config.VMBName, Namespace: tt.config.VMNamespace,
+				}, vmb)
+				if getErr == nil {
+					t.Error("VMB should have been deleted from cluster")
+				}
+			}
+			if tt.config.VMBTName != "" && len(tt.objects) > 0 {
+				vmbt := &kubevirtbackupv1alpha1.VirtualMachineBackupTracker{}
+				getErr := fakeClient.Get(context.Background(), client.ObjectKey{
+					Name: tt.config.VMBTName, Namespace: tt.config.VMNamespace,
+				}, vmbt)
+				if getErr == nil {
+					t.Error("VMBT should have been deleted from cluster")
+				}
+			}
+		})
+	}
+}
+
 func TestBuildCheckpointChain(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -624,6 +1088,28 @@ func TestBuildCheckpointChain(t *testing.T) {
 			expectLen:   2, // Only cp-002 and cp-003, stops when cp-001 not found
 			expectFirst: "cp-002",
 			expectLast:  "cp-003",
+		},
+		{
+			name: "cycle in parent references",
+			checkpoints: []CheckpointEntry{
+				{ID: "cp-001", Type: "full", Parent: "cp-003"},        // cycle: cp-001 → cp-003
+				{ID: "cp-002", Type: "incremental", Parent: "cp-001"}, // cp-002 → cp-001
+				{ID: "cp-003", Type: "incremental", Parent: "cp-002"}, // cp-003 → cp-002
+			},
+			targetID:    "cp-003",
+			expectLen:   3, // Should terminate after visiting all 3 (cycle detected on revisit)
+			expectFirst: "cp-001",
+			expectLast:  "cp-003",
+		},
+		{
+			name: "self-referencing checkpoint",
+			checkpoints: []CheckpointEntry{
+				{ID: "cp-001", Type: "full", Parent: "cp-001"}, // points to itself
+			},
+			targetID:    "cp-001",
+			expectLen:   1,
+			expectFirst: "cp-001",
+			expectLast:  "cp-001",
 		},
 	}
 

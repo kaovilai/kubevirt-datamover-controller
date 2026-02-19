@@ -68,7 +68,8 @@ func main() {
 	// Check for subcommand dispatch before parsing flags
 	if len(os.Args) > 1 && os.Args[1] == "upload" {
 		// Run uploader mode
-		if err := uploader.Run(context.Background()); err != nil {
+		uploadLogger := zap.New(zap.UseDevMode(false)).WithName("uploader")
+		if err := uploader.Run(context.Background(), uploadLogger); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}

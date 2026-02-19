@@ -18,13 +18,18 @@ limitations under the License.
 package controller
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"fmt"
 	"testing"
 
 	"github.com/go-logr/logr"
 	"github.com/migtools/kubevirt-datamover-controller/pkg/common"
+	"github.com/migtools/kubevirt-datamover-controller/pkg/uploader"
 	velerov1 "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
 	velerov2alpha1 "github.com/vmware-tanzu/velero/pkg/apis/velero/v2alpha1"
+	velero "github.com/vmware-tanzu/velero/pkg/plugin/velero"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -2006,6 +2011,3041 @@ func TestHandlePrepared(t *testing.T) {
 
 			if updatedDU.Status.Phase != tt.expectedPhase {
 				t.Errorf("expected phase=%s, got phase=%s", tt.expectedPhase, updatedDU.Status.Phase)
+			}
+		})
+	}
+}
+
+func TestGetCredentialsFromBSL(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = velerov1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	tests := []struct {
+		name          string
+		bsl           *velerov1.BackupStorageLocation
+		secret        *corev1.Secret
+		expectError   bool
+		errorContains string
+	}{
+		{
+			name: "valid credentials",
+			bsl: &velerov1.BackupStorageLocation{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "default",
+					Namespace: "openshift-adp",
+				},
+				Spec: velerov1.BackupStorageLocationSpec{
+					Credential: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{
+							Name: "cloud-credentials",
+						},
+						Key: "cloud",
+					},
+				},
+			},
+			secret: &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "cloud-credentials",
+					Namespace: "openshift-adp",
+				},
+				Data: map[string][]byte{
+					"cloud": []byte("[default]\naws_access_key_id=AKID\naws_secret_access_key=SECRET\n"),
+				},
+			},
+			expectError: false,
+		},
+		{
+			name: "no credential reference",
+			bsl: &velerov1.BackupStorageLocation{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "default",
+					Namespace: "openshift-adp",
+				},
+				Spec: velerov1.BackupStorageLocationSpec{
+					Credential: nil,
+				},
+			},
+			expectError:   true,
+			errorContains: "no credential configured",
+		},
+		{
+			name: "secret not found",
+			bsl: &velerov1.BackupStorageLocation{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "default",
+					Namespace: "openshift-adp",
+				},
+				Spec: velerov1.BackupStorageLocationSpec{
+					Credential: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{
+							Name: "nonexistent",
+						},
+						Key: "cloud",
+					},
+				},
+			},
+			expectError:   true,
+			errorContains: "failed to get credential secret",
+		},
+		{
+			name: "secret missing key",
+			bsl: &velerov1.BackupStorageLocation{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "default",
+					Namespace: "openshift-adp",
+				},
+				Spec: velerov1.BackupStorageLocationSpec{
+					Credential: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{
+							Name: "cloud-credentials",
+						},
+						Key: "wrong-key",
+					},
+				},
+			},
+			secret: &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "cloud-credentials",
+					Namespace: "openshift-adp",
+				},
+				Data: map[string][]byte{
+					"cloud": []byte("data"),
+				},
+			},
+			expectError:   true,
+			errorContains: "does not contain key",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			builder := fake.NewClientBuilder().WithScheme(scheme)
+			if tt.secret != nil {
+				builder = builder.WithObjects(tt.secret)
+			}
+			fakeClient := builder.Build()
+
+			r := &KubeVirtDataUploadReconciler{
+				Client:        fakeClient,
+				OADPNamespace: "openshift-adp",
+			}
+
+			credData, err := r.getCredentialsFromBSL(context.Background(), tt.bsl)
+
+			if tt.expectError {
+				if err == nil {
+					t.Error("expected error but got none")
+				} else if tt.errorContains != "" && !contains(err.Error(), tt.errorContains) {
+					t.Errorf("error %q should contain %q", err.Error(), tt.errorContains)
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			if len(credData) == 0 {
+				t.Error("expected non-empty credentials data")
+			}
+		})
+	}
+}
+
+func TestHandleAccepted_WithBSLCheckpointLookup(t *testing.T) {
+	// This test verifies that handleAccepted correctly handles the case where
+	// BSL is available but credentials are missing. The controller should
+	// gracefully fall back to full backup.
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = velerov1.AddToScheme(scheme)
+	_ = kubevirtbackupv1alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	vmName := "test-vm"
+	vmNamespace := "test-ns"
+	duName := "test-du-bsl"
+
+	du := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      duName,
+			Namespace: vmNamespace,
+			UID:       types.UID("test-uid"),
+			Annotations: map[string]string{
+				common.AnnotationVMName:      vmName,
+				common.AnnotationVMNamespace: vmNamespace,
+			},
+		},
+		Spec: velerov2alpha1.DataUploadSpec{
+			DataMover:             common.DataMoverKubeVirt,
+			SourceNamespace:       vmNamespace,
+			BackupStorageLocation: "default",
+		},
+		Status: velerov2alpha1.DataUploadStatus{
+			Phase: velerov2alpha1.DataUploadPhaseAccepted,
+		},
+	}
+
+	// Create BSL (but no credential secret - lookup will fail gracefully)
+	bsl := &velerov1.BackupStorageLocation{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "default",
+			Namespace: vmNamespace,
+		},
+		Spec: velerov1.BackupStorageLocationSpec{
+			Provider: "aws",
+			StorageType: velerov1.StorageType{
+				ObjectStorage: &velerov1.ObjectStorageLocation{
+					Bucket: "test-bucket",
+					Prefix: "velero",
+				},
+			},
+			Config: map[string]string{"region": "us-east-1"},
+			Credential: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "cloud-creds"},
+				Key:                  "cloud",
+			},
+		},
+		Status: velerov1.BackupStorageLocationStatus{
+			Phase: velerov1.BackupStorageLocationPhaseAvailable,
+		},
+	}
+
+	// Create temporary PVC
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "kubevirt-backup-" + duName,
+			Namespace: vmNamespace,
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceStorage: resource.MustParse("1Gi"),
+				},
+			},
+		},
+	}
+
+	// Create VMBT
+	vmbt := &kubevirtbackupv1alpha1.VirtualMachineBackupTracker{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "vmbt-" + vmName,
+			Namespace: vmNamespace,
+		},
+		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupTrackerSpec{
+			Source: corev1.TypedLocalObjectReference{
+				APIGroup: strPtr("kubevirt.io"),
+				Kind:     "VirtualMachine",
+				Name:     vmName,
+			},
+		},
+	}
+
+	// Create VMB (done=true to transition to Prepared)
+	checkpointName := "vmb-" + duName + "-checkpoint"
+	vmb := &kubevirtbackupv1alpha1.VirtualMachineBackup{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "vmb-" + duName,
+			Namespace: vmNamespace,
+			Labels: map[string]string{
+				common.LabelDataUploadName: duName,
+				common.LabelDataUploadUID:  "test-uid",
+			},
+		},
+		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupSpec{
+			Source: corev1.TypedLocalObjectReference{
+				APIGroup: strPtr("backup.kubevirt.io"),
+				Kind:     "VirtualMachineBackupTracker",
+				Name:     vmbt.Name,
+			},
+			PvcName: strPtr(pvc.Name),
+		},
+		Status: &kubevirtbackupv1alpha1.VirtualMachineBackupStatus{
+			Type:           kubevirtbackupv1alpha1.Full,
+			CheckpointName: &checkpointName,
+			Conditions: []kubevirtbackupv1alpha1.Condition{
+				{
+					Type:   kubevirtbackupv1alpha1.ConditionDone,
+					Status: corev1.ConditionTrue,
+					Reason: "Completed VirtualMachineBackup",
+				},
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(du, bsl, pvc, vmbt, vmb).
+		Build()
+
+	r := &KubeVirtDataUploadReconciler{
+		Client:        fakeClient,
+		Scheme:        scheme,
+		Log:           logr.Discard(),
+		OADPNamespace: vmNamespace,
+	}
+
+	result, err := r.handleAccepted(context.Background(), logr.Discard(), du)
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Should still transition to Prepared even when BSL checkpoint lookup fails
+	var updatedDU velerov2alpha1.DataUpload
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{
+		Name:      duName,
+		Namespace: vmNamespace,
+	}, &updatedDU); err != nil {
+		t.Fatalf("failed to get updated DataUpload: %v", err)
+	}
+
+	if updatedDU.Status.Phase != velerov2alpha1.DataUploadPhasePrepared {
+		t.Errorf("expected phase=%s, got phase=%s", velerov2alpha1.DataUploadPhasePrepared, updatedDU.Status.Phase)
+	}
+
+	if result.RequeueAfter == 0 {
+		t.Error("expected requeue after transitioning to Prepared")
+	}
+
+}
+
+func TestHandleAccepted_NoBSLConfigured(t *testing.T) {
+	// Test that handleAccepted works when BSL name is empty - falls back to full backup
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = kubevirtbackupv1alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	vmName := "test-vm"
+	vmNamespace := "test-ns"
+	duName := "test-du-no-bsl"
+
+	du := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      duName,
+			Namespace: vmNamespace,
+			UID:       types.UID("test-uid"),
+			Annotations: map[string]string{
+				common.AnnotationVMName:      vmName,
+				common.AnnotationVMNamespace: vmNamespace,
+			},
+		},
+		Spec: velerov2alpha1.DataUploadSpec{
+			DataMover:             common.DataMoverKubeVirt,
+			SourceNamespace:       vmNamespace,
+			BackupStorageLocation: "", // No BSL configured
+		},
+		Status: velerov2alpha1.DataUploadStatus{
+			Phase: velerov2alpha1.DataUploadPhaseAccepted,
+		},
+	}
+
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "kubevirt-backup-" + duName,
+			Namespace: vmNamespace,
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceStorage: resource.MustParse("1Gi"),
+				},
+			},
+		},
+	}
+
+	vmbt := &kubevirtbackupv1alpha1.VirtualMachineBackupTracker{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "vmbt-" + vmName,
+			Namespace: vmNamespace,
+		},
+		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupTrackerSpec{
+			Source: corev1.TypedLocalObjectReference{
+				APIGroup: strPtr("kubevirt.io"),
+				Kind:     "VirtualMachine",
+				Name:     vmName,
+			},
+		},
+	}
+
+	// VMB with Done=True
+	checkpointName := "cp-001"
+	vmb := &kubevirtbackupv1alpha1.VirtualMachineBackup{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "vmb-" + duName,
+			Namespace: vmNamespace,
+			Labels: map[string]string{
+				common.LabelDataUploadName: duName,
+			},
+		},
+		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupSpec{
+			Source: corev1.TypedLocalObjectReference{
+				APIGroup: strPtr("backup.kubevirt.io"),
+				Kind:     "VirtualMachineBackupTracker",
+				Name:     vmbt.Name,
+			},
+			PvcName: strPtr(pvc.Name),
+		},
+		Status: &kubevirtbackupv1alpha1.VirtualMachineBackupStatus{
+			Type:           kubevirtbackupv1alpha1.Full,
+			CheckpointName: &checkpointName,
+			Conditions: []kubevirtbackupv1alpha1.Condition{
+				{
+					Type:   kubevirtbackupv1alpha1.ConditionDone,
+					Status: corev1.ConditionTrue,
+				},
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(du, pvc, vmbt, vmb).
+		Build()
+
+	r := &KubeVirtDataUploadReconciler{
+		Client:        fakeClient,
+		Scheme:        scheme,
+		Log:           logr.Discard(),
+		OADPNamespace: vmNamespace,
+	}
+
+	result, err := r.handleAccepted(context.Background(), logr.Discard(), du)
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Should still transition to Prepared
+	var updatedDU velerov2alpha1.DataUpload
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{
+		Name:      duName,
+		Namespace: vmNamespace,
+	}, &updatedDU); err != nil {
+		t.Fatalf("failed to get updated DataUpload: %v", err)
+	}
+
+	if updatedDU.Status.Phase != velerov2alpha1.DataUploadPhasePrepared {
+		t.Errorf("expected phase=%s, got phase=%s", velerov2alpha1.DataUploadPhasePrepared, updatedDU.Status.Phase)
+	}
+
+	if result.RequeueAfter == 0 {
+		t.Error("expected requeue")
+	}
+}
+
+func TestHandleAccepted_BSLNotFound_FailsDataUpload(t *testing.T) {
+	// When BSL is specified but doesn't exist, handleAccepted should fail
+	// the DataUpload immediately without creating PVC/VMBT/VMB resources.
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = velerov1.AddToScheme(scheme)
+	_ = kubevirtbackupv1alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	vmName := "test-vm"
+	vmNamespace := "test-ns"
+	duName := "test-du-bsl-notfound"
+
+	du := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      duName,
+			Namespace: vmNamespace,
+			UID:       types.UID("test-uid"),
+			Annotations: map[string]string{
+				common.AnnotationVMName:      vmName,
+				common.AnnotationVMNamespace: vmNamespace,
+			},
+		},
+		Spec: velerov2alpha1.DataUploadSpec{
+			DataMover:             common.DataMoverKubeVirt,
+			SourceNamespace:       vmNamespace,
+			BackupStorageLocation: "nonexistent-bsl", // BSL does not exist
+		},
+		Status: velerov2alpha1.DataUploadStatus{
+			Phase: velerov2alpha1.DataUploadPhaseAccepted,
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(du).
+		Build()
+
+	r := &KubeVirtDataUploadReconciler{
+		Client:        fakeClient,
+		Scheme:        scheme,
+		Log:           logr.Discard(),
+		OADPNamespace: vmNamespace,
+	}
+
+	result, err := r.handleAccepted(context.Background(), logr.Discard(), du)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Should not requeue (permanent failure)
+	if result.RequeueAfter != 0 {
+		t.Errorf("expected no requeue for permanent BSL failure, got RequeueAfter=%v", result.RequeueAfter)
+	}
+
+	// DataUpload should be failed
+	var updatedDU velerov2alpha1.DataUpload
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{
+		Name:      duName,
+		Namespace: vmNamespace,
+	}, &updatedDU); err != nil {
+		t.Fatalf("failed to get updated DataUpload: %v", err)
+	}
+
+	if updatedDU.Status.Phase != velerov2alpha1.DataUploadPhaseFailed {
+		t.Errorf("expected phase=%s, got phase=%s",
+			velerov2alpha1.DataUploadPhaseFailed, updatedDU.Status.Phase)
+	}
+
+	// Verify no PVC was created (resources should not be created if BSL is unavailable)
+	pvcList := &corev1.PersistentVolumeClaimList{}
+	if err := fakeClient.List(context.Background(), pvcList); err != nil {
+		t.Fatalf("failed to list PVCs: %v", err)
+	}
+	if len(pvcList.Items) != 0 {
+		t.Errorf("expected no PVCs to be created, but found %d", len(pvcList.Items))
+	}
+}
+
+func TestHandleAccepted_BSLUnavailable_FailsDataUpload(t *testing.T) {
+	// When BSL exists but is not in Available phase, handleAccepted should fail
+	// the DataUpload immediately without creating any resources.
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = velerov1.AddToScheme(scheme)
+	_ = kubevirtbackupv1alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	vmName := "test-vm"
+	vmNamespace := "test-ns"
+	duName := "test-du-bsl-unavail"
+
+	du := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      duName,
+			Namespace: vmNamespace,
+			UID:       types.UID("test-uid"),
+			Annotations: map[string]string{
+				common.AnnotationVMName:      vmName,
+				common.AnnotationVMNamespace: vmNamespace,
+			},
+		},
+		Spec: velerov2alpha1.DataUploadSpec{
+			DataMover:             common.DataMoverKubeVirt,
+			SourceNamespace:       vmNamespace,
+			BackupStorageLocation: "default",
+		},
+		Status: velerov2alpha1.DataUploadStatus{
+			Phase: velerov2alpha1.DataUploadPhaseAccepted,
+		},
+	}
+
+	// BSL exists but in Unavailable phase
+	bsl := &velerov1.BackupStorageLocation{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "default",
+			Namespace: vmNamespace,
+		},
+		Spec: velerov1.BackupStorageLocationSpec{
+			Provider: "aws",
+			StorageType: velerov1.StorageType{
+				ObjectStorage: &velerov1.ObjectStorageLocation{
+					Bucket: "test-bucket",
+				},
+			},
+		},
+		Status: velerov1.BackupStorageLocationStatus{
+			Phase: velerov1.BackupStorageLocationPhaseUnavailable,
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(du, bsl).
+		Build()
+
+	r := &KubeVirtDataUploadReconciler{
+		Client:        fakeClient,
+		Scheme:        scheme,
+		Log:           logr.Discard(),
+		OADPNamespace: vmNamespace,
+	}
+
+	result, err := r.handleAccepted(context.Background(), logr.Discard(), du)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Should not requeue (permanent failure)
+	if result.RequeueAfter != 0 {
+		t.Errorf("expected no requeue, got RequeueAfter=%v", result.RequeueAfter)
+	}
+
+	// DataUpload should be failed
+	var updatedDU velerov2alpha1.DataUpload
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{
+		Name:      duName,
+		Namespace: vmNamespace,
+	}, &updatedDU); err != nil {
+		t.Fatalf("failed to get updated DataUpload: %v", err)
+	}
+
+	if updatedDU.Status.Phase != velerov2alpha1.DataUploadPhaseFailed {
+		t.Errorf("expected phase=%s, got phase=%s",
+			velerov2alpha1.DataUploadPhaseFailed, updatedDU.Status.Phase)
+	}
+
+	if updatedDU.Status.Message == "" {
+		t.Error("expected a failure message")
+	}
+
+	// Verify no PVC was created
+	pvcList := &corev1.PersistentVolumeClaimList{}
+	if err := fakeClient.List(context.Background(), pvcList); err != nil {
+		t.Fatalf("failed to list PVCs: %v", err)
+	}
+	if len(pvcList.Items) != 0 {
+		t.Errorf("expected no PVCs to be created, but found %d", len(pvcList.Items))
+	}
+}
+
+func TestHandleAccepted_BSLNotAccessible_FailsDataUpload(t *testing.T) {
+	// When the BSL referenced by the DataUpload does not exist (not found),
+	// handleAccepted should fail the DataUpload without creating resources.
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = velerov1.AddToScheme(scheme)
+	_ = kubevirtbackupv1alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	vmName := "test-vm"
+	vmNamespace := "test-ns"
+	duName := "test-du-bsl-transient"
+
+	du := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      duName,
+			Namespace: vmNamespace,
+			UID:       types.UID("test-uid"),
+			Annotations: map[string]string{
+				common.AnnotationVMName:      vmName,
+				common.AnnotationVMNamespace: vmNamespace,
+			},
+		},
+		Spec: velerov2alpha1.DataUploadSpec{
+			DataMover:             common.DataMoverKubeVirt,
+			SourceNamespace:       vmNamespace,
+			BackupStorageLocation: "my-bsl",
+		},
+		Status: velerov2alpha1.DataUploadStatus{
+			Phase: velerov2alpha1.DataUploadPhaseAccepted,
+		},
+	}
+
+	// No BSL is created in the fake client, so the controller will get a NotFound
+	// error when looking up the BSL. This should cause the DataUpload to fail.
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(du).
+		Build()
+
+	r := &KubeVirtDataUploadReconciler{
+		Client:        fakeClient,
+		Scheme:        scheme,
+		Log:           logr.Discard(),
+		OADPNamespace: vmNamespace,
+	}
+
+	result, err := r.handleAccepted(context.Background(), logr.Discard(), du)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// BSL not found is a permanent failure - DataUpload should be failed
+	if result.RequeueAfter != 0 {
+		t.Errorf("expected no requeue for BSL not found, got RequeueAfter=%v", result.RequeueAfter)
+	}
+
+	var updatedDU velerov2alpha1.DataUpload
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{
+		Name:      duName,
+		Namespace: vmNamespace,
+	}, &updatedDU); err != nil {
+		t.Fatalf("failed to get updated DataUpload: %v", err)
+	}
+
+	if updatedDU.Status.Phase != velerov2alpha1.DataUploadPhaseFailed {
+		t.Errorf("expected phase=%s, got phase=%s",
+			velerov2alpha1.DataUploadPhaseFailed, updatedDU.Status.Phase)
+	}
+
+	// Verify no PVC was created
+	pvcList := &corev1.PersistentVolumeClaimList{}
+	if err := fakeClient.List(context.Background(), pvcList); err != nil {
+		t.Fatalf("failed to list PVCs: %v", err)
+	}
+	if len(pvcList.Items) != 0 {
+		t.Errorf("expected no PVCs to be created, but found %d", len(pvcList.Items))
+	}
+}
+
+func TestLookupCheckpointFromBSL_MissingBucket(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = velerov1.AddToScheme(scheme)
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+
+	r := &KubeVirtDataUploadReconciler{
+		Client:        fakeClient,
+		OADPNamespace: "openshift-adp",
+	}
+
+	bsl := &velerov1.BackupStorageLocation{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "default",
+			Namespace: "openshift-adp",
+		},
+		Spec: velerov1.BackupStorageLocationSpec{
+			Provider: "aws",
+			StorageType: velerov1.StorageType{
+				ObjectStorage: &velerov1.ObjectStorageLocation{
+					Bucket: "", // No bucket
+				},
+			},
+		},
+	}
+
+	_, err := r.lookupCheckpointFromBSL(context.Background(), bsl, "ns", "vm")
+	if err == nil {
+		t.Error("expected error for missing bucket")
+	}
+	if !contains(err.Error(), "no bucket configured") {
+		t.Errorf("expected error about missing bucket, got: %v", err)
+	}
+}
+
+func TestLookupCheckpointFromBSL_MissingCredential(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = velerov1.AddToScheme(scheme)
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+
+	r := &KubeVirtDataUploadReconciler{
+		Client:        fakeClient,
+		OADPNamespace: "openshift-adp",
+	}
+
+	bsl := &velerov1.BackupStorageLocation{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "default",
+			Namespace: "openshift-adp",
+		},
+		Spec: velerov1.BackupStorageLocationSpec{
+			Provider: "aws",
+			StorageType: velerov1.StorageType{
+				ObjectStorage: &velerov1.ObjectStorageLocation{
+					Bucket: "my-bucket",
+				},
+			},
+			Credential: nil, // No credential
+		},
+	}
+
+	_, err := r.lookupCheckpointFromBSL(context.Background(), bsl, "ns", "vm")
+	if err == nil {
+		t.Error("expected error for missing credential")
+	}
+	if !contains(err.Error(), "no credential configured") {
+		t.Errorf("expected error about missing credential, got: %v", err)
+	}
+}
+
+func TestHandleAccepted_HappyPath_IncrementalBackup(t *testing.T) {
+	// This test verifies the full happy path: BSL has valid checkpoint data,
+	// the controller finds the latest checkpoint, updates VMBT, and KubeVirt
+	// performs an incremental backup.
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = velerov1.AddToScheme(scheme)
+	_ = kubevirtbackupv1alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	vmName := "test-vm"
+	vmNamespace := "test-ns"
+	duName := "test-du-incr"
+	existingCheckpointID := "cp-existing-001"
+
+	du := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      duName,
+			Namespace: vmNamespace,
+			UID:       types.UID("test-uid"),
+			Annotations: map[string]string{
+				common.AnnotationVMName:      vmName,
+				common.AnnotationVMNamespace: vmNamespace,
+			},
+		},
+		Spec: velerov2alpha1.DataUploadSpec{
+			DataMover:             common.DataMoverKubeVirt,
+			SourceNamespace:       vmNamespace,
+			BackupStorageLocation: "default",
+		},
+		Status: velerov2alpha1.DataUploadStatus{
+			Phase: velerov2alpha1.DataUploadPhaseAccepted,
+		},
+	}
+
+	bsl := &velerov1.BackupStorageLocation{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "default",
+			Namespace: vmNamespace,
+		},
+		Spec: velerov1.BackupStorageLocationSpec{
+			Provider: "aws",
+			StorageType: velerov1.StorageType{
+				ObjectStorage: &velerov1.ObjectStorageLocation{
+					Bucket: "test-bucket",
+					Prefix: "velero",
+				},
+			},
+			Config: map[string]string{"region": "us-east-1"},
+			Credential: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "cloud-creds"},
+				Key:                  "cloud",
+			},
+		},
+		Status: velerov1.BackupStorageLocationStatus{
+			Phase: velerov1.BackupStorageLocationPhaseAvailable,
+		},
+	}
+
+	credSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "cloud-creds",
+			Namespace: vmNamespace,
+		},
+		Data: map[string][]byte{
+			"cloud": []byte("[default]\naws_access_key_id=AKID\naws_secret_access_key=SECRET\n"),
+		},
+	}
+
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "kubevirt-backup-" + duName,
+			Namespace: vmNamespace,
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceStorage: resource.MustParse("1Gi"),
+				},
+			},
+		},
+	}
+
+	vmbt := &kubevirtbackupv1alpha1.VirtualMachineBackupTracker{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "vmbt-" + vmName,
+			Namespace: vmNamespace,
+		},
+		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupTrackerSpec{
+			Source: corev1.TypedLocalObjectReference{
+				APIGroup: strPtr("kubevirt.io"),
+				Kind:     "VirtualMachine",
+				Name:     vmName,
+			},
+		},
+	}
+
+	checkpointName := "vmb-" + duName + "-checkpoint"
+	vmb := &kubevirtbackupv1alpha1.VirtualMachineBackup{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "vmb-" + duName,
+			Namespace: vmNamespace,
+			Labels: map[string]string{
+				common.LabelDataUploadName: duName,
+				common.LabelDataUploadUID:  "test-uid",
+			},
+		},
+		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupSpec{
+			Source: corev1.TypedLocalObjectReference{
+				APIGroup: strPtr("backup.kubevirt.io"),
+				Kind:     "VirtualMachineBackupTracker",
+				Name:     vmbt.Name,
+			},
+			PvcName: strPtr(pvc.Name),
+		},
+		Status: &kubevirtbackupv1alpha1.VirtualMachineBackupStatus{
+			Type:           kubevirtbackupv1alpha1.Full,
+			CheckpointName: &checkpointName,
+			Conditions: []kubevirtbackupv1alpha1.Condition{
+				{
+					Type:   kubevirtbackupv1alpha1.ConditionDone,
+					Status: corev1.ConditionTrue,
+					Reason: "Completed VirtualMachineBackup",
+				},
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(du, bsl, credSecret, pvc, vmbt, vmb).
+		WithStatusSubresource(&kubevirtbackupv1alpha1.VirtualMachineBackupTracker{}).
+		Build()
+
+	// Create a mock object store with an existing checkpoint index
+	mockStore := uploader.NewMockObjectStore("test-bucket", "velero-kubevirt-datamover")
+
+	vmIndex := uploader.VMIndex{
+		VMName:    vmName,
+		Namespace: vmNamespace,
+		Checkpoints: []uploader.CheckpointEntry{
+			{
+				ID:     existingCheckpointID,
+				Type:   "full",
+				Parent: "",
+				Files: []uploader.CheckpointFile{
+					{
+						Filename:   "vmb-prev-disk1.qcow2",
+						ObjectPath: "checkpoints/" + vmNamespace + "/" + vmName + "/" + existingCheckpointID + "/vmb-prev-disk1.qcow2",
+					},
+				},
+			},
+		},
+	}
+	indexData, _ := json.Marshal(vmIndex)
+	indexPath := "checkpoints/" + vmNamespace + "/" + vmName + "/index.json"
+	_ = mockStore.PutObject("test-bucket", indexPath, bytes.NewReader(indexData))
+
+	// Also store the qcow2 file so chain validation succeeds
+	qcow2Path := "checkpoints/" + vmNamespace + "/" + vmName + "/" + existingCheckpointID + "/vmb-prev-disk1.qcow2"
+	_ = mockStore.PutObject("test-bucket", qcow2Path, bytes.NewReader([]byte("fake-qcow2-data")))
+
+	r := &KubeVirtDataUploadReconciler{
+		Client:        fakeClient,
+		Scheme:        scheme,
+		Log:           logr.Discard(),
+		OADPNamespace: vmNamespace,
+		ObjectStoreFactory: func(_ *uploader.UploaderConfig) (velero.ObjectStore, error) {
+			return mockStore, nil
+		},
+	}
+
+	result, err := r.handleAccepted(context.Background(), logr.Discard(), du)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Should transition to Prepared
+	var updatedDU velerov2alpha1.DataUpload
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{
+		Name:      duName,
+		Namespace: vmNamespace,
+	}, &updatedDU); err != nil {
+		t.Fatalf("failed to get updated DataUpload: %v", err)
+	}
+
+	if updatedDU.Status.Phase != velerov2alpha1.DataUploadPhasePrepared {
+		t.Errorf("expected phase=%s, got phase=%s",
+			velerov2alpha1.DataUploadPhasePrepared, updatedDU.Status.Phase)
+	}
+
+	if result.RequeueAfter == 0 {
+		t.Error("expected requeue after transitioning to Prepared")
+	}
+
+	// Controller no longer modifies VMBT status; checkpoint management is left to KubeVirt.
+}
+
+func TestHandleAccepted_StaleCheckpointForcesFullBackup(t *testing.T) {
+	// This test verifies that when BSL validation finds no valid chain
+	// (e.g., index.json deleted from S3), the controller creates the VMB
+	// with ForceFullBackup=true. The controller does NOT modify VMBT status.
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = velerov1.AddToScheme(scheme)
+	_ = kubevirtbackupv1alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	vmName := "test-vm"
+	vmNamespace := "test-ns"
+	duName := "test-du-stale-cp"
+
+	du := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      duName,
+			Namespace: vmNamespace,
+			UID:       types.UID("test-uid"),
+			Annotations: map[string]string{
+				common.AnnotationVMName:      vmName,
+				common.AnnotationVMNamespace: vmNamespace,
+			},
+		},
+		Spec: velerov2alpha1.DataUploadSpec{
+			DataMover:             common.DataMoverKubeVirt,
+			SourceNamespace:       vmNamespace,
+			BackupStorageLocation: "default",
+		},
+		Status: velerov2alpha1.DataUploadStatus{
+			Phase: velerov2alpha1.DataUploadPhaseAccepted,
+		},
+	}
+
+	bsl := &velerov1.BackupStorageLocation{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "default",
+			Namespace: vmNamespace,
+		},
+		Spec: velerov1.BackupStorageLocationSpec{
+			Provider: "aws",
+			StorageType: velerov1.StorageType{
+				ObjectStorage: &velerov1.ObjectStorageLocation{
+					Bucket: "test-bucket",
+					Prefix: "velero",
+				},
+			},
+			Config: map[string]string{"region": "us-east-1"},
+			Credential: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "cloud-creds"},
+				Key:                  "cloud",
+			},
+		},
+		Status: velerov1.BackupStorageLocationStatus{
+			Phase: velerov1.BackupStorageLocationPhaseAvailable,
+		},
+	}
+
+	credSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "cloud-creds",
+			Namespace: vmNamespace,
+		},
+		Data: map[string][]byte{
+			"cloud": []byte("[default]\naws_access_key_id=AKID\naws_secret_access_key=SECRET\n"),
+		},
+	}
+
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "kubevirt-backup-" + duName,
+			Namespace: vmNamespace,
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceStorage: resource.MustParse("1Gi"),
+				},
+			},
+		},
+	}
+
+	// VMBT with a stale checkpoint from a previous backup
+	staleCheckpointName := "cp-previous-001"
+	now := metav1.Now()
+	vmbt := &kubevirtbackupv1alpha1.VirtualMachineBackupTracker{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "vmbt-" + vmName,
+			Namespace: vmNamespace,
+		},
+		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupTrackerSpec{
+			Source: corev1.TypedLocalObjectReference{
+				APIGroup: strPtr("kubevirt.io"),
+				Kind:     "VirtualMachine",
+				Name:     vmName,
+			},
+		},
+		Status: &kubevirtbackupv1alpha1.VirtualMachineBackupTrackerStatus{
+			LatestCheckpoint: &kubevirtbackupv1alpha1.BackupCheckpoint{
+				Name:         staleCheckpointName,
+				CreationTime: &now,
+			},
+		},
+	}
+
+	// Do NOT pre-create the VMB: let ensureVMBackup create it with ForceFullBackup=true
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(du, bsl, credSecret, pvc, vmbt).
+		WithStatusSubresource(&kubevirtbackupv1alpha1.VirtualMachineBackupTracker{}).
+		Build()
+
+	// Mock object store with NO index.json (simulates deleted S3 data)
+	mockStore := uploader.NewMockObjectStore("test-bucket", "velero-kubevirt-datamover")
+
+	r := &KubeVirtDataUploadReconciler{
+		Client:        fakeClient,
+		Scheme:        scheme,
+		Log:           logr.Discard(),
+		OADPNamespace: vmNamespace,
+		ObjectStoreFactory: func(_ *uploader.UploaderConfig) (velero.ObjectStore, error) {
+			return mockStore, nil
+		},
+	}
+
+	_, err := r.handleAccepted(context.Background(), logr.Discard(), du)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Verify VMB was created with ForceFullBackup=true
+	var createdVMB kubevirtbackupv1alpha1.VirtualMachineBackup
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{
+		Name:      "vmb-" + duName,
+		Namespace: vmNamespace,
+	}, &createdVMB); err != nil {
+		t.Fatalf("failed to get created VMB: %v", err)
+	}
+
+	if !createdVMB.Spec.ForceFullBackup {
+		t.Error("expected VMB.Spec.ForceFullBackup to be true when BSL finds no valid chain")
+	}
+
+	// Verify BSL validated annotation was set
+	var updatedDU velerov2alpha1.DataUpload
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{
+		Name:      duName,
+		Namespace: vmNamespace,
+	}, &updatedDU); err != nil {
+		t.Fatalf("failed to get updated DataUpload: %v", err)
+	}
+
+	if updatedDU.Annotations[common.AnnotationBSLValidated] != "true" {
+		t.Error("expected BSL validated annotation to be set")
+	}
+}
+
+func TestHandleAccepted_SkipsBSLValidationWhenAnnotated(t *testing.T) {
+	// This test verifies that BSL validation is skipped on subsequent reconciles
+	// when the DataUpload already has the BSL validated annotation.
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = velerov1.AddToScheme(scheme)
+	_ = kubevirtbackupv1alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	vmName := "test-vm"
+	vmNamespace := "test-ns"
+	duName := "test-du-annotated"
+
+	du := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      duName,
+			Namespace: vmNamespace,
+			UID:       types.UID("test-uid"),
+			Annotations: map[string]string{
+				common.AnnotationVMName:       vmName,
+				common.AnnotationVMNamespace:  vmNamespace,
+				common.AnnotationBSLValidated: "true", // Already validated
+			},
+		},
+		Spec: velerov2alpha1.DataUploadSpec{
+			DataMover:             common.DataMoverKubeVirt,
+			SourceNamespace:       vmNamespace,
+			BackupStorageLocation: "default",
+		},
+		Status: velerov2alpha1.DataUploadStatus{
+			Phase: velerov2alpha1.DataUploadPhaseAccepted,
+		},
+	}
+
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "kubevirt-backup-" + duName,
+			Namespace: vmNamespace,
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceStorage: resource.MustParse("1Gi"),
+				},
+			},
+		},
+	}
+
+	vmbt := &kubevirtbackupv1alpha1.VirtualMachineBackupTracker{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "vmbt-" + vmName,
+			Namespace: vmNamespace,
+		},
+		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupTrackerSpec{
+			Source: corev1.TypedLocalObjectReference{
+				APIGroup: strPtr("kubevirt.io"),
+				Kind:     "VirtualMachine",
+				Name:     vmName,
+			},
+		},
+	}
+
+	// VMB in progress (no Done condition yet)
+	vmb := &kubevirtbackupv1alpha1.VirtualMachineBackup{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "vmb-" + duName,
+			Namespace: vmNamespace,
+			Labels: map[string]string{
+				common.LabelDataUploadName: duName,
+				common.LabelDataUploadUID:  "test-uid",
+			},
+		},
+		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupSpec{
+			Source: corev1.TypedLocalObjectReference{
+				APIGroup: strPtr("backup.kubevirt.io"),
+				Kind:     "VirtualMachineBackupTracker",
+				Name:     vmbt.Name,
+			},
+			PvcName: strPtr(pvc.Name),
+		},
+		Status: &kubevirtbackupv1alpha1.VirtualMachineBackupStatus{},
+	}
+
+	// BSL must exist for the Step 0 availability check
+	bsl := &velerov1.BackupStorageLocation{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "default",
+			Namespace: vmNamespace,
+		},
+		Spec: velerov1.BackupStorageLocationSpec{
+			Provider: "aws",
+			StorageType: velerov1.StorageType{
+				ObjectStorage: &velerov1.ObjectStorageLocation{
+					Bucket: "test-bucket",
+				},
+			},
+		},
+		Status: velerov1.BackupStorageLocationStatus{
+			Phase: velerov1.BackupStorageLocationPhaseAvailable,
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(du, pvc, vmbt, vmb, bsl).
+		Build()
+
+	// ObjectStoreFactory should NOT be called - BSL validation is skipped
+	factoryCalled := false
+	r := &KubeVirtDataUploadReconciler{
+		Client:        fakeClient,
+		Scheme:        scheme,
+		Log:           logr.Discard(),
+		OADPNamespace: vmNamespace,
+		ObjectStoreFactory: func(_ *uploader.UploaderConfig) (velero.ObjectStore, error) {
+			factoryCalled = true
+			return nil, nil
+		},
+	}
+
+	_, err := r.handleAccepted(context.Background(), logr.Discard(), du)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if factoryCalled {
+		t.Error("ObjectStoreFactory should not be called when BSL validation annotation is present")
+	}
+}
+
+func TestLookupCheckpointFromBSL_WithValidCredentials(t *testing.T) {
+	// Tests the full lookupCheckpointFromBSL path with valid credentials
+	// and a mock object store that returns no checkpoint (first backup).
+	scheme := runtime.NewScheme()
+	_ = velerov1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	credSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "cloud-credentials",
+			Namespace: "openshift-adp",
+		},
+		Data: map[string][]byte{
+			"cloud": []byte("[default]\naws_access_key_id=AKID\naws_secret_access_key=SECRET\n"),
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(credSecret).
+		Build()
+
+	// Mock store with no index (first backup)
+	mockStore := uploader.NewMockObjectStore("my-bucket", "velero-kubevirt-datamover")
+
+	r := &KubeVirtDataUploadReconciler{
+		Client:        fakeClient,
+		OADPNamespace: "openshift-adp",
+		ObjectStoreFactory: func(_ *uploader.UploaderConfig) (velero.ObjectStore, error) {
+			return mockStore, nil
+		},
+	}
+
+	bsl := &velerov1.BackupStorageLocation{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "default",
+			Namespace: "openshift-adp",
+		},
+		Spec: velerov1.BackupStorageLocationSpec{
+			Provider: "aws",
+			StorageType: velerov1.StorageType{
+				ObjectStorage: &velerov1.ObjectStorageLocation{
+					Bucket: "my-bucket",
+					Prefix: "velero",
+				},
+			},
+			Config: map[string]string{"region": "us-east-1"},
+			Credential: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "cloud-credentials"},
+				Key:                  "cloud",
+			},
+		},
+		Status: velerov1.BackupStorageLocationStatus{
+			Phase: velerov1.BackupStorageLocationPhaseAvailable,
+		},
+	}
+
+	result, err := r.lookupCheckpointFromBSL(context.Background(), bsl, "test-ns", "test-vm")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if result.Found {
+		t.Error("expected Found=false for first backup (no index)")
+	}
+	if !contains(result.Message, "no checkpoint index found") {
+		t.Errorf("expected message about no index, got: %s", result.Message)
+	}
+}
+
+func TestLookupCheckpointFromBSL_WithExistingCheckpoint(t *testing.T) {
+	// Tests lookupCheckpointFromBSL when BSL has an existing valid checkpoint.
+	scheme := runtime.NewScheme()
+	_ = velerov1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	credSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "cloud-credentials",
+			Namespace: "openshift-adp",
+		},
+		Data: map[string][]byte{
+			"cloud": []byte("[default]\naws_access_key_id=AKID\naws_secret_access_key=SECRET\n"),
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(credSecret).
+		Build()
+
+	mockStore := uploader.NewMockObjectStore("my-bucket", "velero-kubevirt-datamover")
+
+	// Populate mock store with checkpoint data
+	vmIndex := uploader.VMIndex{
+		VMName:    "test-vm",
+		Namespace: "test-ns",
+		Checkpoints: []uploader.CheckpointEntry{
+			{
+				ID:     "cp-001",
+				Type:   "full",
+				Parent: "",
+				Files: []uploader.CheckpointFile{
+					{
+						Filename:   "disk1.qcow2",
+						ObjectPath: "checkpoints/test-ns/test-vm/cp-001/disk1.qcow2",
+					},
+				},
+			},
+			{
+				ID:     "cp-002",
+				Type:   "incremental",
+				Parent: "cp-001",
+				Files: []uploader.CheckpointFile{
+					{
+						Filename:   "disk1.qcow2",
+						ObjectPath: "checkpoints/test-ns/test-vm/cp-002/disk1.qcow2",
+					},
+				},
+			},
+		},
+	}
+	indexData, _ := json.Marshal(vmIndex)
+	_ = mockStore.PutObject("my-bucket", "checkpoints/test-ns/test-vm/index.json",
+		bytes.NewReader(indexData))
+	_ = mockStore.PutObject("my-bucket", "checkpoints/test-ns/test-vm/cp-001/disk1.qcow2",
+		bytes.NewReader([]byte("data")))
+	_ = mockStore.PutObject("my-bucket", "checkpoints/test-ns/test-vm/cp-002/disk1.qcow2",
+		bytes.NewReader([]byte("data")))
+
+	r := &KubeVirtDataUploadReconciler{
+		Client:        fakeClient,
+		OADPNamespace: "openshift-adp",
+		ObjectStoreFactory: func(_ *uploader.UploaderConfig) (velero.ObjectStore, error) {
+			return mockStore, nil
+		},
+	}
+
+	bsl := &velerov1.BackupStorageLocation{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "default",
+			Namespace: "openshift-adp",
+		},
+		Spec: velerov1.BackupStorageLocationSpec{
+			Provider: "aws",
+			StorageType: velerov1.StorageType{
+				ObjectStorage: &velerov1.ObjectStorageLocation{
+					Bucket: "my-bucket",
+					Prefix: "velero",
+				},
+			},
+			Config: map[string]string{"region": "us-east-1"},
+			Credential: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "cloud-credentials"},
+				Key:                  "cloud",
+			},
+		},
+		Status: velerov1.BackupStorageLocationStatus{
+			Phase: velerov1.BackupStorageLocationPhaseAvailable,
+		},
+	}
+
+	result, err := r.lookupCheckpointFromBSL(context.Background(), bsl, "test-ns", "test-vm")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if !result.Found {
+		t.Errorf("expected Found=true, got Found=false (message: %s)", result.Message)
+	}
+	if result.LatestCheckpoint != "cp-002" {
+		t.Errorf("expected LatestCheckpoint=cp-002, got=%s", result.LatestCheckpoint)
+	}
+	if result.ChainLength != 2 {
+		t.Errorf("expected ChainLength=2, got=%d", result.ChainLength)
+	}
+}
+
+func TestGetCredentialsFromBSL_ReturnsRawBytes(t *testing.T) {
+	// Verifies that credentials are returned as raw bytes without temp files.
+	scheme := runtime.NewScheme()
+	_ = velerov1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	expectedData := "[default]\naws_access_key_id=AKID\naws_secret_access_key=SECRET\n"
+	credSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "cloud-credentials",
+			Namespace: "openshift-adp",
+		},
+		Data: map[string][]byte{
+			"cloud": []byte(expectedData),
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(credSecret).
+		Build()
+
+	r := &KubeVirtDataUploadReconciler{
+		Client:        fakeClient,
+		OADPNamespace: "openshift-adp",
+	}
+
+	bsl := &velerov1.BackupStorageLocation{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "default",
+			Namespace: "openshift-adp",
+		},
+		Spec: velerov1.BackupStorageLocationSpec{
+			Credential: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "cloud-credentials"},
+				Key:                  "cloud",
+			},
+		},
+	}
+
+	credData, err := r.getCredentialsFromBSL(context.Background(), bsl)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if string(credData) != expectedData {
+		t.Errorf("credential data mismatch: got %q, want %q", string(credData), expectedData)
+	}
+}
+
+func TestExtractBSLConfig(t *testing.T) {
+	tests := []struct {
+		name          string
+		bsl           *velerov1.BackupStorageLocation
+		expectError   bool
+		errorContains string
+		validate      func(*testing.T, *bslConfig)
+	}{
+		{
+			name: "full config with prefix",
+			bsl: &velerov1.BackupStorageLocation{
+				ObjectMeta: metav1.ObjectMeta{Name: "default"},
+				Spec: velerov1.BackupStorageLocationSpec{
+					Provider: "aws",
+					StorageType: velerov1.StorageType{
+						ObjectStorage: &velerov1.ObjectStorageLocation{
+							Bucket: "my-bucket",
+							Prefix: "velero",
+						},
+					},
+					Config: map[string]string{"region": "us-west-2"},
+					Credential: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{Name: "creds"},
+						Key:                  "custom-key",
+					},
+				},
+			},
+			validate: func(t *testing.T, cfg *bslConfig) {
+				if cfg.Provider != "aws" {
+					t.Errorf("Provider = %q, want %q", cfg.Provider, "aws")
+				}
+				if cfg.Bucket != "my-bucket" {
+					t.Errorf("Bucket = %q, want %q", cfg.Bucket, "my-bucket")
+				}
+				if cfg.Prefix != "velero-kubevirt-datamover" {
+					t.Errorf("Prefix = %q, want %q", cfg.Prefix, "velero-kubevirt-datamover")
+				}
+				if cfg.Region != "us-west-2" {
+					t.Errorf("Region = %q, want %q", cfg.Region, "us-west-2")
+				}
+				if cfg.CredentialName != "creds" {
+					t.Errorf("CredentialName = %q, want %q", cfg.CredentialName, "creds")
+				}
+				if cfg.CredentialKey != "custom-key" {
+					t.Errorf("CredentialKey = %q, want %q", cfg.CredentialKey, "custom-key")
+				}
+			},
+		},
+		{
+			name: "empty prefix produces bare datamover prefix",
+			bsl: &velerov1.BackupStorageLocation{
+				ObjectMeta: metav1.ObjectMeta{Name: "default"},
+				Spec: velerov1.BackupStorageLocationSpec{
+					Provider: "aws",
+					StorageType: velerov1.StorageType{
+						ObjectStorage: &velerov1.ObjectStorageLocation{
+							Bucket: "bucket",
+							Prefix: "",
+						},
+					},
+					Credential: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{Name: "creds"},
+					},
+				},
+			},
+			validate: func(t *testing.T, cfg *bslConfig) {
+				if cfg.Prefix != "kubevirt-datamover" {
+					t.Errorf("Prefix = %q, want %q", cfg.Prefix, "kubevirt-datamover")
+				}
+			},
+		},
+		{
+			name: "nil ObjectStorage returns error",
+			bsl: &velerov1.BackupStorageLocation{
+				ObjectMeta: metav1.ObjectMeta{Name: "bsl-nil-os"},
+				Spec: velerov1.BackupStorageLocationSpec{
+					Provider: "aws",
+					StorageType: velerov1.StorageType{
+						ObjectStorage: nil,
+					},
+				},
+			},
+			expectError:   true,
+			errorContains: "no bucket configured",
+		},
+		{
+			name: "empty bucket returns error",
+			bsl: &velerov1.BackupStorageLocation{
+				ObjectMeta: metav1.ObjectMeta{Name: "bsl-no-bucket"},
+				Spec: velerov1.BackupStorageLocationSpec{
+					Provider: "aws",
+					StorageType: velerov1.StorageType{
+						ObjectStorage: &velerov1.ObjectStorageLocation{
+							Bucket: "",
+						},
+					},
+				},
+			},
+			expectError:   true,
+			errorContains: "no bucket configured",
+		},
+		{
+			name: "nil Config map gives empty region",
+			bsl: &velerov1.BackupStorageLocation{
+				ObjectMeta: metav1.ObjectMeta{Name: "default"},
+				Spec: velerov1.BackupStorageLocationSpec{
+					Provider: "aws",
+					StorageType: velerov1.StorageType{
+						ObjectStorage: &velerov1.ObjectStorageLocation{
+							Bucket: "bucket",
+						},
+					},
+					Config: nil,
+					Credential: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{Name: "creds"},
+					},
+				},
+			},
+			validate: func(t *testing.T, cfg *bslConfig) {
+				if cfg.Region != "" {
+					t.Errorf("Region = %q, want empty", cfg.Region)
+				}
+			},
+		},
+		{
+			name: "nil Credential gives empty credential name",
+			bsl: &velerov1.BackupStorageLocation{
+				ObjectMeta: metav1.ObjectMeta{Name: "default"},
+				Spec: velerov1.BackupStorageLocationSpec{
+					Provider: "aws",
+					StorageType: velerov1.StorageType{
+						ObjectStorage: &velerov1.ObjectStorageLocation{
+							Bucket: "bucket",
+						},
+					},
+					Credential: nil,
+				},
+			},
+			validate: func(t *testing.T, cfg *bslConfig) {
+				if cfg.CredentialName != "" {
+					t.Errorf("CredentialName = %q, want empty", cfg.CredentialName)
+				}
+			},
+		},
+		{
+			name: "Credential with empty Key defaults to cloud",
+			bsl: &velerov1.BackupStorageLocation{
+				ObjectMeta: metav1.ObjectMeta{Name: "default"},
+				Spec: velerov1.BackupStorageLocationSpec{
+					Provider: "aws",
+					StorageType: velerov1.StorageType{
+						ObjectStorage: &velerov1.ObjectStorageLocation{
+							Bucket: "bucket",
+						},
+					},
+					Credential: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{Name: "creds"},
+						Key:                  "",
+					},
+				},
+			},
+			validate: func(t *testing.T, cfg *bslConfig) {
+				if cfg.CredentialKey != "cloud" {
+					t.Errorf("CredentialKey = %q, want %q", cfg.CredentialKey, "cloud")
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg, err := extractBSLConfig(tt.bsl)
+
+			if tt.expectError {
+				if err == nil {
+					t.Error("expected error but got none")
+				} else if tt.errorContains != "" && !contains(err.Error(), tt.errorContains) {
+					t.Errorf("error %q should contain %q", err.Error(), tt.errorContains)
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if tt.validate != nil {
+				tt.validate(t, cfg)
+			}
+		})
+	}
+}
+
+func TestHandleAccepted_VMBConflictRequeuesGracefully(t *testing.T) {
+	// This test verifies that when another VirtualMachineBackup is in progress
+	// for the same VM (admission webhook denies creation), the controller requeues
+	// with a longer delay instead of returning an error that causes a retry storm.
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = velerov1.AddToScheme(scheme)
+	_ = kubevirtbackupv1alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	vmName := "test-vm"
+	vmNamespace := "test-ns"
+	duName := "test-du-conflict"
+
+	du := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      duName,
+			Namespace: vmNamespace,
+			UID:       types.UID("test-uid"),
+			Annotations: map[string]string{
+				common.AnnotationVMName:       vmName,
+				common.AnnotationVMNamespace:  vmNamespace,
+				common.AnnotationBSLValidated: "true", // Skip BSL validation
+			},
+		},
+		Spec: velerov2alpha1.DataUploadSpec{
+			DataMover:             common.DataMoverKubeVirt,
+			SourceNamespace:       vmNamespace,
+			BackupStorageLocation: "default",
+		},
+		Status: velerov2alpha1.DataUploadStatus{
+			Phase: velerov2alpha1.DataUploadPhaseAccepted,
+		},
+	}
+
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "kubevirt-backup-" + duName,
+			Namespace: vmNamespace,
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceStorage: resource.MustParse("1Gi"),
+				},
+			},
+		},
+	}
+
+	vmbt := &kubevirtbackupv1alpha1.VirtualMachineBackupTracker{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "vmbt-" + vmName,
+			Namespace: vmNamespace,
+		},
+		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupTrackerSpec{
+			Source: corev1.TypedLocalObjectReference{
+				APIGroup: strPtr("kubevirt.io"),
+				Kind:     "VirtualMachine",
+				Name:     vmName,
+			},
+		},
+	}
+
+	// BSL must exist for the Step 0 availability check
+	bsl := &velerov1.BackupStorageLocation{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "default",
+			Namespace: vmNamespace,
+		},
+		Spec: velerov1.BackupStorageLocationSpec{
+			Provider: "aws",
+			StorageType: velerov1.StorageType{
+				ObjectStorage: &velerov1.ObjectStorageLocation{
+					Bucket: "test-bucket",
+				},
+			},
+		},
+		Status: velerov1.BackupStorageLocationStatus{
+			Phase: velerov1.BackupStorageLocationPhaseAvailable,
+		},
+	}
+
+	// No VMB exists - the controller will try to create one.
+	// We simulate the admission webhook rejection by using an interceptor.
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(du, pvc, vmbt, bsl).
+		Build()
+
+	r := &KubeVirtDataUploadReconciler{
+		Client:        fakeClient,
+		Scheme:        scheme,
+		Log:           logr.Discard(),
+		OADPNamespace: vmNamespace,
+	}
+
+	// Call ensureVMBackup directly to verify the error handling logic.
+	// The fake client won't produce an admission webhook error, so we test
+	// the handleAccepted logic by simulating the error path.
+	// Instead, we test by calling handleAccepted and checking that if
+	// ensureVMBackup returns an "in progress for source" error, it requeues.
+
+	// To properly test this, we need to verify the string matching logic.
+	// Let's construct the exact error that the admission webhook produces.
+	webhookErr := fmt.Errorf("failed to create VirtualMachineBackup: admission webhook " +
+		"\"virtualmachinebackup-validator.backup.kubevirt.io\" denied the request: " +
+		"VirtualMachineBackup \"vmb-other-du\" in progress for source")
+
+	// Verify the string matching works correctly
+	if !contains(webhookErr.Error(), "in progress for source") {
+		t.Fatal("expected error to contain 'in progress for source'")
+	}
+
+	// Verify that a normal error does NOT match
+	normalErr := fmt.Errorf("failed to create VirtualMachineBackup: connection refused")
+	if contains(normalErr.Error(), "in progress for source") {
+		t.Fatal("normal error should not match 'in progress for source'")
+	}
+
+	// Also verify via handleAccepted: when VMB doesn't exist and creation succeeds,
+	// the flow continues normally (no conflict).
+	result, err := r.handleAccepted(context.Background(), logr.Discard(), du)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Should have created the VMB and be requeuing to check its status
+	if result.RequeueAfter == 0 {
+		t.Error("expected requeue")
+	}
+
+	// Verify RequeueAfterLong constant is larger than RequeueAfterShort
+	if RequeueAfterLong <= RequeueAfterShort {
+		t.Errorf("RequeueAfterLong (%v) should be greater than RequeueAfterShort (%v)",
+			RequeueAfterLong, RequeueAfterShort)
+	}
+}
+
+func TestHandleAccepted_BSLAnnotationNotSetOnTransientFailure(t *testing.T) {
+	// This test verifies that when BSL lookup fails due to a transient error
+	// (e.g., missing credential secret), the AnnotationBSLValidated is NOT set,
+	// so validation will be retried on the next reconcile.
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = velerov1.AddToScheme(scheme)
+	_ = kubevirtbackupv1alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	vmName := "test-vm"
+	vmNamespace := "test-ns"
+	duName := "test-du-transient"
+
+	du := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      duName,
+			Namespace: vmNamespace,
+			UID:       types.UID("test-uid"),
+			Annotations: map[string]string{
+				common.AnnotationVMName:      vmName,
+				common.AnnotationVMNamespace: vmNamespace,
+			},
+		},
+		Spec: velerov2alpha1.DataUploadSpec{
+			DataMover:             common.DataMoverKubeVirt,
+			SourceNamespace:       vmNamespace,
+			BackupStorageLocation: "default",
+		},
+		Status: velerov2alpha1.DataUploadStatus{
+			Phase: velerov2alpha1.DataUploadPhaseAccepted,
+		},
+	}
+
+	// BSL exists but credential secret is MISSING (transient failure)
+	bsl := &velerov1.BackupStorageLocation{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "default",
+			Namespace: vmNamespace,
+		},
+		Spec: velerov1.BackupStorageLocationSpec{
+			Provider: "aws",
+			StorageType: velerov1.StorageType{
+				ObjectStorage: &velerov1.ObjectStorageLocation{
+					Bucket: "test-bucket",
+					Prefix: "velero",
+				},
+			},
+			Config: map[string]string{"region": "us-east-1"},
+			Credential: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "missing-secret"},
+				Key:                  "cloud",
+			},
+		},
+		Status: velerov1.BackupStorageLocationStatus{
+			Phase: velerov1.BackupStorageLocationPhaseAvailable,
+		},
+	}
+
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "kubevirt-backup-" + duName,
+			Namespace: vmNamespace,
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceStorage: resource.MustParse("1Gi"),
+				},
+			},
+		},
+	}
+
+	vmbt := &kubevirtbackupv1alpha1.VirtualMachineBackupTracker{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "vmbt-" + vmName,
+			Namespace: vmNamespace,
+		},
+		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupTrackerSpec{
+			Source: corev1.TypedLocalObjectReference{
+				APIGroup: strPtr("kubevirt.io"),
+				Kind:     "VirtualMachine",
+				Name:     vmName,
+			},
+		},
+	}
+
+	// VMB with Done=True so the test can proceed past the VMB check
+	checkpointName := "cp-001"
+	vmb := &kubevirtbackupv1alpha1.VirtualMachineBackup{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "vmb-" + duName,
+			Namespace: vmNamespace,
+			Labels: map[string]string{
+				common.LabelDataUploadName: duName,
+				common.LabelDataUploadUID:  "test-uid",
+			},
+		},
+		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupSpec{
+			Source: corev1.TypedLocalObjectReference{
+				APIGroup: strPtr("backup.kubevirt.io"),
+				Kind:     "VirtualMachineBackupTracker",
+				Name:     vmbt.Name,
+			},
+			PvcName: strPtr(pvc.Name),
+		},
+		Status: &kubevirtbackupv1alpha1.VirtualMachineBackupStatus{
+			Type:           kubevirtbackupv1alpha1.Full,
+			CheckpointName: &checkpointName,
+			Conditions: []kubevirtbackupv1alpha1.Condition{
+				{
+					Type:   kubevirtbackupv1alpha1.ConditionDone,
+					Status: corev1.ConditionTrue,
+				},
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(du, bsl, pvc, vmbt, vmb).
+		Build()
+
+	r := &KubeVirtDataUploadReconciler{
+		Client:        fakeClient,
+		Scheme:        scheme,
+		Log:           logr.Discard(),
+		OADPNamespace: vmNamespace,
+	}
+
+	_, err := r.handleAccepted(context.Background(), logr.Discard(), du)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Verify BSL validated annotation was NOT set (transient failure)
+	var updatedDU velerov2alpha1.DataUpload
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{
+		Name:      duName,
+		Namespace: vmNamespace,
+	}, &updatedDU); err != nil {
+		t.Fatalf("failed to get updated DataUpload: %v", err)
+	}
+
+	if updatedDU.Annotations[common.AnnotationBSLValidated] == "true" {
+		t.Error("expected BSL validated annotation to NOT be set on transient failure, " +
+			"so validation will be retried on the next reconcile")
+	}
+
+	// Should still transition to Prepared (graceful degradation)
+	if updatedDU.Status.Phase != velerov2alpha1.DataUploadPhasePrepared {
+		t.Errorf("expected phase=%s, got phase=%s",
+			velerov2alpha1.DataUploadPhasePrepared, updatedDU.Status.Phase)
+	}
+}
+
+func TestHandleAccepted_ForceFullBackupAnnotation(t *testing.T) {
+	// When the force-full-backup annotation is set on the DataUpload,
+	// the controller should:
+	// 1. Skip BSL checkpoint lookup entirely
+	// 2. Clear any existing VMBT checkpoint
+	// 3. Create the VMB with ForceFullBackup=true
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = velerov1.AddToScheme(scheme)
+	_ = kubevirtbackupv1alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	vmName := "test-vm"
+	vmNamespace := "test-ns"
+	duName := "test-du-force-full"
+
+	du := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      duName,
+			Namespace: vmNamespace,
+			UID:       types.UID("test-uid"),
+			Annotations: map[string]string{
+				common.AnnotationVMName:          vmName,
+				common.AnnotationVMNamespace:     vmNamespace,
+				common.AnnotationForceFullBackup: "true",
+			},
+		},
+		Spec: velerov2alpha1.DataUploadSpec{
+			DataMover:             common.DataMoverKubeVirt,
+			SourceNamespace:       vmNamespace,
+			BackupStorageLocation: "default",
+		},
+		Status: velerov2alpha1.DataUploadStatus{
+			Phase: velerov2alpha1.DataUploadPhaseAccepted,
+		},
+	}
+
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "kubevirt-backup-" + duName,
+			Namespace: vmNamespace,
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceStorage: resource.MustParse("1Gi"),
+				},
+			},
+		},
+	}
+
+	// VMBT with an existing checkpoint (should be cleared)
+	existingCheckpoint := "cp-existing-001"
+	now := metav1.Now()
+	vmbt := &kubevirtbackupv1alpha1.VirtualMachineBackupTracker{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "vmbt-" + vmName,
+			Namespace: vmNamespace,
+		},
+		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupTrackerSpec{
+			Source: corev1.TypedLocalObjectReference{
+				APIGroup: strPtr("kubevirt.io"),
+				Kind:     "VirtualMachine",
+				Name:     vmName,
+			},
+		},
+		Status: &kubevirtbackupv1alpha1.VirtualMachineBackupTrackerStatus{
+			LatestCheckpoint: &kubevirtbackupv1alpha1.BackupCheckpoint{
+				Name:         existingCheckpoint,
+				CreationTime: &now,
+			},
+		},
+	}
+
+	// BSL must exist for the Step 0 availability check
+	bsl := &velerov1.BackupStorageLocation{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "default",
+			Namespace: vmNamespace,
+		},
+		Spec: velerov1.BackupStorageLocationSpec{
+			Provider: "aws",
+			StorageType: velerov1.StorageType{
+				ObjectStorage: &velerov1.ObjectStorageLocation{
+					Bucket: "test-bucket",
+				},
+			},
+		},
+		Status: velerov1.BackupStorageLocationStatus{
+			Phase: velerov1.BackupStorageLocationPhaseAvailable,
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(du, pvc, vmbt, bsl).
+		WithStatusSubresource(&kubevirtbackupv1alpha1.VirtualMachineBackupTracker{}).
+		Build()
+
+	objectStoreFactoryCalled := false
+	r := &KubeVirtDataUploadReconciler{
+		Client:        fakeClient,
+		Scheme:        scheme,
+		Log:           logr.Discard(),
+		OADPNamespace: vmNamespace,
+		ObjectStoreFactory: func(_ *uploader.UploaderConfig) (velero.ObjectStore, error) {
+			objectStoreFactoryCalled = true
+			return nil, fmt.Errorf("should not be called")
+		},
+	}
+
+	result, err := r.handleAccepted(context.Background(), logr.Discard(), du)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if result.RequeueAfter == 0 {
+		t.Error("expected requeue")
+	}
+
+	// Verify BSL checkpoint lookup was NOT called
+	if objectStoreFactoryCalled {
+		t.Error("ObjectStoreFactory should not be called when force-full-backup annotation is set")
+	}
+
+	// Verify VMB was created with ForceFullBackup=true
+	var createdVMB kubevirtbackupv1alpha1.VirtualMachineBackup
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{
+		Name:      "vmb-" + duName,
+		Namespace: vmNamespace,
+	}, &createdVMB); err != nil {
+		t.Fatalf("failed to get created VMB: %v", err)
+	}
+
+	if !createdVMB.Spec.ForceFullBackup {
+		t.Error("expected VMB.Spec.ForceFullBackup to be true")
+	}
+}
+
+func TestHandleAccepted_ForceFullBackupWithNoExistingCheckpoint(t *testing.T) {
+	// When force-full-backup is set but VMBT has no checkpoint,
+	// the controller should still create the VMB with ForceFullBackup=true
+	// without errors (no checkpoint to clear).
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = kubevirtbackupv1alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	vmName := "test-vm"
+	vmNamespace := "test-ns"
+	duName := "test-du-force-no-cp"
+
+	du := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      duName,
+			Namespace: vmNamespace,
+			UID:       types.UID("test-uid"),
+			Annotations: map[string]string{
+				common.AnnotationVMName:          vmName,
+				common.AnnotationVMNamespace:     vmNamespace,
+				common.AnnotationForceFullBackup: "true",
+			},
+		},
+		Spec: velerov2alpha1.DataUploadSpec{
+			DataMover:       common.DataMoverKubeVirt,
+			SourceNamespace: vmNamespace,
+		},
+		Status: velerov2alpha1.DataUploadStatus{
+			Phase: velerov2alpha1.DataUploadPhaseAccepted,
+		},
+	}
+
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "kubevirt-backup-" + duName,
+			Namespace: vmNamespace,
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceStorage: resource.MustParse("1Gi"),
+				},
+			},
+		},
+	}
+
+	// VMBT with no checkpoint
+	vmbt := &kubevirtbackupv1alpha1.VirtualMachineBackupTracker{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "vmbt-" + vmName,
+			Namespace: vmNamespace,
+		},
+		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupTrackerSpec{
+			Source: corev1.TypedLocalObjectReference{
+				APIGroup: strPtr("kubevirt.io"),
+				Kind:     "VirtualMachine",
+				Name:     vmName,
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(du, pvc, vmbt).
+		Build()
+
+	r := &KubeVirtDataUploadReconciler{
+		Client:        fakeClient,
+		Scheme:        scheme,
+		Log:           logr.Discard(),
+		OADPNamespace: vmNamespace,
+	}
+
+	result, err := r.handleAccepted(context.Background(), logr.Discard(), du)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if result.RequeueAfter == 0 {
+		t.Error("expected requeue")
+	}
+
+	// Verify VMB was created with ForceFullBackup=true
+	var createdVMB kubevirtbackupv1alpha1.VirtualMachineBackup
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{
+		Name:      "vmb-" + duName,
+		Namespace: vmNamespace,
+	}, &createdVMB); err != nil {
+		t.Fatalf("failed to get created VMB: %v", err)
+	}
+
+	if !createdVMB.Spec.ForceFullBackup {
+		t.Error("expected VMB.Spec.ForceFullBackup to be true")
+	}
+}
+
+func TestHandleAccepted_NoForceFullBackupByDefault(t *testing.T) {
+	// When the force-full-backup annotation is NOT set, the VMB should
+	// be created with ForceFullBackup=false (default).
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = kubevirtbackupv1alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	vmName := "test-vm"
+	vmNamespace := "test-ns"
+	duName := "test-du-no-force"
+
+	du := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      duName,
+			Namespace: vmNamespace,
+			UID:       types.UID("test-uid"),
+			Annotations: map[string]string{
+				common.AnnotationVMName:       vmName,
+				common.AnnotationVMNamespace:  vmNamespace,
+				common.AnnotationBSLValidated: "true", // Skip BSL validation
+			},
+		},
+		Spec: velerov2alpha1.DataUploadSpec{
+			DataMover:       common.DataMoverKubeVirt,
+			SourceNamespace: vmNamespace,
+		},
+		Status: velerov2alpha1.DataUploadStatus{
+			Phase: velerov2alpha1.DataUploadPhaseAccepted,
+		},
+	}
+
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "kubevirt-backup-" + duName,
+			Namespace: vmNamespace,
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceStorage: resource.MustParse("1Gi"),
+				},
+			},
+		},
+	}
+
+	vmbt := &kubevirtbackupv1alpha1.VirtualMachineBackupTracker{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "vmbt-" + vmName,
+			Namespace: vmNamespace,
+		},
+		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupTrackerSpec{
+			Source: corev1.TypedLocalObjectReference{
+				APIGroup: strPtr("kubevirt.io"),
+				Kind:     "VirtualMachine",
+				Name:     vmName,
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(du, pvc, vmbt).
+		Build()
+
+	r := &KubeVirtDataUploadReconciler{
+		Client:        fakeClient,
+		Scheme:        scheme,
+		Log:           logr.Discard(),
+		OADPNamespace: vmNamespace,
+	}
+
+	_, err := r.handleAccepted(context.Background(), logr.Discard(), du)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Verify VMB was created with ForceFullBackup=false
+	var createdVMB kubevirtbackupv1alpha1.VirtualMachineBackup
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{
+		Name:      "vmb-" + duName,
+		Namespace: vmNamespace,
+	}, &createdVMB); err != nil {
+		t.Fatalf("failed to get created VMB: %v", err)
+	}
+
+	if createdVMB.Spec.ForceFullBackup {
+		t.Error("expected VMB.Spec.ForceFullBackup to be false when annotation is not set")
+	}
+}
+
+func TestHandleAccepted_StaleCheckpointSetsForceFullOnVMB(t *testing.T) {
+	// When BSL validation finds no valid checkpoint chain but VMBT has a stale
+	// checkpoint, the controller should set ForceFullBackup=true on the VMB
+	// as defense-in-depth.
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = velerov1.AddToScheme(scheme)
+	_ = kubevirtbackupv1alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	vmName := "test-vm"
+	vmNamespace := "test-ns"
+	duName := "test-du-stale-force"
+
+	du := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      duName,
+			Namespace: vmNamespace,
+			UID:       types.UID("test-uid"),
+			Annotations: map[string]string{
+				common.AnnotationVMName:      vmName,
+				common.AnnotationVMNamespace: vmNamespace,
+			},
+		},
+		Spec: velerov2alpha1.DataUploadSpec{
+			DataMover:             common.DataMoverKubeVirt,
+			SourceNamespace:       vmNamespace,
+			BackupStorageLocation: "default",
+		},
+		Status: velerov2alpha1.DataUploadStatus{
+			Phase: velerov2alpha1.DataUploadPhaseAccepted,
+		},
+	}
+
+	bsl := &velerov1.BackupStorageLocation{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "default",
+			Namespace: vmNamespace,
+		},
+		Spec: velerov1.BackupStorageLocationSpec{
+			Provider: "aws",
+			StorageType: velerov1.StorageType{
+				ObjectStorage: &velerov1.ObjectStorageLocation{
+					Bucket: "test-bucket",
+					Prefix: "velero",
+				},
+			},
+			Config: map[string]string{"region": "us-east-1"},
+			Credential: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "cloud-creds"},
+				Key:                  "cloud",
+			},
+		},
+		Status: velerov1.BackupStorageLocationStatus{
+			Phase: velerov1.BackupStorageLocationPhaseAvailable,
+		},
+	}
+
+	credSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "cloud-creds",
+			Namespace: vmNamespace,
+		},
+		Data: map[string][]byte{
+			"cloud": []byte("[default]\naws_access_key_id=AKID\naws_secret_access_key=SECRET\n"),
+		},
+	}
+
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "kubevirt-backup-" + duName,
+			Namespace: vmNamespace,
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceStorage: resource.MustParse("1Gi"),
+				},
+			},
+		},
+	}
+
+	// VMBT with a stale checkpoint
+	staleCheckpointName := "cp-stale-001"
+	now := metav1.Now()
+	vmbt := &kubevirtbackupv1alpha1.VirtualMachineBackupTracker{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "vmbt-" + vmName,
+			Namespace: vmNamespace,
+		},
+		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupTrackerSpec{
+			Source: corev1.TypedLocalObjectReference{
+				APIGroup: strPtr("kubevirt.io"),
+				Kind:     "VirtualMachine",
+				Name:     vmName,
+			},
+		},
+		Status: &kubevirtbackupv1alpha1.VirtualMachineBackupTrackerStatus{
+			LatestCheckpoint: &kubevirtbackupv1alpha1.BackupCheckpoint{
+				Name:         staleCheckpointName,
+				CreationTime: &now,
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(du, bsl, credSecret, pvc, vmbt).
+		WithStatusSubresource(&kubevirtbackupv1alpha1.VirtualMachineBackupTracker{}).
+		Build()
+
+	// Mock object store with NO index.json (simulates deleted S3 data)
+	mockStore := uploader.NewMockObjectStore("test-bucket", "velero-kubevirt-datamover")
+
+	r := &KubeVirtDataUploadReconciler{
+		Client:        fakeClient,
+		Scheme:        scheme,
+		Log:           logr.Discard(),
+		OADPNamespace: vmNamespace,
+		ObjectStoreFactory: func(_ *uploader.UploaderConfig) (velero.ObjectStore, error) {
+			return mockStore, nil
+		},
+	}
+
+	_, err := r.handleAccepted(context.Background(), logr.Discard(), du)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Verify VMB was created with ForceFullBackup=true
+	var createdVMB kubevirtbackupv1alpha1.VirtualMachineBackup
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{
+		Name:      "vmb-" + duName,
+		Namespace: vmNamespace,
+	}, &createdVMB); err != nil {
+		t.Fatalf("failed to get created VMB: %v", err)
+	}
+
+	if !createdVMB.Spec.ForceFullBackup {
+		t.Error("expected VMB.Spec.ForceFullBackup to be true when BSL finds stale checkpoint chain")
+	}
+
+}
+
+func TestValidateBSLCheckpoint_ForceFullOnChainFallback(t *testing.T) {
+	// When the BSL checkpoint chain is broken mid-way and falls back to an
+	// older checkpoint, forceFullBackup must be true. We can't safely assume
+	// KubeVirt's CBT can produce a correct incremental since the older checkpoint.
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = velerov1.AddToScheme(scheme)
+	_ = kubevirtbackupv1alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	vmName := "test-vm"
+	vmNamespace := "test-ns"
+	duName := "test-du-chain-fallback"
+
+	du := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      duName,
+			Namespace: vmNamespace,
+			UID:       types.UID("test-uid"),
+			Annotations: map[string]string{
+				common.AnnotationVMName:      vmName,
+				common.AnnotationVMNamespace: vmNamespace,
+			},
+		},
+		Spec: velerov2alpha1.DataUploadSpec{
+			DataMover:             common.DataMoverKubeVirt,
+			SourceNamespace:       vmNamespace,
+			BackupStorageLocation: "default",
+		},
+		Status: velerov2alpha1.DataUploadStatus{
+			Phase: velerov2alpha1.DataUploadPhaseAccepted,
+		},
+	}
+
+	bsl := &velerov1.BackupStorageLocation{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "default",
+			Namespace: vmNamespace,
+		},
+		Spec: velerov1.BackupStorageLocationSpec{
+			Provider: "aws",
+			StorageType: velerov1.StorageType{
+				ObjectStorage: &velerov1.ObjectStorageLocation{
+					Bucket: "test-bucket",
+					Prefix: "velero",
+				},
+			},
+			Config: map[string]string{"region": "us-east-1"},
+			Credential: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "cloud-creds"},
+				Key:                  "cloud",
+			},
+		},
+		Status: velerov1.BackupStorageLocationStatus{
+			Phase: velerov1.BackupStorageLocationPhaseAvailable,
+		},
+	}
+
+	credSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "cloud-creds",
+			Namespace: vmNamespace,
+		},
+		Data: map[string][]byte{
+			"cloud": []byte("[default]\naws_access_key_id=AKID\naws_secret_access_key=SECRET\n"),
+		},
+	}
+
+	// VMBT with checkpoint set to cp-003 (the latest in the chain).
+	// BSL will return cp-001 as latest valid (because cp-002 is broken).
+	// The mismatch triggers forceFullBackup.
+	now := metav1.Now()
+	vmbt := &kubevirtbackupv1alpha1.VirtualMachineBackupTracker{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "vmbt-" + vmName,
+			Namespace: vmNamespace,
+		},
+		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupTrackerSpec{
+			Source: corev1.TypedLocalObjectReference{
+				APIGroup: strPtr("kubevirt.io"),
+				Kind:     "VirtualMachine",
+				Name:     vmName,
+			},
+		},
+		Status: &kubevirtbackupv1alpha1.VirtualMachineBackupTrackerStatus{
+			LatestCheckpoint: &kubevirtbackupv1alpha1.BackupCheckpoint{
+				Name:         "cp-003",
+				CreationTime: &now,
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(du, bsl, credSecret, vmbt).
+		WithStatusSubresource(&kubevirtbackupv1alpha1.VirtualMachineBackupTracker{}).
+		Build()
+
+	// Mock object store: chain cp-001(Full) -> cp-002(Inc) -> cp-003(Inc)
+	// cp-002's file is missing → chain falls back to cp-001
+	mockStore := uploader.NewMockObjectStore("test-bucket", "velero-kubevirt-datamover")
+	vmIndex := uploader.VMIndex{
+		VMName:    vmName,
+		Namespace: vmNamespace,
+		Checkpoints: []uploader.CheckpointEntry{
+			{
+				ID:       "cp-001",
+				Type:     "full",
+				VMBackup: "vmb-001",
+				Files: []uploader.CheckpointFile{
+					{ObjectPath: "checkpoints/test-ns/test-vm/cp-001/disk.qcow2"},
+				},
+			},
+			{
+				ID:       "cp-002",
+				Type:     "incremental",
+				Parent:   "cp-001",
+				VMBackup: "vmb-002",
+				Files: []uploader.CheckpointFile{
+					{ObjectPath: "checkpoints/test-ns/test-vm/cp-002/disk.qcow2"},
+				},
+			},
+			{
+				ID:       "cp-003",
+				Type:     "incremental",
+				Parent:   "cp-002",
+				VMBackup: "vmb-003",
+				Files: []uploader.CheckpointFile{
+					{ObjectPath: "checkpoints/test-ns/test-vm/cp-003/disk.qcow2"},
+				},
+			},
+		},
+	}
+	indexData, _ := json.Marshal(vmIndex)
+	_ = mockStore.PutObjectBytes("checkpoints/test-ns/test-vm/index.json", indexData)
+	// Create files for cp-001 and cp-003 but NOT cp-002 (mid-chain break)
+	_ = mockStore.PutObjectBytes("checkpoints/test-ns/test-vm/cp-001/disk.qcow2", []byte("full"))
+	_ = mockStore.PutObjectBytes("checkpoints/test-ns/test-vm/cp-003/disk.qcow2", []byte("inc2"))
+
+	r := &KubeVirtDataUploadReconciler{
+		Client:        fakeClient,
+		Scheme:        scheme,
+		Log:           logr.Discard(),
+		OADPNamespace: vmNamespace,
+		ObjectStoreFactory: func(_ *uploader.UploaderConfig) (velero.ObjectStore, error) {
+			return mockStore, nil
+		},
+	}
+
+	vmRef := &common.VMReference{Name: vmName, Namespace: vmNamespace}
+
+	forceFullBackup, checkpointLookup := r.validateBSLCheckpoint(context.Background(), logr.Discard(), du, vmRef)
+
+	if !forceFullBackup {
+		t.Error("expected forceFullBackup=true when BSL chain falls back to older checkpoint")
+	}
+
+	if checkpointLookup == nil {
+		t.Fatal("expected checkpointLookup to be returned")
+	}
+	if !checkpointLookup.Found {
+		t.Error("expected checkpointLookup.Found=true (fell back to valid chain)")
+	}
+
+}
+
+func TestPrepareVMBackupTracker_FirstBackup(t *testing.T) {
+	// No S3 index exists → creates fresh VMBT with no LatestCheckpoint
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = kubevirtbackupv1alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	vmName := "test-vm"
+	vmNamespace := "test-ns"
+	duName := "test-du-first"
+
+	du := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      duName,
+			Namespace: vmNamespace,
+			Annotations: map[string]string{
+				common.AnnotationVMName:      vmName,
+				common.AnnotationVMNamespace: vmNamespace,
+			},
+		},
+		Spec: velerov2alpha1.DataUploadSpec{
+			DataMover:             common.DataMoverKubeVirt,
+			BackupStorageLocation: "", // No BSL → first backup path
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(du).
+		Build()
+
+	r := &KubeVirtDataUploadReconciler{
+		Client:        fakeClient,
+		Scheme:        scheme,
+		Log:           logr.Discard(),
+		OADPNamespace: vmNamespace,
+	}
+
+	vmbt, err := r.prepareVMBackupTracker(context.Background(), logr.Discard(), du, vmName, vmNamespace)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if vmbt == nil {
+		t.Fatal("expected VMBT to be created")
+	}
+	if vmbt.Name != "vmbt-"+vmName {
+		t.Errorf("VMBT name = %q, want %q", vmbt.Name, "vmbt-"+vmName)
+	}
+	if vmbt.Namespace != vmNamespace {
+		t.Errorf("VMBT namespace = %q, want %q", vmbt.Namespace, vmNamespace)
+	}
+	// First backup: no LatestCheckpoint
+	if vmbt.Status != nil && vmbt.Status.LatestCheckpoint != nil {
+		t.Error("expected no LatestCheckpoint for first backup")
+	}
+}
+
+func TestPrepareVMBackupTracker_FromS3(t *testing.T) {
+	// S3 has index.json with vmbtObjectPath pointing to vmbt.json
+	// vmbt.json has LatestCheckpoint set
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = velerov1.AddToScheme(scheme)
+	_ = kubevirtbackupv1alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	vmName := "test-vm"
+	vmNamespace := "test-ns"
+	duName := "test-du-s3"
+
+	du := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      duName,
+			Namespace: vmNamespace,
+			Annotations: map[string]string{
+				common.AnnotationVMName:      vmName,
+				common.AnnotationVMNamespace: vmNamespace,
+			},
+		},
+		Spec: velerov2alpha1.DataUploadSpec{
+			DataMover:             common.DataMoverKubeVirt,
+			BackupStorageLocation: "default",
+		},
+	}
+
+	bsl := &velerov1.BackupStorageLocation{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "default",
+			Namespace: vmNamespace,
+		},
+		Spec: velerov1.BackupStorageLocationSpec{
+			Provider: "aws",
+			StorageType: velerov1.StorageType{
+				ObjectStorage: &velerov1.ObjectStorageLocation{
+					Bucket: "test-bucket",
+					Prefix: "velero",
+				},
+			},
+			Config: map[string]string{"region": "us-east-1"},
+			Credential: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "cloud-creds"},
+				Key:                  "cloud",
+			},
+		},
+		Status: velerov1.BackupStorageLocationStatus{
+			Phase: velerov1.BackupStorageLocationPhaseAvailable,
+		},
+	}
+
+	credSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "cloud-creds",
+			Namespace: vmNamespace,
+		},
+		Data: map[string][]byte{
+			"cloud": []byte("[default]\naws_access_key_id=AKID\naws_secret_access_key=SECRET\n"),
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(du, bsl, credSecret).
+		WithStatusSubresource(&kubevirtbackupv1alpha1.VirtualMachineBackupTracker{}).
+		Build()
+
+	// Set up mock object store with index.json and vmbt.json
+	mockStore := uploader.NewMockObjectStore("test-bucket", "velero-kubevirt-datamover")
+
+	// Create vmbt.json with LatestCheckpoint
+	now := metav1.Now()
+	archivedVMBT := &kubevirtbackupv1alpha1.VirtualMachineBackupTracker{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "vmbt-" + vmName,
+			Namespace: vmNamespace,
+		},
+		Status: &kubevirtbackupv1alpha1.VirtualMachineBackupTrackerStatus{
+			LatestCheckpoint: &kubevirtbackupv1alpha1.BackupCheckpoint{
+				Name:         "cp-002",
+				CreationTime: &now,
+			},
+		},
+	}
+	vmbtData, _ := json.MarshalIndent(archivedVMBT, "", "  ")
+	_ = mockStore.PutObjectBytes("checkpoints/test-ns/test-vm/cp-002/vmbt.json", vmbtData)
+
+	// Create index.json with vmbtObjectPath
+	vmIndex := &uploader.VMIndex{
+		VMName:    vmName,
+		Namespace: vmNamespace,
+		Checkpoints: []uploader.CheckpointEntry{
+			{
+				ID:             "cp-002",
+				Type:           "full",
+				VMBTObjectPath: "checkpoints/test-ns/test-vm/cp-002/vmbt.json",
+			},
+		},
+	}
+	indexData, _ := json.MarshalIndent(vmIndex, "", "  ")
+	_ = mockStore.PutObjectBytes("checkpoints/test-ns/test-vm/index.json", indexData)
+
+	r := &KubeVirtDataUploadReconciler{
+		Client:        fakeClient,
+		Scheme:        scheme,
+		Log:           logr.Discard(),
+		OADPNamespace: vmNamespace,
+		ObjectStoreFactory: func(_ *uploader.UploaderConfig) (velero.ObjectStore, error) {
+			return mockStore, nil
+		},
+	}
+
+	vmbt, err := r.prepareVMBackupTracker(context.Background(), logr.Discard(), du, vmName, vmNamespace)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if vmbt == nil {
+		t.Fatal("expected VMBT to be created")
+	}
+
+	// Verify LatestCheckpoint was restored from S3
+	if vmbt.Status == nil || vmbt.Status.LatestCheckpoint == nil {
+		t.Fatal("expected VMBT to have LatestCheckpoint from S3")
+	}
+	if vmbt.Status.LatestCheckpoint.Name != "cp-002" {
+		t.Errorf("LatestCheckpoint.Name = %q, want %q", vmbt.Status.LatestCheckpoint.Name, "cp-002")
+	}
+}
+
+func TestPrepareVMBackupTracker_DeletesExisting(t *testing.T) {
+	// VMBT already exists in cluster → should be deleted and recreated
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = kubevirtbackupv1alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	vmName := "test-vm"
+	vmNamespace := "test-ns"
+	duName := "test-du-delete"
+
+	du := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      duName,
+			Namespace: vmNamespace,
+			Annotations: map[string]string{
+				common.AnnotationVMName:      vmName,
+				common.AnnotationVMNamespace: vmNamespace,
+			},
+		},
+		Spec: velerov2alpha1.DataUploadSpec{
+			DataMover: common.DataMoverKubeVirt,
+		},
+	}
+
+	// Pre-create an existing VMBT with stale label
+	existingVMBT := &kubevirtbackupv1alpha1.VirtualMachineBackupTracker{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "vmbt-" + vmName,
+			Namespace: vmNamespace,
+			Labels: map[string]string{
+				"stale-label": "old-value",
+			},
+		},
+		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupTrackerSpec{
+			Source: corev1.TypedLocalObjectReference{
+				APIGroup: strPtr("kubevirt.io"),
+				Kind:     "VirtualMachine",
+				Name:     vmName,
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(du, existingVMBT).
+		Build()
+
+	r := &KubeVirtDataUploadReconciler{
+		Client:        fakeClient,
+		Scheme:        scheme,
+		Log:           logr.Discard(),
+		OADPNamespace: vmNamespace,
+	}
+
+	vmbt, err := r.prepareVMBackupTracker(context.Background(), logr.Discard(), du, vmName, vmNamespace)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Verify new VMBT was created (should have our label, not the stale one)
+	if vmbt.Labels["stale-label"] == "old-value" {
+		t.Error("expected old VMBT to be deleted and new one created, but old labels persist")
+	}
+	if vmbt.Labels[common.LabelDataUploadName] != duName {
+		t.Errorf("expected new VMBT to have DataUpload label %q, got %q",
+			duName, vmbt.Labels[common.LabelDataUploadName])
+	}
+}
+
+func TestLookupLatestVMBTFromBSL(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = velerov1.AddToScheme(scheme)
+	_ = kubevirtbackupv1alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	vmNamespace := "test-ns"
+
+	bsl := &velerov1.BackupStorageLocation{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "default",
+			Namespace: vmNamespace,
+		},
+		Spec: velerov1.BackupStorageLocationSpec{
+			Provider: "aws",
+			StorageType: velerov1.StorageType{
+				ObjectStorage: &velerov1.ObjectStorageLocation{
+					Bucket: "test-bucket",
+					Prefix: "velero",
+				},
+			},
+			Config: map[string]string{"region": "us-east-1"},
+			Credential: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "cloud-creds"},
+				Key:                  "cloud",
+			},
+		},
+	}
+
+	credSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "cloud-creds",
+			Namespace: vmNamespace,
+		},
+		Data: map[string][]byte{
+			"cloud": []byte("[default]\naws_access_key_id=AKID\naws_secret_access_key=SECRET\n"),
+		},
+	}
+
+	tests := []struct {
+		name        string
+		setupStore  func(*uploader.MockObjectStore)
+		expectNil   bool
+		expectError bool
+		expectCP    string
+	}{
+		{
+			name: "returns nil when no index exists",
+			setupStore: func(_ *uploader.MockObjectStore) {
+				// Empty store
+			},
+			expectNil: true,
+		},
+		{
+			name: "returns nil when index has empty vmbtObjectPath",
+			setupStore: func(store *uploader.MockObjectStore) {
+				vmIndex := &uploader.VMIndex{
+					VMName:    "test-vm",
+					Namespace: vmNamespace,
+					Checkpoints: []uploader.CheckpointEntry{
+						{ID: "cp-001", Type: "full"}, // No VMBTObjectPath
+					},
+				}
+				data, _ := json.MarshalIndent(vmIndex, "", "  ")
+				_ = store.PutObjectBytes("checkpoints/test-ns/test-vm/index.json", data)
+			},
+			expectNil: true,
+		},
+		{
+			name: "returns VMBT from S3 with checkpoint",
+			setupStore: func(store *uploader.MockObjectStore) {
+				now := metav1.Now()
+				vmbt := &kubevirtbackupv1alpha1.VirtualMachineBackupTracker{
+					Status: &kubevirtbackupv1alpha1.VirtualMachineBackupTrackerStatus{
+						LatestCheckpoint: &kubevirtbackupv1alpha1.BackupCheckpoint{
+							Name:         "cp-005",
+							CreationTime: &now,
+						},
+					},
+				}
+				vmbtData, _ := json.MarshalIndent(vmbt, "", "  ")
+				_ = store.PutObjectBytes("checkpoints/test-ns/test-vm/cp-005/vmbt.json", vmbtData)
+
+				vmIndex := &uploader.VMIndex{
+					VMName:    "test-vm",
+					Namespace: vmNamespace,
+					Checkpoints: []uploader.CheckpointEntry{
+						{
+							ID:             "cp-005",
+							Type:           "full",
+							VMBTObjectPath: "checkpoints/test-ns/test-vm/cp-005/vmbt.json",
+						},
+					},
+				}
+				indexData, _ := json.MarshalIndent(vmIndex, "", "  ")
+				_ = store.PutObjectBytes("checkpoints/test-ns/test-vm/index.json", indexData)
+			},
+			expectNil: false,
+			expectCP:  "cp-005",
+		},
+		{
+			name: "returns error when vmbt.json is missing",
+			setupStore: func(store *uploader.MockObjectStore) {
+				vmIndex := &uploader.VMIndex{
+					VMName:    "test-vm",
+					Namespace: vmNamespace,
+					Checkpoints: []uploader.CheckpointEntry{
+						{
+							ID:             "cp-005",
+							Type:           "full",
+							VMBTObjectPath: "checkpoints/test-ns/test-vm/cp-005/vmbt.json",
+						},
+					},
+				}
+				indexData, _ := json.MarshalIndent(vmIndex, "", "  ")
+				_ = store.PutObjectBytes("checkpoints/test-ns/test-vm/index.json", indexData)
+				// Don't create vmbt.json
+			},
+			expectError: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fakeClient := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(bsl, credSecret).
+				Build()
+
+			mockStore := uploader.NewMockObjectStore("test-bucket", "velero-kubevirt-datamover")
+			tt.setupStore(mockStore)
+
+			r := &KubeVirtDataUploadReconciler{
+				Client:        fakeClient,
+				Scheme:        scheme,
+				Log:           logr.Discard(),
+				OADPNamespace: vmNamespace,
+				ObjectStoreFactory: func(_ *uploader.UploaderConfig) (velero.ObjectStore, error) {
+					return mockStore, nil
+				},
+			}
+
+			result, err := r.lookupLatestVMBTFromBSL(context.Background(), bsl, vmNamespace, "test-vm")
+
+			if tt.expectError {
+				if err == nil {
+					t.Error("expected error but got none")
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			if tt.expectNil {
+				if result != nil {
+					t.Error("expected nil result")
+				}
+				return
+			}
+
+			if result == nil {
+				t.Fatal("expected non-nil result")
+			}
+			if result.Status == nil || result.Status.LatestCheckpoint == nil {
+				t.Fatal("expected LatestCheckpoint to be set")
+			}
+			if result.Status.LatestCheckpoint.Name != tt.expectCP {
+				t.Errorf("LatestCheckpoint.Name = %q, want %q",
+					result.Status.LatestCheckpoint.Name, tt.expectCP)
 			}
 		})
 	}

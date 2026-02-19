@@ -62,9 +62,16 @@ rules:
   - backup.kubevirt.io
   resources:
   - virtualmachinebackups/status
+  verbs:
+  - get
+- apiGroups:
+  - backup.kubevirt.io
+  resources:
   - virtualmachinebackuptrackers/status
   verbs:
   - get
+  - patch
+  - update
 - apiGroups:
   - kubevirt.io
   resources:

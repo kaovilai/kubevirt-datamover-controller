@@ -19,13 +19,18 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
+	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
 	"github.com/migtools/kubevirt-datamover-controller/pkg/common"
+	"github.com/migtools/kubevirt-datamover-controller/pkg/uploader"
 	velerov1 "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
 	velerov2alpha1 "github.com/vmware-tanzu/velero/pkg/apis/velero/v2alpha1"
+	velero "github.com/vmware-tanzu/velero/pkg/plugin/velero"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -54,6 +59,12 @@ const (
 
 	// RequeueAfterLong is the longer requeue duration
 	RequeueAfterLong = 30 * time.Second
+
+	// bslValidatedValue is the annotation value indicating BSL validation is complete
+	bslValidatedValue = "true"
+
+	// defaultCredentialKey is the default key in BSL credential secrets
+	defaultCredentialKey = "cloud"
 )
 
 // KubeVirtDataUploadReconciler reconciles DataUpload objects where Spec.DataMover is "kubevirt"
@@ -73,6 +84,10 @@ type KubeVirtDataUploadReconciler struct {
 
 	// DatamoverImagePullPolicy is the pull policy for the datamover image
 	DatamoverImagePullPolicy corev1.PullPolicy
+
+	// ObjectStoreFactory creates an ObjectStore from an UploaderConfig.
+	// Defaults to uploader.InitObjectStore if nil. Override in tests to inject mocks.
+	ObjectStoreFactory func(cfg *uploader.UploaderConfig) (velero.ObjectStore, error)
 }
 
 // +kubebuilder:rbac:groups=velero.io,resources=datauploads,verbs=get;list;watch;update;patch
@@ -81,7 +96,7 @@ type KubeVirtDataUploadReconciler struct {
 // +kubebuilder:rbac:groups=backup.kubevirt.io,resources=virtualmachinebackups,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=backup.kubevirt.io,resources=virtualmachinebackups/status,verbs=get
 // +kubebuilder:rbac:groups=backup.kubevirt.io,resources=virtualmachinebackuptrackers,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=backup.kubevirt.io,resources=virtualmachinebackuptrackers/status,verbs=get
+// +kubebuilder:rbac:groups=backup.kubevirt.io,resources=virtualmachinebackuptrackers/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=persistentvolumes,verbs=get;list;watch;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;delete
@@ -206,6 +221,31 @@ func (r *KubeVirtDataUploadReconciler) handleAccepted(ctx context.Context, logge
 		return ctrl.Result{}, nil
 	}
 
+	// Step 0: Verify BSL exists and is Available before creating any resources.
+	// BSL must be in Available phase — if it's not, fail immediately rather than
+	// creating resources (PVC, VMBT, VMB) that will be wasted.
+	if du.Spec.BackupStorageLocation != "" {
+		bslObj, err := r.getBackupStorageLocation(ctx, du)
+		if err != nil {
+			logger.Error(err, "BackupStorageLocation not accessible")
+			if updateErr := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed,
+				fmt.Sprintf("BackupStorageLocation not accessible: %v", err)); updateErr != nil {
+				return ctrl.Result{}, updateErr
+			}
+			return ctrl.Result{}, nil
+		}
+		if bslObj.Status.Phase != velerov1.BackupStorageLocationPhaseAvailable {
+			logger.Error(nil, "BackupStorageLocation is not in Available phase",
+				"bsl", bslObj.Name, "phase", bslObj.Status.Phase)
+			if updateErr := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed,
+				fmt.Sprintf("BackupStorageLocation %q is not available (phase: %s)",
+					bslObj.Name, bslObj.Status.Phase)); updateErr != nil {
+				return ctrl.Result{}, updateErr
+			}
+			return ctrl.Result{}, nil
+		}
+	}
+
 	// Step 1: Create or get temporary PVC for backup output
 	pvc, err := r.ensureTempPVC(ctx, logger, du, vmRef.Namespace)
 	if err != nil {
@@ -214,28 +254,78 @@ func (r *KubeVirtDataUploadReconciler) handleAccepted(ctx context.Context, logge
 	}
 	logger.Info("Temporary PVC ready", "pvc", pvc.Name)
 
-	// Step 2: Create or get VirtualMachineBackupTracker
-	vmbt, err := r.ensureVMBackupTracker(ctx, logger, du, vmRef.Name, vmRef.Namespace)
-	if err != nil {
-		logger.Error(err, "Failed to ensure VirtualMachineBackupTracker")
-		return ctrl.Result{}, err
-	}
-	logger.Info("VirtualMachineBackupTracker ready", "vmbt", vmbt.Name)
-
-	// Step 3: Create VirtualMachineBackup if it doesn't exist
-	vmb, created, err := r.ensureVMBackup(ctx, logger, du, vmbt, pvc.Name, vmRef.Namespace)
-	if err != nil {
-		logger.Error(err, "Failed to ensure VirtualMachineBackup")
-		return ctrl.Result{}, err
+	// Check if VMB already exists. If it does, the VMBT is already in the right
+	// state (set before VMB creation) and we can skip straight to monitoring.
+	// This avoids deleting/recreating the VMBT while an active VMB references it.
+	vmbName := fmt.Sprintf("%s%s", common.VMBackupNamePrefix, du.Name)
+	existingVMB := &kubevirtbackupv1alpha1.VirtualMachineBackup{}
+	vmbExists := false
+	if err := r.Get(ctx, types.NamespacedName{Name: vmbName, Namespace: vmRef.Namespace}, existingVMB); err == nil {
+		vmbExists = true
+	} else if !errors.IsNotFound(err) {
+		return ctrl.Result{}, fmt.Errorf("failed to check for existing VMB: %w", err)
 	}
 
-	if created {
-		logger.Info("Created VirtualMachineBackup", "vmb", vmb.Name)
-		// Requeue to check status
-		return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
+	var vmb *kubevirtbackupv1alpha1.VirtualMachineBackup
+	if vmbExists {
+		// VMB already exists — skip VMBT preparation and backup mode resolution.
+		// The VMBT was set up before this VMB was created and should not be disturbed.
+		vmb = existingVMB
+		logger.V(1).Info("VirtualMachineBackup already exists, skipping VMBT preparation", "vmb", vmb.Name)
+	} else {
+		// Step 2: Prepare VirtualMachineBackupTracker (recreate from S3 state)
+		vmbt, err := r.prepareVMBackupTracker(ctx, logger, du, vmRef.Name, vmRef.Namespace)
+		if err != nil {
+			logger.Error(err, "Failed to prepare VirtualMachineBackupTracker")
+			return ctrl.Result{}, err
+		}
+		logger.Info("VirtualMachineBackupTracker ready", "vmbt", vmbt.Name)
+
+		// Step 3: Determine backup mode (full vs incremental).
+		forceFullBackup, checkpointLookup := r.resolveBackupMode(ctx, logger, du, vmRef)
+
+		// Step 3b: Cross-check VMBT checkpoint against BSL chain validation result.
+		// The VMBT's LatestCheckpoint (restored from archived vmbt.json) must agree
+		// with the BSL chain validation (which independently walks the S3 index).
+		// If they diverge, the archived VMBT is stale — force a full backup.
+		if !forceFullBackup && checkpointLookup != nil && checkpointLookup.Found {
+			vmbtCheckpoint := ""
+			if vmbt.Status != nil && vmbt.Status.LatestCheckpoint != nil {
+				vmbtCheckpoint = vmbt.Status.LatestCheckpoint.Name
+			}
+			if vmbtCheckpoint != checkpointLookup.LatestCheckpoint {
+				logger.Info("VMBT checkpoint does not match BSL chain validation result, forcing full backup",
+					"vmbtCheckpoint", vmbtCheckpoint,
+					"bslLatestCheckpoint", checkpointLookup.LatestCheckpoint)
+				forceFullBackup = true
+			}
+		}
+
+		// Step 4: Create VirtualMachineBackup
+		var created bool
+		vmb, created, err = r.ensureVMBackup(ctx, logger, du, vmbt, pvc.Name, vmRef.Namespace, forceFullBackup)
+		if err != nil {
+			// Check if the error is due to another VMB being in progress for the same VM.
+			// KubeVirt's admission webhook only allows one active (non-terminal) VMB per VM.
+			// Requeue with a longer delay instead of returning an error (which causes
+			// exponential backoff retry storm).
+			if strings.Contains(err.Error(), "in progress for source") {
+				logger.Info("Another VirtualMachineBackup is in progress for this VM, will retry",
+					"reason", err.Error())
+				return ctrl.Result{RequeueAfter: RequeueAfterLong}, nil
+			}
+			logger.Error(err, "Failed to ensure VirtualMachineBackup")
+			return ctrl.Result{}, err
+		}
+
+		if created {
+			logger.Info("Created VirtualMachineBackup", "vmb", vmb.Name)
+			// Requeue to check status
+			return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
+		}
 	}
 
-	// Step 4: Check VMB status
+	// Step 5: Check VMB status
 	if vmb.Status == nil {
 		logger.Info("VirtualMachineBackup status not yet available, requeuing")
 		return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
@@ -270,6 +360,105 @@ func (r *KubeVirtDataUploadReconciler) handleAccepted(ctx context.Context, logge
 	// No Done condition yet - still in progress
 	logger.Info("VirtualMachineBackup in progress, requeuing")
 	return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
+}
+
+// resolveBackupMode determines whether to force a full backup or allow incremental.
+// Returns (forceFullBackup, checkpointLookup) where checkpointLookup is the BSL
+// chain validation result (nil if BSL was unreachable or validation was skipped).
+// This covers two scenarios:
+//  1. User explicitly requested force-full-backup via annotation on DataUpload.
+//  2. BSL checkpoint validation found a broken chain, requiring a forced full backup.
+func (r *KubeVirtDataUploadReconciler) resolveBackupMode(ctx context.Context, logger logr.Logger, du *velerov2alpha1.DataUpload, vmRef *common.VMReference) (bool, *uploader.CheckpointLookupResult) {
+	// Check if force full backup is requested via annotation.
+	if du.Annotations[common.AnnotationForceFullBackup] == bslValidatedValue {
+		logger.Info("Force full backup requested via annotation, skipping BSL checkpoint lookup")
+		return true, nil
+	}
+
+	// Validate checkpoint chain in BSL for incremental backup support.
+	// This runs once per DataUpload (tracked via annotation) to avoid redundant
+	// S3 queries on every reconcile, while still validating the BSL state for
+	// each new backup.
+	if du.Annotations[common.AnnotationBSLValidated] == bslValidatedValue {
+		logger.V(1).Info("BSL validation already completed for this DataUpload")
+		return false, nil
+	}
+
+	return r.validateBSLCheckpoint(ctx, logger, du, vmRef)
+}
+
+// validateBSLCheckpoint queries the BSL for a valid checkpoint chain and determines
+// whether a forced full backup is required because the chain is broken.
+// Returns (forceFullBackup, checkpointLookup) where checkpointLookup is the BSL
+// chain validation result (nil if BSL was unreachable or lookup failed).
+// It does NOT modify VMBT status — ForceFullBackup on the VMB is the sole mechanism
+// for forcing full backups.
+func (r *KubeVirtDataUploadReconciler) validateBSLCheckpoint(ctx context.Context, logger logr.Logger, du *velerov2alpha1.DataUpload, vmRef *common.VMReference) (bool, *uploader.CheckpointLookupResult) {
+	forceFullBackup := false
+
+	var checkpointLookup *uploader.CheckpointLookupResult
+	bsl, bslErr := r.getBackupStorageLocation(ctx, du)
+	if bslErr != nil {
+		// BSL lookup failure is non-fatal. Validation will be retried on the
+		// next reconcile.
+		logger.Info("BSL not available for checkpoint lookup, skipping validation",
+			"reason", bslErr.Error())
+	} else {
+		var err error
+		checkpointLookup, err = r.lookupCheckpointFromBSL(ctx, bsl, vmRef.Namespace, vmRef.Name)
+		if err != nil {
+			// Checkpoint lookup failure is non-fatal. Validation will be retried
+			// on the next reconcile.
+			logger.Info("Checkpoint lookup failed, skipping validation",
+				"reason", err.Error())
+		} else if checkpointLookup != nil {
+			logger.Info("Checkpoint lookup completed",
+				"found", checkpointLookup.Found,
+				"message", checkpointLookup.Message)
+		}
+	}
+
+	// Determine whether to force full backup based on BSL validation result.
+	// Only act on definitive results (checkpointLookup != nil). If BSL was
+	// unreachable or lookup errored, checkpointLookup is nil and we skip
+	// (don't force full backup due to transient failures).
+	if checkpointLookup != nil && !checkpointLookup.IsChainValid {
+		// Chain is broken — force full backup via VMB.Spec.ForceFullBackup
+		logger.Info("BSL checkpoint chain is invalid, forcing full backup",
+			"message", checkpointLookup.Message)
+		forceFullBackup = true
+	} else if checkpointLookup != nil && checkpointLookup.Found && checkpointLookup.IsChainValid {
+		// Valid chain exists — allow incremental backup
+		logger.Info("BSL checkpoint chain is valid, allowing incremental backup",
+			"checkpoint", checkpointLookup.LatestCheckpoint,
+			"chainLength", checkpointLookup.ChainLength)
+	} else if checkpointLookup != nil && !checkpointLookup.Found {
+		// No checkpoint found — first backup or all data deleted.
+		// ForceFullBackup not strictly needed (KubeVirt will do full anyway
+		// without a checkpoint), but set it for clarity.
+		logger.Info("No valid checkpoint found in BSL, will perform full backup",
+			"message", checkpointLookup.Message)
+		forceFullBackup = true
+	}
+
+	// Mark BSL validation as done for this DataUpload to avoid redundant S3 queries.
+	// Only set the annotation when we got a definitive result from BSL (checkpointLookup != nil).
+	// If BSL was unreachable or the lookup failed due to transient errors (e.g., read-only
+	// filesystem, network errors), don't set the annotation so validation will be retried
+	// on the next reconcile.
+	if checkpointLookup != nil {
+		if du.Annotations == nil {
+			du.Annotations = make(map[string]string)
+		}
+		du.Annotations[common.AnnotationBSLValidated] = bslValidatedValue
+		if err := r.Update(ctx, du); err != nil {
+			// Non-fatal: worst case we re-run BSL validation on next reconcile
+			logger.Info("Failed to set BSL validated annotation, will retry",
+				"reason", err.Error())
+		}
+	}
+
+	return forceFullBackup, checkpointLookup
 }
 
 // handlePrepared processes DataUploads in Prepared phase
@@ -499,7 +688,30 @@ func (r *KubeVirtDataUploadReconciler) cleanupDatamoverResources(ctx context.Con
 		// Continue - don't block completion on cleanup failures
 	}
 
-	// TODO Phase 5: Also cleanup VMB in VM namespace if needed
+}
+
+// cleanupVMBackupResources deletes VMB and VMBT CRs in the VM namespace.
+// Used during cancellation when the datamover pod won't run its own cleanup.
+func (r *KubeVirtDataUploadReconciler) cleanupVMBackupResources(ctx context.Context, logger logr.Logger, du *velerov2alpha1.DataUpload, vmName, vmNamespace string) {
+	vmbName := fmt.Sprintf("vmb-%s", du.Name)
+	vmb := &kubevirtbackupv1alpha1.VirtualMachineBackup{}
+	if err := r.Get(ctx, types.NamespacedName{Name: vmbName, Namespace: vmNamespace}, vmb); err == nil {
+		if err := r.Delete(ctx, vmb); err != nil && !errors.IsNotFound(err) {
+			logger.Error(err, "Failed to delete VMB", "vmb", vmbName)
+		} else {
+			logger.Info("Deleted VMB", "vmb", vmbName, "namespace", vmNamespace)
+		}
+	}
+
+	vmbtName := fmt.Sprintf("vmbt-%s", vmName)
+	vmbt := &kubevirtbackupv1alpha1.VirtualMachineBackupTracker{}
+	if err := r.Get(ctx, types.NamespacedName{Name: vmbtName, Namespace: vmNamespace}, vmbt); err == nil {
+		if err := r.Delete(ctx, vmbt); err != nil && !errors.IsNotFound(err) {
+			logger.Error(err, "Failed to delete VMBT", "vmbt", vmbtName)
+		} else {
+			logger.Info("Deleted VMBT", "vmbt", vmbtName, "namespace", vmNamespace)
+		}
+	}
 }
 
 // handleCanceling processes DataUploads in Canceling phase
@@ -513,9 +725,12 @@ func (r *KubeVirtDataUploadReconciler) handleCanceling(ctx context.Context, logg
 	// Clean up datamover resources in OADP namespace
 	r.cleanupDatamoverResources(ctx, logger, du, podNamespace)
 
-	// TODO Phase 5: Cancel in-progress operations
-	// - Delete VMB if exists in VM namespace
-	// - Delete VMBT if exists in VM namespace
+	// Clean up VMB and VMBT in the VM namespace.
+	// When canceling, the datamover pod won't run its cleanup, so we handle it here.
+	vmRef, _ := common.GetVMReference(du)
+	if vmRef != nil {
+		r.cleanupVMBackupResources(ctx, logger, du, vmRef.Name, vmRef.Namespace)
+	}
 
 	if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseCanceled, "DataUpload canceled"); err != nil {
 		return ctrl.Result{}, err
@@ -643,20 +858,45 @@ func (r *KubeVirtDataUploadReconciler) ensureTempPVC(ctx context.Context, logger
 	return pvc, nil
 }
 
-// ensureVMBackupTracker creates or retrieves the VirtualMachineBackupTracker for the VM
-func (r *KubeVirtDataUploadReconciler) ensureVMBackupTracker(ctx context.Context, logger logr.Logger, du *velerov2alpha1.DataUpload, vmName, vmNamespace string) (*kubevirtbackupv1alpha1.VirtualMachineBackupTracker, error) {
-	// Use a consistent name based on VM name for tracking across backups
+// prepareVMBackupTracker creates a VirtualMachineBackupTracker for the VM,
+// restoring the LatestCheckpoint from the archived VMBT in S3 if available.
+// Any existing VMBT is deleted first to avoid conflicts (S3 is the source of truth).
+func (r *KubeVirtDataUploadReconciler) prepareVMBackupTracker(ctx context.Context, logger logr.Logger, du *velerov2alpha1.DataUpload, vmName, vmNamespace string) (*kubevirtbackupv1alpha1.VirtualMachineBackupTracker, error) {
 	vmbtName := fmt.Sprintf("vmbt-%s", vmName)
 
-	// Check if VMBT already exists
+	// Try to fetch the archived VMBT from S3 to restore LatestCheckpoint.
+	// This is non-fatal: if BSL is unreachable or no VMBT exists yet (first backup),
+	// we create a fresh VMBT without a checkpoint.
+	var archivedVMBT *kubevirtbackupv1alpha1.VirtualMachineBackupTracker
+	bsl, bslErr := r.getBackupStorageLocation(ctx, du)
+	if bslErr != nil {
+		logger.Info("BSL not available for VMBT lookup, creating fresh VMBT",
+			"reason", bslErr.Error())
+	} else {
+		var err error
+		archivedVMBT, err = r.lookupLatestVMBTFromBSL(ctx, bsl, vmNamespace, vmName)
+		if err != nil {
+			logger.Info("Failed to lookup VMBT from BSL, creating fresh VMBT",
+				"reason", err.Error())
+		} else if archivedVMBT != nil {
+			cpName := ""
+			if archivedVMBT.Status != nil && archivedVMBT.Status.LatestCheckpoint != nil {
+				cpName = archivedVMBT.Status.LatestCheckpoint.Name
+			}
+			logger.Info("Found archived VMBT in BSL",
+				"latestCheckpoint", cpName)
+		}
+	}
+
+	// Delete existing VMBT unconditionally (we're recreating from S3 state)
 	existingVMBT := &kubevirtbackupv1alpha1.VirtualMachineBackupTracker{}
 	err := r.Get(ctx, types.NamespacedName{Name: vmbtName, Namespace: vmNamespace}, existingVMBT)
 	if err == nil {
-		logger.V(1).Info("VirtualMachineBackupTracker already exists", "vmbt", vmbtName)
-		return existingVMBT, nil
-	}
-
-	if !errors.IsNotFound(err) {
+		logger.Info("Deleting existing VMBT before recreation", "vmbt", vmbtName)
+		if err := r.Delete(ctx, existingVMBT); err != nil && !errors.IsNotFound(err) {
+			return nil, fmt.Errorf("failed to delete existing VMBT %s: %w", vmbtName, err)
+		}
+	} else if !errors.IsNotFound(err) {
 		return nil, fmt.Errorf("failed to check for existing VMBT: %w", err)
 	}
 
@@ -684,15 +924,95 @@ func (r *KubeVirtDataUploadReconciler) ensureVMBackupTracker(ctx context.Context
 	}
 
 	logger.Info("Created VirtualMachineBackupTracker", "vmbt", vmbtName, "namespace", vmNamespace)
+
+	// If we have an archived VMBT with LatestCheckpoint, set it on the new VMBT's status.
+	// K8s ignores Status during creation, so we must use Status().Update() separately.
+	if archivedVMBT != nil && archivedVMBT.Status != nil && archivedVMBT.Status.LatestCheckpoint != nil {
+		vmbt.Status = &kubevirtbackupv1alpha1.VirtualMachineBackupTrackerStatus{
+			LatestCheckpoint: archivedVMBT.Status.LatestCheckpoint.DeepCopy(),
+		}
+		if err := r.Status().Update(ctx, vmbt); err != nil {
+			return nil, fmt.Errorf("failed to update VMBT status with LatestCheckpoint: %w", err)
+		}
+		logger.Info("Set VMBT LatestCheckpoint from S3 archive",
+			"vmbt", vmbtName,
+			"latestCheckpoint", archivedVMBT.Status.LatestCheckpoint.Name)
+	}
+
 	return vmbt, nil
+}
+
+// lookupLatestVMBTFromBSL reads the VM's checkpoint index from the BSL, finds the
+// latest checkpoint's vmbtObjectPath, fetches the archived vmbt.json, and returns
+// the deserialized VMBT. Returns nil if no VMBT is archived (first backup or old-format index).
+func (r *KubeVirtDataUploadReconciler) lookupLatestVMBTFromBSL(ctx context.Context, bsl *velerov1.BackupStorageLocation, vmNamespace, vmName string) (*kubevirtbackupv1alpha1.VirtualMachineBackupTracker, error) {
+	store, cfg, err := r.initObjectStoreFromBSL(ctx, bsl)
+	if err != nil {
+		return nil, err
+	}
+
+	// Read the VM checkpoint index
+	indexPath := fmt.Sprintf("checkpoints/%s/%s/index.json", vmNamespace, vmName)
+	exists, err := store.ObjectExists(cfg.Bucket, indexPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to check VM index existence: %w", err)
+	}
+	if !exists {
+		return nil, nil // No index = first backup
+	}
+
+	reader, err := store.GetObject(cfg.Bucket, indexPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read VM index: %w", err)
+	}
+	indexData, err := io.ReadAll(reader)
+	_ = reader.Close()
+	if err != nil {
+		return nil, fmt.Errorf("failed to read VM index data: %w", err)
+	}
+
+	var vmIndex uploader.VMIndex
+	if err := json.Unmarshal(indexData, &vmIndex); err != nil {
+		return nil, fmt.Errorf("failed to parse VM index: %w", err)
+	}
+
+	if len(vmIndex.Checkpoints) == 0 {
+		return nil, nil // Empty index
+	}
+
+	// Get the latest checkpoint's VMBTObjectPath
+	latestCP := vmIndex.Checkpoints[len(vmIndex.Checkpoints)-1]
+	if latestCP.VMBTObjectPath == "" {
+		return nil, nil // Old-format index without vmbtObjectPath
+	}
+
+	// Fetch the archived vmbt.json
+	vmbtReader, err := store.GetObject(cfg.Bucket, latestCP.VMBTObjectPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read archived vmbt.json at %s: %w", latestCP.VMBTObjectPath, err)
+	}
+	vmbtData, err := io.ReadAll(vmbtReader)
+	_ = vmbtReader.Close()
+	if err != nil {
+		return nil, fmt.Errorf("failed to read vmbt.json data: %w", err)
+	}
+
+	var vmbt kubevirtbackupv1alpha1.VirtualMachineBackupTracker
+	if err := json.Unmarshal(vmbtData, &vmbt); err != nil {
+		return nil, fmt.Errorf("failed to parse archived vmbt.json: %w", err)
+	}
+
+	return &vmbt, nil
 }
 
 // ensureVMBackup creates or retrieves the VirtualMachineBackup for this DataUpload.
 // Returns the VMB, whether it was created (vs already existed), and any error.
+// When forceFullBackup is true, the VMB is created with ForceFullBackup=true in its spec,
+// which tells KubeVirt to perform a full backup regardless of any existing checkpoint.
 // Note: We don't set an owner reference because VMB is in VM namespace
 // while DataUpload is in OADP namespace (cross-namespace owner refs not allowed).
-// VMB cleanup will be handled explicitly in Phase 5.
-func (r *KubeVirtDataUploadReconciler) ensureVMBackup(ctx context.Context, logger logr.Logger, du *velerov2alpha1.DataUpload, vmbt *kubevirtbackupv1alpha1.VirtualMachineBackupTracker, pvcName, namespace string) (*kubevirtbackupv1alpha1.VirtualMachineBackup, bool, error) {
+// VMB and VMBT are archived to S3 and deleted by the datamover pod after upload.
+func (r *KubeVirtDataUploadReconciler) ensureVMBackup(ctx context.Context, logger logr.Logger, du *velerov2alpha1.DataUpload, vmbt *kubevirtbackupv1alpha1.VirtualMachineBackupTracker, pvcName, namespace string, forceFullBackup bool) (*kubevirtbackupv1alpha1.VirtualMachineBackup, bool, error) {
 	// Use DataUpload name for VMB to ensure 1:1 mapping
 	vmbName := fmt.Sprintf("vmb-%s", du.Name)
 
@@ -725,8 +1045,13 @@ func (r *KubeVirtDataUploadReconciler) ensureVMBackup(ctx context.Context, logge
 				Kind:     "VirtualMachineBackupTracker",
 				Name:     vmbt.Name,
 			},
-			PvcName: &pvcName,
+			PvcName:         &pvcName,
+			ForceFullBackup: forceFullBackup,
 		},
+	}
+
+	if forceFullBackup {
+		logger.Info("Creating VirtualMachineBackup with ForceFullBackup=true", "vmb", vmbName)
 	}
 
 	if err := r.Create(ctx, vmb); err != nil {
@@ -793,40 +1118,12 @@ func (r *KubeVirtDataUploadReconciler) buildDatamoverPodConfig(
 	backupType string,
 	checkpointName string,
 ) (*DatamoverPodConfig, error) {
-	// Extract BSL configuration
-	bucket := ""
-	prefix := ""
-	if bsl.Spec.ObjectStorage != nil {
-		bucket = bsl.Spec.ObjectStorage.Bucket
-		prefix = bsl.Spec.ObjectStorage.Prefix
-	}
-	if bucket == "" {
-		return nil, fmt.Errorf("BSL %s has no bucket configured", bsl.Name)
+	cfg, err := extractBSLConfig(bsl)
+	if err != nil {
+		return nil, err
 	}
 
-	// Add our datamover prefix to the BSL prefix
-	if prefix != "" {
-		prefix = prefix + "-kubevirt-datamover"
-	} else {
-		prefix = "kubevirt-datamover"
-	}
-
-	// Get region from BSL config
-	region := ""
-	if bsl.Spec.Config != nil {
-		region = bsl.Spec.Config["region"]
-	}
-
-	// Get credential secret reference
-	credSecretName := ""
-	credSecretKey := "cloud"
-	if bsl.Spec.Credential != nil {
-		credSecretName = bsl.Spec.Credential.Name
-		if bsl.Spec.Credential.Key != "" {
-			credSecretKey = bsl.Spec.Credential.Key
-		}
-	}
-	if credSecretName == "" {
+	if cfg.CredentialName == "" {
 		return nil, fmt.Errorf("BSL %s has no credential secret configured", bsl.Name)
 	}
 
@@ -849,12 +1146,12 @@ func (r *KubeVirtDataUploadReconciler) buildDatamoverPodConfig(
 		Namespace:            vmRef.Namespace,
 		Image:                image,
 		ImagePullPolicy:      pullPolicy,
-		BSLProvider:          bsl.Spec.Provider,
-		BSLBucket:            bucket,
-		BSLPrefix:            prefix,
-		BSLRegion:            region,
-		CredentialSecretName: credSecretName,
-		CredentialSecretKey:  credSecretKey,
+		BSLProvider:          cfg.Provider,
+		BSLBucket:            cfg.Bucket,
+		BSLPrefix:            cfg.Prefix,
+		BSLRegion:            cfg.Region,
+		CredentialSecretName: cfg.CredentialName,
+		CredentialSecretKey:  cfg.CredentialKey,
 		VMName:               vmRef.Name,
 		VMNamespace:          vmRef.Namespace,
 		CheckpointName:       checkpointName,
@@ -863,6 +1160,7 @@ func (r *KubeVirtDataUploadReconciler) buildDatamoverPodConfig(
 		DataUploadName:       du.Name,
 		DataUploadUID:        string(du.UID),
 		VMBName:              vmb.Name,
+		VMBTName:             fmt.Sprintf("vmbt-%s", vmRef.Name),
 		SourcePVCName:        pvcName,
 		Labels:               make(map[string]string),
 	}, nil
@@ -895,4 +1193,159 @@ func extractPodFailureMessage(pod *corev1.Pod) string {
 	}
 
 	return "unknown error"
+}
+
+// bslConfig holds extracted BSL configuration used by both the datamover pod
+// and the checkpoint lookup.
+type bslConfig struct {
+	Provider       string
+	Bucket         string
+	Prefix         string // Datamover prefix (e.g., "velero-kubevirt-datamover")
+	Region         string
+	CredentialName string
+	CredentialKey  string
+}
+
+// extractBSLConfig extracts and validates common BSL configuration fields.
+// The returned prefix includes the datamover suffix (e.g., "velero-kubevirt-datamover").
+func extractBSLConfig(bsl *velerov1.BackupStorageLocation) (*bslConfig, error) {
+	bucket := ""
+	prefix := ""
+	if bsl.Spec.ObjectStorage != nil {
+		bucket = bsl.Spec.ObjectStorage.Bucket
+		prefix = bsl.Spec.ObjectStorage.Prefix
+	}
+	if bucket == "" {
+		return nil, fmt.Errorf("BSL %s has no bucket configured", bsl.Name)
+	}
+
+	// Add our datamover prefix to the BSL prefix
+	if prefix != "" {
+		prefix = prefix + "-" + common.DatamoverBSLPrefix
+	} else {
+		prefix = common.DatamoverBSLPrefix
+	}
+
+	region := ""
+	if bsl.Spec.Config != nil {
+		region = bsl.Spec.Config["region"]
+	}
+
+	credName := ""
+	credKey := defaultCredentialKey
+	if bsl.Spec.Credential != nil {
+		credName = bsl.Spec.Credential.Name
+		if bsl.Spec.Credential.Key != "" {
+			credKey = bsl.Spec.Credential.Key
+		}
+	}
+
+	return &bslConfig{
+		Provider:       bsl.Spec.Provider,
+		Bucket:         bucket,
+		Prefix:         prefix,
+		Region:         region,
+		CredentialName: credName,
+		CredentialKey:  credKey,
+	}, nil
+}
+
+// lookupCheckpointFromBSL reads the VM's checkpoint index from the BSL and returns
+// the latest valid checkpoint for incremental backup support.
+func (r *KubeVirtDataUploadReconciler) lookupCheckpointFromBSL(ctx context.Context, bsl *velerov1.BackupStorageLocation, vmNamespace, vmName string) (*uploader.CheckpointLookupResult, error) {
+	store, cfg, err := r.initObjectStoreFromBSL(ctx, bsl)
+	if err != nil {
+		return nil, err
+	}
+
+	// Lookup the latest checkpoint
+	result, err := uploader.LookupLatestCheckpoint(ctx, store, cfg.Bucket, vmNamespace, vmName)
+	if err != nil {
+		return nil, fmt.Errorf("checkpoint lookup failed: %w", err)
+	}
+
+	return result, nil
+}
+
+// initObjectStoreFromBSL extracts BSL config, fetches credentials, and initializes
+// an ObjectStore client. Used by both lookupCheckpointFromBSL and lookupLatestVMBTFromBSL.
+func (r *KubeVirtDataUploadReconciler) initObjectStoreFromBSL(
+	ctx context.Context, bsl *velerov1.BackupStorageLocation,
+) (velero.ObjectStore, *bslConfig, error) {
+	cfg, err := extractBSLConfig(bsl)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if cfg.CredentialName == "" {
+		return nil, nil, fmt.Errorf("BSL %s has no credential configured", bsl.Name)
+	}
+
+	credData, err := r.getCredentialsFromBSL(ctx, bsl)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to get BSL credentials: %w", err)
+	}
+
+	factory := r.ObjectStoreFactory
+	if factory == nil {
+		factory = func(c *uploader.UploaderConfig) (velero.ObjectStore, error) {
+			return uploader.InitObjectStore(c)
+		}
+	}
+
+	store, err := factory(&uploader.UploaderConfig{
+		BSLProvider:     cfg.Provider,
+		BSLBucket:       cfg.Bucket,
+		BSLPrefix:       cfg.Prefix,
+		BSLRegion:       cfg.Region,
+		CredentialsData: credData,
+	})
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to initialize object store: %w", err)
+	}
+
+	return store, cfg, nil
+}
+
+// getCredentialsFromBSL reads the BSL credential secret and returns the raw
+// credential bytes. The credentials are kept in memory and never written to disk.
+func (r *KubeVirtDataUploadReconciler) getCredentialsFromBSL(
+	ctx context.Context, bsl *velerov1.BackupStorageLocation,
+) ([]byte, error) {
+	if bsl.Spec.Credential == nil {
+		return nil, fmt.Errorf("BSL %s has no credential configured", bsl.Name)
+	}
+
+	secretName := bsl.Spec.Credential.Name
+	secretKey := bsl.Spec.Credential.Key
+	if secretKey == "" {
+		secretKey = defaultCredentialKey
+	}
+
+	// BSL credentials secret is in the same namespace as the BSL
+	namespace := bsl.Namespace
+	if namespace == "" {
+		namespace = r.OADPNamespace
+	}
+
+	// Fetch the secret
+	secret := &corev1.Secret{}
+	if err := r.Get(ctx, types.NamespacedName{
+		Name: secretName, Namespace: namespace,
+	}, secret); err != nil {
+		return nil, fmt.Errorf(
+			"failed to get credential secret %s/%s: %w",
+			namespace, secretName, err,
+		)
+	}
+
+	credData, ok := secret.Data[secretKey]
+	if !ok {
+		return nil, fmt.Errorf(
+			"credential secret %s/%s does not contain key %q",
+			namespace, secretName, secretKey,
+		)
+	}
+
+	return credData, nil
 }

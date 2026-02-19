@@ -31,6 +31,18 @@ const (
 
 	// AnnotationOperationID is the annotation for tracking async backup/restore operations.
 	AnnotationOperationID = "kubevirt-datamover.io/operation-id"
+
+	// AnnotationBSLValidated indicates that BSL checkpoint validation has been
+	// performed for this DataUpload. This prevents redundant S3 queries on
+	// every reconcile loop iteration while still ensuring validation runs
+	// once per DataUpload.
+	AnnotationBSLValidated = "kubevirt-datamover.io/bsl-validated"
+
+	// AnnotationForceFullBackup, when set to "true" on a DataUpload, forces
+	// a full backup even when a valid incremental checkpoint chain exists.
+	// The VMBT checkpoint is cleared and the VMB is created with
+	// ForceFullBackup=true. The new checkpoint replaces the old one in BSL.
+	AnnotationForceFullBackup = "kubevirt-datamover.io/force-full-backup"
 )
 
 // Label keys for resources created by the controller
@@ -70,6 +82,13 @@ const (
 	// DataMoverKubeVirt is the datamover value that indicates the kubevirt
 	// datamover controller should handle the DataUpload/DataDownload.
 	DataMoverKubeVirt = "kubevirt"
+)
+
+// BSL prefix for datamover objects
+const (
+	// DatamoverBSLPrefix is the suffix appended to the BSL prefix to namespace
+	// datamover objects within the object store bucket.
+	DatamoverBSLPrefix = "kubevirt-datamover"
 )
 
 // Default images
