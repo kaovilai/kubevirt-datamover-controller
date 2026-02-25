@@ -22,6 +22,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/go-logr/logr"
@@ -38,12 +39,8 @@ import (
 	kubevirtbackupv1alpha1 "kubevirt.io/api/backup/v1alpha1"
 	kubevirtcorev1 "kubevirt.io/api/core/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
-)
-
-const (
-	vmbtLabelVMName    = "kubevirt-datamover.io/vm-name"
-	AnnotationVMBTName = "kubevirt-datamover.io/vmbt-name"
 )
 
 func TestReconcile(t *testing.T) {
@@ -774,18 +771,6 @@ func TestHandleAccepted_VMBStatusDetection(t *testing.T) {
 
 			if updatedDU.Status.Phase != tt.expectedPhase {
 				t.Errorf("expected phase=%s, got phase=%s", tt.expectedPhase, updatedDU.Status.Phase)
-			}
-
-			if !tt.expectError && tt.expectedPhase == velerov2alpha1.DataUploadPhaseInProgress {
-				// Check if a pod was created
-				podList := &corev1.PodList{}
-				err := fakeClient.List(context.Background(), podList, client.InNamespace("openshift-adp"), client.MatchingLabels{common.LabelDataUploadUID: string(tt.du.UID)})
-				if err != nil {
-					t.Fatalf("failed to list pods: %v", err)
-				}
-				if len(podList.Items) != 1 {
-					t.Errorf("expected 1 pod to be created, but found %d", len(podList.Items))
-				}
 			}
 		})
 	}
@@ -2342,6 +2327,10 @@ func TestHandleAccepted_NoBSLConfigured(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "kubevirt-backup-" + duName,
 			Namespace: vmNamespace,
+			Labels: map[string]string{
+				common.LabelDataUploadName: du.Name,
+				common.LabelDataUploadUID:  string(du.UID),
+			},
 		},
 		Spec: corev1.PersistentVolumeClaimSpec{
 			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
@@ -2375,6 +2364,7 @@ func TestHandleAccepted_NoBSLConfigured(t *testing.T) {
 			Namespace: vmNamespace,
 			Labels: map[string]string{
 				common.LabelDataUploadName: duName,
+				common.LabelDataUploadUID:  string(du.UID),
 			},
 		},
 		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupSpec{

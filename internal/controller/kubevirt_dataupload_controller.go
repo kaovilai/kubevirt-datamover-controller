@@ -696,7 +696,7 @@ func (r *KubeVirtDataUploadReconciler) handleInProgress(ctx context.Context, log
 
 	case corev1.PodFailed:
 		failureMessage := extractPodFailureMessage(pod)
-		logger.Error(nil, "Datamover pod failed", "pod", podName, "message", failureMessage)
+		logger.Error(nil, "Datamover pod failed", "pod", pod.Name, "message", failureMessage)
 
 		// Skip cleanup on failure to preserve resources for debugging.
 		// Resources (pod, rebound PVC/PV) can be manually cleaned up after investigation.
@@ -707,11 +707,11 @@ func (r *KubeVirtDataUploadReconciler) handleInProgress(ctx context.Context, log
 		return ctrl.Result{}, nil
 
 	case corev1.PodPending, corev1.PodRunning:
-		logger.V(1).Info("Datamover pod still running", "pod", podName, "phase", pod.Status.Phase)
+		logger.V(1).Info("Datamover pod still running", "pod", pod.Name, "phase", pod.Status.Phase)
 		return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
 
 	default:
-		logger.Info("Datamover pod in unknown phase", "pod", podName, "phase", pod.Status.Phase)
+		logger.Info("Datamover pod in unknown phase", "pod", pod.Name, "phase", pod.Status.Phase)
 		return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
 	}
 }
@@ -1104,12 +1104,11 @@ func (r *KubeVirtDataUploadReconciler) ensureVMBackup(ctx context.Context, logge
 		},
 	}
 
-	if forceFullBackup {
-		logger.Info("Creating VirtualMachineBackup with ForceFullBackup=true", "vmb", vmbName)
-	}
-
 	if err := r.Create(ctx, vmb); err != nil {
 		return nil, false, fmt.Errorf("failed to create VirtualMachineBackup: %w", err)
+	}
+	if forceFullBackup {
+		logger.Info("Creating VirtualMachineBackup with ForceFullBackup=true", "vmb", vmb.Name)
 	}
 
 	logger.Info("Created VirtualMachineBackup", "generateName", vmb.GenerateName, "namespace", namespace, "tracker", vmbt.Name)
