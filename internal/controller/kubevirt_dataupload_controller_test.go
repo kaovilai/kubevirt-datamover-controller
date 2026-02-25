@@ -541,8 +541,13 @@ func TestHandleAccepted_VMBStatusDetection(t *testing.T) {
 			expectRequeue: true,
 		},
 		{
-			name: "VMB Done False transitions to Failed",
+			name: "VMB Done False and Progressing False transitions to Failed",
 			vmbConditions: []kubevirtbackupv1alpha1.Condition{
+				{
+					Type:   kubevirtbackupv1alpha1.ConditionProgressing,
+					Status: corev1.ConditionFalse,
+					Reason: "BackupFailed",
+				},
 				{
 					Type:    kubevirtbackupv1alpha1.ConditionDone,
 					Status:  corev1.ConditionFalse,
@@ -552,6 +557,36 @@ func TestHandleAccepted_VMBStatusDetection(t *testing.T) {
 			},
 			expectedPhase: velerov2alpha1.DataUploadPhaseFailed,
 			expectRequeue: false,
+		},
+		{
+			name: "VMB Done False and Progressing True requeues (backup still running)",
+			vmbConditions: []kubevirtbackupv1alpha1.Condition{
+				{
+					Type:   kubevirtbackupv1alpha1.ConditionProgressing,
+					Status: corev1.ConditionTrue,
+					Reason: "Backup is in progress",
+				},
+				{
+					Type:   kubevirtbackupv1alpha1.ConditionDone,
+					Status: corev1.ConditionFalse,
+					Reason: "Backup is in progress",
+				},
+			},
+			expectedPhase: velerov2alpha1.DataUploadPhaseAccepted, // unchanged - still running
+			expectRequeue: true,
+		},
+		{
+			name: "VMB Done False without Progressing requeues",
+			vmbConditions: []kubevirtbackupv1alpha1.Condition{
+				{
+					Type:    kubevirtbackupv1alpha1.ConditionDone,
+					Status:  corev1.ConditionFalse,
+					Reason:  "Backup is in progress",
+					Message: "",
+				},
+			},
+			expectedPhase: velerov2alpha1.DataUploadPhaseAccepted, // unchanged - wait for Progressing
+			expectRequeue: true,
 		},
 		{
 			name: "VMB only Progressing True requeues",

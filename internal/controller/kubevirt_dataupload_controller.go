@@ -331,33 +331,58 @@ func (r *KubeVirtDataUploadReconciler) handleAccepted(ctx context.Context, logge
 		return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
 	}
 
-	// Simple logic: check the Done condition only
-	for _, cond := range vmb.Status.Conditions {
-		if cond.Type == kubevirtbackupv1alpha1.ConditionDone {
-			if cond.Status == corev1.ConditionTrue {
-				// Success
-				logger.Info("VirtualMachineBackup completed",
-					"vmb", vmb.Name,
-					"type", vmb.Status.Type,
-					"checkpoint", vmb.Status.CheckpointName)
+	return r.evaluateVMBackupStatus(ctx, logger, du, vmb)
+}
 
-				if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhasePrepared,
-					fmt.Sprintf("VMBackup completed (type=%s)", vmb.Status.Type)); err != nil {
-					return ctrl.Result{}, err
-				}
-				return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
-			}
-			// Done: False means explicit failure
-			logger.Error(nil, "VirtualMachineBackup failed", "reason", cond.Reason, "message", cond.Message)
+// evaluateVMBackupStatus checks the Done and Progressing conditions on a VirtualMachineBackup
+// to determine whether the backup succeeded, failed, or is still running.
+// KubeVirt uses both conditions together:
+//
+//	Progressing=True  + Done=False  → backup still running
+//	Progressing=False + Done=True   → backup completed successfully
+//	Progressing=False + Done=False  → backup failed
+func (r *KubeVirtDataUploadReconciler) evaluateVMBackupStatus(
+	ctx context.Context, logger logr.Logger,
+	du *velerov2alpha1.DataUpload, vmb *kubevirtbackupv1alpha1.VirtualMachineBackup,
+) (ctrl.Result, error) {
+	var doneCond, progressingCond *kubevirtbackupv1alpha1.Condition
+	for i := range vmb.Status.Conditions {
+		switch vmb.Status.Conditions[i].Type {
+		case kubevirtbackupv1alpha1.ConditionDone:
+			doneCond = &vmb.Status.Conditions[i]
+		case kubevirtbackupv1alpha1.ConditionProgressing:
+			progressingCond = &vmb.Status.Conditions[i]
+		}
+	}
+
+	if doneCond != nil && doneCond.Status == corev1.ConditionTrue {
+		logger.Info("VirtualMachineBackup completed",
+			"vmb", vmb.Name,
+			"type", vmb.Status.Type,
+			"checkpoint", vmb.Status.CheckpointName)
+
+		if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhasePrepared,
+			fmt.Sprintf("VMBackup completed (type=%s)", vmb.Status.Type)); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
+	}
+
+	if doneCond != nil && doneCond.Status == corev1.ConditionFalse {
+		if progressingCond != nil && progressingCond.Status == corev1.ConditionFalse {
+			// Progressing=False + Done=False → actual failure
+			logger.Error(nil, "VirtualMachineBackup failed", "reason", doneCond.Reason, "message", doneCond.Message)
 			if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed,
-				fmt.Sprintf("VMBackup failed: %s", cond.Message)); err != nil {
+				fmt.Sprintf("VMBackup failed: %s", doneCond.Message)); err != nil {
 				return ctrl.Result{}, err
 			}
 			return ctrl.Result{}, nil
 		}
+		// Done=False but Progressing is True or absent → backup still running
+		logger.Info("VirtualMachineBackup still in progress (Done=False, waiting for completion)", "vmb", vmb.Name)
 	}
 
-	// No Done condition yet - still in progress
+	// No Done condition yet, or backup still running - requeue
 	logger.Info("VirtualMachineBackup in progress, requeuing")
 	return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
 }
