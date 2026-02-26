@@ -708,8 +708,10 @@ func TestHandleAccepted_VMBStatusDetection(t *testing.T) {
 					Name:      "vmb-" + duName,
 					Namespace: vmNamespace,
 					Labels: map[string]string{
-						common.LabelDataUploadName: duName,
-						common.LabelDataUploadUID:  string(du.UID),
+						common.LabelDataUploadUID: string(du.UID),
+					},
+					Annotations: map[string]string{
+						common.AnnotationDataUploadName: duName,
 					},
 					OwnerReferences: []metav1.OwnerReference{
 						{
@@ -2230,8 +2232,10 @@ func TestHandleAccepted_WithBSLCheckpointLookup(t *testing.T) {
 			Name:      "vmb-" + duName,
 			Namespace: vmNamespace,
 			Labels: map[string]string{
-				common.LabelDataUploadName: duName,
-				common.LabelDataUploadUID:  "test-uid",
+				common.LabelDataUploadUID: "test-uid",
+			},
+			Annotations: map[string]string{
+				common.AnnotationDataUploadName: duName,
 			},
 		},
 		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupSpec{
@@ -2363,8 +2367,10 @@ func TestHandleAccepted_NoBSLConfigured(t *testing.T) {
 			Name:      "vmb-" + duName,
 			Namespace: vmNamespace,
 			Labels: map[string]string{
-				common.LabelDataUploadName: duName,
-				common.LabelDataUploadUID:  string(du.UID),
+				common.LabelDataUploadUID: string(du.UID),
+			},
+			Annotations: map[string]string{
+				common.AnnotationDataUploadName: duName,
 			},
 		},
 		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupSpec{
@@ -2859,8 +2865,10 @@ func TestHandleAccepted_HappyPath_IncrementalBackup(t *testing.T) {
 			Name:      "vmb-" + duName,
 			Namespace: vmNamespace,
 			Labels: map[string]string{
-				common.LabelDataUploadName: duName,
-				common.LabelDataUploadUID:  "test-uid",
+				common.LabelDataUploadUID: "test-uid",
+			},
+			Annotations: map[string]string{
+				common.AnnotationDataUploadName: duName,
 			},
 		},
 		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupSpec{
@@ -4862,9 +4870,9 @@ func TestPrepareVMBackupTracker_DeletesExisting(t *testing.T) {
 	if vmbt.Labels["stale-label"] == "old-value" {
 		t.Error("expected old VMBT to be deleted and new one created, but old labels persist")
 	}
-	if vmbt.Labels[common.LabelDataUploadName] != duName {
-		t.Errorf("expected new VMBT to have DataUpload label %q, got %q",
-			duName, vmbt.Labels[common.LabelDataUploadName])
+	if vmbt.Annotations[common.AnnotationDataUploadName] != duName {
+		t.Errorf("expected new VMBT to have DataUpload annotation %q, got %q",
+			duName, vmbt.Annotations[common.AnnotationDataUploadName])
 	}
 	if vmbt.Labels[vmbtLabelVMName] != vmName {
 		t.Errorf("expected new VMBT to have label %s, got %q",

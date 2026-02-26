@@ -43,12 +43,16 @@ const (
 	// The VMBT checkpoint is cleared and the VMB is created with
 	// ForceFullBackup=true. The new checkpoint replaces the old one in BSL.
 	AnnotationForceFullBackup = "kubevirt-datamover.io/force-full-backup"
+
+	// AnnotationDataUploadName is the annotation key for the DataUpload name.
+	// Used on VMB, VMBT, and PVC resources to track ownership.
+	AnnotationDataUploadName = "velero.io/dataupload-name"
 )
 
 // Label keys for resources created by the controller
 const (
 	// LabelDataUploadName is the label key for the DataUpload name.
-	// Used on VMB, VMBT, and PVC resources to track ownership.
+	// Used on datamover pods to track ownership.
 	LabelDataUploadName = "velero.io/dataupload-name"
 
 	// LabelDataUploadUID is the label key for the DataUpload UID.

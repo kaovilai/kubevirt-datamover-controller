@@ -900,8 +900,10 @@ func (r *KubeVirtDataUploadReconciler) ensureTempPVC(ctx context.Context, logger
 			GenerateName: safeGenerateNamePrefix(fmt.Sprintf("kubevirt-backup-%s-", du.Name), 63),
 			Namespace:    namespace,
 			Labels: map[string]string{
-				common.LabelDataUploadName: du.Name,
-				common.LabelDataUploadUID:  string(du.UID),
+				common.LabelDataUploadUID: string(du.UID),
+			},
+			Annotations: map[string]string{
+				common.AnnotationDataUploadName: du.Name,
 			},
 		},
 		Spec: corev1.PersistentVolumeClaimSpec{
@@ -973,8 +975,10 @@ func (r *KubeVirtDataUploadReconciler) prepareVMBackupTracker(ctx context.Contex
 			GenerateName: safeGenerateNamePrefix(fmt.Sprintf("vmbt-%s-", vmName), 63),
 			Namespace:    vmNamespace,
 			Labels: map[string]string{
-				common.LabelDataUploadName: du.Name,
-				vmbtLabelVMName:            vmName,
+				vmbtLabelVMName: vmName,
+			},
+			Annotations: map[string]string{
+				common.AnnotationDataUploadName: du.Name,
 			},
 		},
 		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupTrackerSpec{
@@ -1097,8 +1101,10 @@ func (r *KubeVirtDataUploadReconciler) ensureVMBackup(ctx context.Context, logge
 			GenerateName: safeGenerateNamePrefix(fmt.Sprintf("vmb-%s-", du.Name), maxVMBNameLen),
 			Namespace:    namespace,
 			Labels: map[string]string{
-				common.LabelDataUploadName: du.Name,
-				common.LabelDataUploadUID:  string(du.UID),
+				common.LabelDataUploadUID: string(du.UID),
+			},
+			Annotations: map[string]string{
+				common.AnnotationDataUploadName: du.Name,
 			},
 		},
 		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupSpec{
