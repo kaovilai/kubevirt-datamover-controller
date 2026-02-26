@@ -5072,13 +5072,13 @@ func TestSafeGenerateNamePrefix(t *testing.T) {
 			name:       "long prefix is truncated",
 			prefix:     "a-very-long-prefix-that-will-be-truncated-and-should-not-exceed-the-limit-",
 			maxNameLen: 63,
-			expected:   "a-very-long-prefix-that-will-be-truncated-and-should-no", // 58 chars
+			expected:   "a-very-long-prefix-that-will-be-truncated-and-should-not-e", // 58 chars
 		},
 		{
 			name:       "long prefix for VMB is truncated",
 			prefix:     "vmb-a-very-long-dataupload-name-that-exceeds-the-limit-for-kubevirt-hotplug-",
-			maxNameLen: maxVMBNameLen, // 45
-			expected:   "vmb-a-very-long-dataupload-name-that-e", // 40 chars = 45 - 5
+			maxNameLen: maxVMBNameLen,                              // 45
+			expected:   "vmb-a-very-long-dataupload-name-that-exc", // 40 chars = 45 - 5
 		},
 		{
 			name:       "edge case: maxNameLen < random part",
@@ -5107,10 +5107,7 @@ func TestSafeGenerateNamePrefix(t *testing.T) {
 				t.Errorf("safeGenerateNamePrefix() = %q, want %q", result, tt.expected)
 			}
 			// Sanity check length
-			maxPrefixLen := tt.maxNameLen - k8sGenerateNameRandomLen
-			if maxPrefixLen < 1 {
-				maxPrefixLen = 1
-			}
+			maxPrefixLen := max(tt.maxNameLen-k8sGenerateNameRandomLen, 1)
 			if len(result) > maxPrefixLen {
 				t.Errorf("result length %d exceeds max prefix length %d", len(result), maxPrefixLen)
 			}

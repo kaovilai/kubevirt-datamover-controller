@@ -1171,10 +1171,7 @@ func getVeleroBackupName(du *velerov2alpha1.DataUpload) string {
 // safeGenerateNamePrefix truncates a GenerateName prefix so that the final
 // name (prefix + 5 random chars) does not exceed maxNameLen.
 func safeGenerateNamePrefix(prefix string, maxNameLen int) string {
-	maxPrefix := maxNameLen - k8sGenerateNameRandomLen
-	if maxPrefix < 1 {
-		maxPrefix = 1
-	}
+	maxPrefix := max(maxNameLen-k8sGenerateNameRandomLen, 1)
 	if len(prefix) > maxPrefix {
 		prefix = prefix[:maxPrefix]
 	}
