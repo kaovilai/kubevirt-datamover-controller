@@ -583,6 +583,540 @@ func countOccurrences(data []byte, substr string) int {
 	return bytes.Count(data, []byte(substr))
 }
 
+func TestMergeReferencedBy(t *testing.T) {
+	tests := []struct {
+		name       string
+		existing   []string
+		additional []string
+		expected   []string
+	}{
+		{
+			name:       "both empty",
+			existing:   nil,
+			additional: nil,
+			expected:   []string{},
+		},
+		{
+			name:       "existing empty, additional has entries",
+			existing:   nil,
+			additional: []string{"backup-1"},
+			expected:   []string{"backup-1"},
+		},
+		{
+			name:       "additional empty",
+			existing:   []string{"backup-1"},
+			additional: nil,
+			expected:   []string{"backup-1"},
+		},
+		{
+			name:       "no overlap",
+			existing:   []string{"backup-1"},
+			additional: []string{"backup-2"},
+			expected:   []string{"backup-1", "backup-2"},
+		},
+		{
+			name:       "full overlap",
+			existing:   []string{"backup-1", "backup-2"},
+			additional: []string{"backup-1", "backup-2"},
+			expected:   []string{"backup-1", "backup-2"},
+		},
+		{
+			name:       "partial overlap",
+			existing:   []string{"backup-1", "backup-2"},
+			additional: []string{"backup-2", "backup-3"},
+			expected:   []string{"backup-1", "backup-2", "backup-3"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := mergeReferencedBy(tt.existing, tt.additional)
+			if len(result) != len(tt.expected) {
+				t.Fatalf("len = %d, want %d; got %v", len(result), len(tt.expected), result)
+			}
+			for i, v := range result {
+				if v != tt.expected[i] {
+					t.Errorf("result[%d] = %q, want %q", i, v, tt.expected[i])
+				}
+			}
+		})
+	}
+}
+
+func TestPropagateReferencedBy(t *testing.T) {
+	tests := []struct {
+		name        string
+		checkpoints []CheckpointEntry
+		startID     string
+		backupName  string
+		// expected maps checkpoint ID -> expected ReferencedBy after propagation
+		expected map[string][]string
+	}{
+		{
+			name: "single full checkpoint, no parent to propagate to",
+			checkpoints: []CheckpointEntry{
+				{ID: "cp-001", Type: "full", ReferencedBy: []string{"backup-1"}},
+			},
+			startID:    "cp-001",
+			backupName: "backup-1",
+			expected: map[string][]string{
+				"cp-001": {"backup-1"}, // unchanged
+			},
+		},
+		{
+			name: "one incremental adds backup to parent",
+			checkpoints: []CheckpointEntry{
+				{ID: "cp-001", Type: "full", ReferencedBy: []string{"backup-1"}},
+				{ID: "cp-002", Type: "incremental", Parent: "cp-001", ReferencedBy: []string{"backup-2"}},
+			},
+			startID:    "cp-002",
+			backupName: "backup-2",
+			expected: map[string][]string{
+				"cp-001": {"backup-1", "backup-2"},
+				"cp-002": {"backup-2"},
+			},
+		},
+		{
+			name: "three-level chain propagates to all ancestors",
+			checkpoints: []CheckpointEntry{
+				{ID: "cp-001", Type: "full", ReferencedBy: []string{"backup-1"}},
+				{ID: "cp-002", Type: "incremental", Parent: "cp-001", ReferencedBy: []string{"backup-2"}},
+				{ID: "cp-003", Type: "incremental", Parent: "cp-002", ReferencedBy: []string{"backup-3"}},
+			},
+			startID:    "cp-003",
+			backupName: "backup-3",
+			expected: map[string][]string{
+				"cp-001": {"backup-1", "backup-3"},
+				"cp-002": {"backup-2", "backup-3"},
+				"cp-003": {"backup-3"}, // unchanged (start is skipped)
+			},
+		},
+		{
+			name: "does not add duplicate",
+			checkpoints: []CheckpointEntry{
+				{ID: "cp-001", Type: "full", ReferencedBy: []string{"backup-1", "backup-2"}},
+				{ID: "cp-002", Type: "incremental", Parent: "cp-001", ReferencedBy: []string{"backup-2"}},
+			},
+			startID:    "cp-002",
+			backupName: "backup-2",
+			expected: map[string][]string{
+				"cp-001": {"backup-1", "backup-2"}, // backup-2 not duplicated
+				"cp-002": {"backup-2"},
+			},
+		},
+		{
+			name: "start checkpoint not found is a no-op",
+			checkpoints: []CheckpointEntry{
+				{ID: "cp-001", Type: "full", ReferencedBy: []string{"backup-1"}},
+			},
+			startID:    "cp-999",
+			backupName: "backup-2",
+			expected: map[string][]string{
+				"cp-001": {"backup-1"},
+			},
+		},
+		{
+			name: "cycle in parent chain terminates",
+			checkpoints: []CheckpointEntry{
+				{ID: "cp-001", Type: "full", Parent: "cp-002", ReferencedBy: []string{}},
+				{ID: "cp-002", Type: "incremental", Parent: "cp-001", ReferencedBy: []string{}},
+			},
+			startID:    "cp-002",
+			backupName: "backup-1",
+			expected: map[string][]string{
+				"cp-001": {"backup-1"},
+				"cp-002": {"backup-1"}, // cp-002 is also an ancestor via cycle
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			propagateReferencedBy(tt.checkpoints, tt.startID, tt.backupName)
+
+			for _, cp := range tt.checkpoints {
+				expected, ok := tt.expected[cp.ID]
+				if !ok {
+					continue
+				}
+				if len(cp.ReferencedBy) != len(expected) {
+					t.Errorf("checkpoint %s: ReferencedBy len = %d, want %d; got %v",
+						cp.ID, len(cp.ReferencedBy), len(expected), cp.ReferencedBy)
+					continue
+				}
+				for i, v := range cp.ReferencedBy {
+					if v != expected[i] {
+						t.Errorf("checkpoint %s: ReferencedBy[%d] = %q, want %q",
+							cp.ID, i, v, expected[i])
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestUpdateVMIndex_ReferencedByPropagation(t *testing.T) {
+	tests := []struct {
+		name           string
+		config         *UploaderConfig
+		files          []CheckpointFile
+		archived       *archivedPaths
+		existingIndex  *VMIndex
+		validateResult func(*testing.T, *MockObjectStore)
+	}{
+		{
+			name: "incremental backup propagates referencedBy to parent (full)",
+			config: &UploaderConfig{
+				BSLBucket:        "test-bucket",
+				VMName:           "test-vm",
+				VMNamespace:      "test-ns",
+				CheckpointName:   "cp-002",
+				BackupType:       "incremental",
+				VMBName:          "vmb-2",
+				VeleroBackupName: "backup-day2",
+			},
+			files: []CheckpointFile{
+				{Filename: "vmb-2-disk1.qcow2", DiskName: "disk1", Size: 512,
+					ObjectPath: "checkpoints/test-ns/test-vm/cp-002/vmb-2-disk1.qcow2"},
+			},
+			archived: &archivedPaths{},
+			existingIndex: &VMIndex{
+				VMName:    "test-vm",
+				Namespace: "test-ns",
+				Checkpoints: []CheckpointEntry{
+					{
+						ID: "cp-001", Type: "full", VMBackup: "vmb-1",
+						ReferencedBy: []string{"backup-day1"},
+						Files: []CheckpointFile{
+							{ObjectPath: "checkpoints/test-ns/test-vm/cp-001/vmb-1-disk1.qcow2"},
+						},
+					},
+				},
+			},
+			validateResult: func(t *testing.T, store *MockObjectStore) {
+				data, err := store.GetObjectBytes("checkpoints/test-ns/test-vm/index.json")
+				if err != nil {
+					t.Fatalf("failed to get index: %v", err)
+				}
+
+				var idx VMIndex
+				if err := json.Unmarshal(data, &idx); err != nil {
+					t.Fatalf("failed to parse index: %v", err)
+				}
+
+				// cp-001 should now have both backup-day1 and backup-day2
+				cp001 := findCheckpoint(idx.Checkpoints, "cp-001")
+				if cp001 == nil {
+					t.Fatal("cp-001 not found")
+				}
+				assertReferencedBy(t, "cp-001", cp001.ReferencedBy, []string{"backup-day1", "backup-day2"})
+
+				// cp-002 should have backup-day2
+				cp002 := findCheckpoint(idx.Checkpoints, "cp-002")
+				if cp002 == nil {
+					t.Fatal("cp-002 not found")
+				}
+				assertReferencedBy(t, "cp-002", cp002.ReferencedBy, []string{"backup-day2"})
+			},
+		},
+		{
+			name: "three-level chain propagates to all ancestors",
+			config: &UploaderConfig{
+				BSLBucket:        "test-bucket",
+				VMName:           "test-vm",
+				VMNamespace:      "test-ns",
+				CheckpointName:   "cp-003",
+				BackupType:       "incremental",
+				VMBName:          "vmb-3",
+				VeleroBackupName: "backup-day3",
+			},
+			files: []CheckpointFile{
+				{Filename: "vmb-3-disk1.qcow2", DiskName: "disk1", Size: 256,
+					ObjectPath: "checkpoints/test-ns/test-vm/cp-003/vmb-3-disk1.qcow2"},
+			},
+			archived: &archivedPaths{},
+			existingIndex: &VMIndex{
+				VMName:    "test-vm",
+				Namespace: "test-ns",
+				Checkpoints: []CheckpointEntry{
+					{
+						ID: "cp-001", Type: "full", VMBackup: "vmb-1",
+						ReferencedBy: []string{"backup-day1", "backup-day2"},
+						Files: []CheckpointFile{
+							{ObjectPath: "checkpoints/test-ns/test-vm/cp-001/vmb-1-disk1.qcow2"},
+						},
+					},
+					{
+						ID: "cp-002", Type: "incremental", Parent: "cp-001", VMBackup: "vmb-2",
+						ReferencedBy: []string{"backup-day2"},
+						Files: []CheckpointFile{
+							{ObjectPath: "checkpoints/test-ns/test-vm/cp-002/vmb-2-disk1.qcow2"},
+						},
+					},
+				},
+			},
+			validateResult: func(t *testing.T, store *MockObjectStore) {
+				data, err := store.GetObjectBytes("checkpoints/test-ns/test-vm/index.json")
+				if err != nil {
+					t.Fatalf("failed to get index: %v", err)
+				}
+
+				var idx VMIndex
+				if err := json.Unmarshal(data, &idx); err != nil {
+					t.Fatalf("failed to parse index: %v", err)
+				}
+
+				cp001 := findCheckpoint(idx.Checkpoints, "cp-001")
+				if cp001 == nil {
+					t.Fatal("cp-001 not found")
+				}
+				assertReferencedBy(t, "cp-001", cp001.ReferencedBy,
+					[]string{"backup-day1", "backup-day2", "backup-day3"})
+
+				cp002 := findCheckpoint(idx.Checkpoints, "cp-002")
+				if cp002 == nil {
+					t.Fatal("cp-002 not found")
+				}
+				assertReferencedBy(t, "cp-002", cp002.ReferencedBy,
+					[]string{"backup-day2", "backup-day3"})
+
+				cp003 := findCheckpoint(idx.Checkpoints, "cp-003")
+				if cp003 == nil {
+					t.Fatal("cp-003 not found")
+				}
+				assertReferencedBy(t, "cp-003", cp003.ReferencedBy,
+					[]string{"backup-day3"})
+			},
+		},
+		{
+			name: "full backup does not propagate (no parent)",
+			config: &UploaderConfig{
+				BSLBucket:        "test-bucket",
+				VMName:           "test-vm",
+				VMNamespace:      "test-ns",
+				CheckpointName:   "cp-001",
+				BackupType:       "full",
+				VMBName:          "vmb-1",
+				VeleroBackupName: "backup-day1",
+			},
+			files: []CheckpointFile{
+				{Filename: "vmb-1-disk1.qcow2", DiskName: "disk1", Size: 1024,
+					ObjectPath: "checkpoints/test-ns/test-vm/cp-001/vmb-1-disk1.qcow2"},
+			},
+			archived:      &archivedPaths{},
+			existingIndex: nil,
+			validateResult: func(t *testing.T, store *MockObjectStore) {
+				data, err := store.GetObjectBytes("checkpoints/test-ns/test-vm/index.json")
+				if err != nil {
+					t.Fatalf("failed to get index: %v", err)
+				}
+
+				var idx VMIndex
+				if err := json.Unmarshal(data, &idx); err != nil {
+					t.Fatalf("failed to parse index: %v", err)
+				}
+
+				if len(idx.Checkpoints) != 1 {
+					t.Fatalf("expected 1 checkpoint, got %d", len(idx.Checkpoints))
+				}
+				assertReferencedBy(t, "cp-001", idx.Checkpoints[0].ReferencedBy, []string{"backup-day1"})
+			},
+		},
+		{
+			name: "dedup checkpoint merges referencedBy",
+			config: &UploaderConfig{
+				BSLBucket:        "test-bucket",
+				VMName:           "test-vm",
+				VMNamespace:      "test-ns",
+				CheckpointName:   "cp-001",
+				BackupType:       "full",
+				VMBName:          "vmb-1",
+				VeleroBackupName: "backup-retry",
+			},
+			files: []CheckpointFile{
+				{Filename: "vmb-1-disk1.qcow2", DiskName: "disk1", Size: 1024,
+					ObjectPath: "checkpoints/test-ns/test-vm/cp-001/vmb-1-disk1.qcow2"},
+			},
+			archived: &archivedPaths{},
+			existingIndex: &VMIndex{
+				VMName:    "test-vm",
+				Namespace: "test-ns",
+				Checkpoints: []CheckpointEntry{
+					{
+						ID: "cp-001", Type: "full", VMBackup: "vmb-1",
+						ReferencedBy: []string{"backup-original", "backup-day2"},
+					},
+				},
+			},
+			validateResult: func(t *testing.T, store *MockObjectStore) {
+				data, err := store.GetObjectBytes("checkpoints/test-ns/test-vm/index.json")
+				if err != nil {
+					t.Fatalf("failed to get index: %v", err)
+				}
+
+				var idx VMIndex
+				if err := json.Unmarshal(data, &idx); err != nil {
+					t.Fatalf("failed to parse index: %v", err)
+				}
+
+				cp001 := findCheckpoint(idx.Checkpoints, "cp-001")
+				if cp001 == nil {
+					t.Fatal("cp-001 not found")
+				}
+				// Should preserve original entries and add the new one
+				assertReferencedBy(t, "cp-001", cp001.ReferencedBy,
+					[]string{"backup-original", "backup-day2", "backup-retry"})
+			},
+		},
+		{
+			name: "new full backup after broken chain does not propagate to old chain",
+			config: &UploaderConfig{
+				BSLBucket:        "test-bucket",
+				VMName:           "test-vm",
+				VMNamespace:      "test-ns",
+				CheckpointName:   "cp-004",
+				BackupType:       "full",
+				VMBName:          "vmb-4",
+				VeleroBackupName: "backup-day4",
+			},
+			files: []CheckpointFile{
+				{Filename: "vmb-4-disk1.qcow2", DiskName: "disk1", Size: 2048,
+					ObjectPath: "checkpoints/test-ns/test-vm/cp-004/vmb-4-disk1.qcow2"},
+			},
+			archived: &archivedPaths{},
+			existingIndex: &VMIndex{
+				VMName:    "test-vm",
+				Namespace: "test-ns",
+				Checkpoints: []CheckpointEntry{
+					{
+						ID: "cp-001", Type: "full", VMBackup: "vmb-1",
+						ReferencedBy: []string{"backup-day1", "backup-day2", "backup-day3"},
+						Files: []CheckpointFile{
+							{ObjectPath: "checkpoints/test-ns/test-vm/cp-001/vmb-1-disk1.qcow2"},
+						},
+					},
+					{
+						ID: "cp-002", Type: "incremental", Parent: "cp-001", VMBackup: "vmb-2",
+						ReferencedBy: []string{"backup-day2", "backup-day3"},
+						Files: []CheckpointFile{
+							{ObjectPath: "checkpoints/test-ns/test-vm/cp-002/vmb-2-disk1.qcow2"},
+						},
+					},
+					{
+						ID: "cp-003", Type: "incremental", Parent: "cp-002", VMBackup: "vmb-3",
+						ReferencedBy: []string{"backup-day3"},
+						Files: []CheckpointFile{
+							{ObjectPath: "checkpoints/test-ns/test-vm/cp-003/vmb-3-disk1.qcow2"},
+						},
+					},
+				},
+			},
+			validateResult: func(t *testing.T, store *MockObjectStore) {
+				data, err := store.GetObjectBytes("checkpoints/test-ns/test-vm/index.json")
+				if err != nil {
+					t.Fatalf("failed to get index: %v", err)
+				}
+
+				var idx VMIndex
+				if err := json.Unmarshal(data, &idx); err != nil {
+					t.Fatalf("failed to parse index: %v", err)
+				}
+
+				// Old chain checkpoints should be unchanged
+				cp001 := findCheckpoint(idx.Checkpoints, "cp-001")
+				if cp001 == nil {
+					t.Fatal("cp-001 not found")
+				}
+				assertReferencedBy(t, "cp-001", cp001.ReferencedBy,
+					[]string{"backup-day1", "backup-day2", "backup-day3"})
+
+				cp002 := findCheckpoint(idx.Checkpoints, "cp-002")
+				if cp002 == nil {
+					t.Fatal("cp-002 not found")
+				}
+				assertReferencedBy(t, "cp-002", cp002.ReferencedBy,
+					[]string{"backup-day2", "backup-day3"})
+
+				cp003 := findCheckpoint(idx.Checkpoints, "cp-003")
+				if cp003 == nil {
+					t.Fatal("cp-003 not found")
+				}
+				assertReferencedBy(t, "cp-003", cp003.ReferencedBy,
+					[]string{"backup-day3"})
+
+				// New full backup starts fresh chain
+				cp004 := findCheckpoint(idx.Checkpoints, "cp-004")
+				if cp004 == nil {
+					t.Fatal("cp-004 not found")
+				}
+				assertReferencedBy(t, "cp-004", cp004.ReferencedBy,
+					[]string{"backup-day4"})
+
+				// Verify cp-004 has no parent
+				if cp004.Parent != "" {
+					t.Errorf("cp-004 should have no parent, got %q", cp004.Parent)
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := NewMockObjectStore("test-bucket", "")
+
+			if tt.existingIndex != nil {
+				data, _ := json.Marshal(tt.existingIndex)
+				indexPath := fmt.Sprintf("checkpoints/%s/%s/index.json",
+					tt.config.VMNamespace, tt.config.VMName)
+				_ = store.PutObjectBytes(indexPath, data)
+
+				for _, cp := range tt.existingIndex.Checkpoints {
+					for _, f := range cp.Files {
+						if f.ObjectPath != "" {
+							_ = store.PutObjectBytes(f.ObjectPath, []byte("fake-qcow2"))
+						}
+					}
+				}
+			}
+
+			err := updateVMIndex(context.Background(), store, tt.config, tt.files, tt.archived, logr.Discard())
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			if tt.validateResult != nil {
+				tt.validateResult(t, store)
+			}
+		})
+	}
+}
+
+// findCheckpoint returns a pointer to the checkpoint with the given ID, or nil.
+func findCheckpoint(checkpoints []CheckpointEntry, id string) *CheckpointEntry {
+	for i := range checkpoints {
+		if checkpoints[i].ID == id {
+			return &checkpoints[i]
+		}
+	}
+	return nil
+}
+
+// assertReferencedBy asserts that a checkpoint's ReferencedBy matches expected exactly.
+func assertReferencedBy(t *testing.T, cpID string, got, want []string) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Errorf("checkpoint %s: ReferencedBy = %v (len %d), want %v (len %d)",
+			cpID, got, len(got), want, len(want))
+		return
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			t.Errorf("checkpoint %s: ReferencedBy[%d] = %q, want %q",
+				cpID, i, got[i], want[i])
+		}
+	}
+}
+
 func TestUpdateBackupManifests(t *testing.T) {
 	tests := []struct {
 		name           string
