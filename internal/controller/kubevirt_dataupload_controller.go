@@ -70,6 +70,14 @@ const (
 	vmbtLabelVMName = "kubevirt-datamover.io/vm-name"
 	// AnnotationVMBTName is the annotation key for the generated VMBT name on a DataUpload
 	AnnotationVMBTName = "kubevirt-datamover.io/vmbt-name"
+
+	// k8sGenerateNameRandomLen is the number of random characters K8s appends to GenerateName
+	k8sGenerateNameRandomLen = 5
+
+	// maxVMBNameLen is the max allowed VMB name length. KubeVirt constructs a
+	// hotplug volume name as "<vmb-name>-backup-target-pvc" which must be a
+	// valid DNS label (≤ 63 chars). Reserve 18 chars for that suffix.
+	maxVMBNameLen = 63 - len("-backup-target-pvc") // = 45
 )
 
 // KubeVirtDataUploadReconciler reconciles DataUpload objects where Spec.DataMover is "kubevirt"
@@ -631,7 +639,7 @@ func (r *KubeVirtDataUploadReconciler) handlePrepared(ctx context.Context, logge
 	podToCreate := buildDatamoverPod(podConfig)
 
 	// Use GenerateName instead of a fixed name
-	podToCreate.GenerateName = fmt.Sprintf("%s%s-", common.DatamoverPodNamePrefix, du.Name)
+	podToCreate.GenerateName = safeGenerateNamePrefix(fmt.Sprintf("%s%s-", common.DatamoverPodNamePrefix, du.Name), 63)
 	podToCreate.Name = ""
 
 	// Set owner reference so pod is cleaned up when DataUpload is deleted
@@ -889,7 +897,7 @@ func (r *KubeVirtDataUploadReconciler) ensureTempPVC(ctx context.Context, logger
 	// Create new PVC
 	pvc := &corev1.PersistentVolumeClaim{
 		ObjectMeta: metav1.ObjectMeta{
-			GenerateName: fmt.Sprintf("kubevirt-backup-%s-", du.Name),
+			GenerateName: safeGenerateNamePrefix(fmt.Sprintf("kubevirt-backup-%s-", du.Name), 63),
 			Namespace:    namespace,
 			Labels: map[string]string{
 				common.LabelDataUploadName: du.Name,
@@ -962,7 +970,7 @@ func (r *KubeVirtDataUploadReconciler) prepareVMBackupTracker(ctx context.Contex
 	apiGroup := "kubevirt.io"
 	vmbt := &kubevirtbackupv1alpha1.VirtualMachineBackupTracker{
 		ObjectMeta: metav1.ObjectMeta{
-			GenerateName: fmt.Sprintf("vmbt-%s-", vmName),
+			GenerateName: safeGenerateNamePrefix(fmt.Sprintf("vmbt-%s-", vmName), 63),
 			Namespace:    vmNamespace,
 			Labels: map[string]string{
 				common.LabelDataUploadName: du.Name,
@@ -1086,7 +1094,7 @@ func (r *KubeVirtDataUploadReconciler) ensureVMBackup(ctx context.Context, logge
 	apiGroup := "backup.kubevirt.io"
 	vmb := &kubevirtbackupv1alpha1.VirtualMachineBackup{
 		ObjectMeta: metav1.ObjectMeta{
-			GenerateName: fmt.Sprintf("vmb-%s-", du.Name),
+			GenerateName: safeGenerateNamePrefix(fmt.Sprintf("vmb-%s-", du.Name), maxVMBNameLen),
 			Namespace:    namespace,
 			Labels: map[string]string{
 				common.LabelDataUploadName: du.Name,
@@ -1158,6 +1166,19 @@ func getVeleroBackupName(du *velerov2alpha1.DataUpload) string {
 		return ""
 	}
 	return du.Labels[common.LabelVeleroBackupName]
+}
+
+// safeGenerateNamePrefix truncates a GenerateName prefix so that the final
+// name (prefix + 5 random chars) does not exceed maxNameLen.
+func safeGenerateNamePrefix(prefix string, maxNameLen int) string {
+	maxPrefix := maxNameLen - k8sGenerateNameRandomLen
+	if maxPrefix < 1 {
+		maxPrefix = 1
+	}
+	if len(prefix) > maxPrefix {
+		prefix = prefix[:maxPrefix]
+	}
+	return prefix
 }
 
 // buildDatamoverPodConfig assembles the configuration for the datamover pod

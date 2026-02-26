@@ -5048,3 +5048,72 @@ func TestLookupLatestVMBTFromBSL(t *testing.T) {
 		})
 	}
 }
+
+func TestSafeGenerateNamePrefix(t *testing.T) {
+	tests := []struct {
+		name       string
+		prefix     string
+		maxNameLen int
+		expected   string
+	}{
+		{
+			name:       "short prefix is unchanged",
+			prefix:     "short-prefix-",
+			maxNameLen: 63,
+			expected:   "short-prefix-",
+		},
+		{
+			name:       "prefix exactly at limit is unchanged",
+			prefix:     strings.Repeat("a", 58), // 58 = 63 - 5
+			maxNameLen: 63,
+			expected:   strings.Repeat("a", 58),
+		},
+		{
+			name:       "long prefix is truncated",
+			prefix:     "a-very-long-prefix-that-will-be-truncated-and-should-not-exceed-the-limit-",
+			maxNameLen: 63,
+			expected:   "a-very-long-prefix-that-will-be-truncated-and-should-no", // 58 chars
+		},
+		{
+			name:       "long prefix for VMB is truncated",
+			prefix:     "vmb-a-very-long-dataupload-name-that-exceeds-the-limit-for-kubevirt-hotplug-",
+			maxNameLen: maxVMBNameLen, // 45
+			expected:   "vmb-a-very-long-dataupload-name-that-e", // 40 chars = 45 - 5
+		},
+		{
+			name:       "edge case: maxNameLen < random part",
+			prefix:     "short-",
+			maxNameLen: 4,
+			expected:   "s", // maxPrefix becomes 1
+		},
+		{
+			name:       "edge case: maxNameLen == random part",
+			prefix:     "short-",
+			maxNameLen: 5,
+			expected:   "s", // maxPrefix becomes 1
+		},
+		{
+			name:       "edge case: maxNameLen == random part + 1",
+			prefix:     "short-",
+			maxNameLen: 6,
+			expected:   "s", // maxPrefix is 1, so prefix is truncated to 1
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := safeGenerateNamePrefix(tt.prefix, tt.maxNameLen)
+			if result != tt.expected {
+				t.Errorf("safeGenerateNamePrefix() = %q, want %q", result, tt.expected)
+			}
+			// Sanity check length
+			maxPrefixLen := tt.maxNameLen - k8sGenerateNameRandomLen
+			if maxPrefixLen < 1 {
+				maxPrefixLen = 1
+			}
+			if len(result) > maxPrefixLen {
+				t.Errorf("result length %d exceeds max prefix length %d", len(result), maxPrefixLen)
+			}
+		})
+	}
+}
