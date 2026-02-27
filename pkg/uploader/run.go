@@ -356,6 +356,14 @@ func updateVMIndex(
 	found := false
 	for i, cp := range vmIndex.Checkpoints {
 		if cp.ID == checkpoint.ID {
+			// Guard against self-referential parent. This can happen when an
+			// incremental backup re-runs: the checkpoint is already the last
+			// entry, so validateCheckpointChain returns its own ID as the
+			// latest valid checkpoint, causing Parent to point to itself.
+			// Preserve the original parent from the existing entry instead.
+			if checkpoint.Parent == checkpoint.ID {
+				checkpoint.Parent = cp.Parent
+			}
 			// Merge ReferencedBy from the existing entry so we don't lose
 			// backup names accumulated by previous runs.
 			checkpoint.ReferencedBy = mergeReferencedBy(cp.ReferencedBy, checkpoint.ReferencedBy)
@@ -689,12 +697,17 @@ func propagateReferencedBy(checkpoints []CheckpointEntry, startID, backupName st
 // mergeReferencedBy returns the union of two ReferencedBy slices, preserving
 // order (existing entries first) and eliminating duplicates.
 func mergeReferencedBy(existing, additional []string) []string {
-	seen := make(map[string]bool, len(existing))
+	seen := make(map[string]bool, len(existing)+len(additional))
+	// Deduplicate existing entries too — corrupted index data or older
+	// buggy writes may have introduced duplicates that would otherwise
+	// be carried forward on every merge.
+	merged := make([]string, 0, len(existing)+len(additional))
 	for _, v := range existing {
-		seen[v] = true
+		if !seen[v] {
+			merged = append(merged, v)
+			seen[v] = true
+		}
 	}
-	merged := make([]string, len(existing))
-	copy(merged, existing)
 	for _, v := range additional {
 		if !seen[v] {
 			merged = append(merged, v)

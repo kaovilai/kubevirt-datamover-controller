@@ -626,6 +626,24 @@ func TestMergeReferencedBy(t *testing.T) {
 			additional: []string{"backup-2", "backup-3"},
 			expected:   []string{"backup-1", "backup-2", "backup-3"},
 		},
+		{
+			name:       "duplicates in existing only",
+			existing:   []string{"backup-1", "backup-1", "backup-2"},
+			additional: []string{"backup-3"},
+			expected:   []string{"backup-1", "backup-2", "backup-3"},
+		},
+		{
+			name:       "duplicates in both slices",
+			existing:   []string{"backup-1", "backup-2", "backup-1"},
+			additional: []string{"backup-2", "backup-3"},
+			expected:   []string{"backup-1", "backup-2", "backup-3"},
+		},
+		{
+			name:       "all entries are the same",
+			existing:   []string{"backup-1", "backup-1"},
+			additional: []string{"backup-1"},
+			expected:   []string{"backup-1"},
+		},
 	}
 
 	for _, tt := range tests {
@@ -1115,6 +1133,95 @@ func assertReferencedBy(t *testing.T, cpID string, got, want []string) {
 				cpID, i, got[i], want[i])
 		}
 	}
+}
+
+// TestUpdateVMIndex_DedupIncrementalPreservesParent verifies that when an
+// incremental backup re-runs with the same checkpoint ID, the Parent field
+// is preserved from the existing entry (not corrupted to a self-reference).
+func TestUpdateVMIndex_DedupIncrementalPreservesParent(t *testing.T) {
+	store := NewMockObjectStore("test-bucket", "")
+
+	existingIndex := &VMIndex{
+		VMName:    "test-vm",
+		Namespace: "test-ns",
+		Checkpoints: []CheckpointEntry{
+			{
+				ID: "cp-001", Type: "full", VMBackup: "vmb-1",
+				ReferencedBy: []string{"backup-day1", "backup-day2"},
+				Files: []CheckpointFile{
+					{ObjectPath: "checkpoints/test-ns/test-vm/cp-001/vmb-1-disk1.qcow2"},
+				},
+			},
+			{
+				ID: "cp-002", Type: "incremental", Parent: "cp-001", VMBackup: "vmb-2",
+				ReferencedBy: []string{"backup-day2"},
+				Files: []CheckpointFile{
+					{ObjectPath: "checkpoints/test-ns/test-vm/cp-002/vmb-2-disk1.qcow2"},
+				},
+			},
+		},
+	}
+
+	// Seed the store with the existing index and checkpoint files
+	data, _ := json.Marshal(existingIndex)
+	indexPath := "checkpoints/test-ns/test-vm/index.json"
+	_ = store.PutObjectBytes(indexPath, data)
+	for _, cp := range existingIndex.Checkpoints {
+		for _, f := range cp.Files {
+			if f.ObjectPath != "" {
+				_ = store.PutObjectBytes(f.ObjectPath, []byte("fake-qcow2"))
+			}
+		}
+	}
+
+	config := &UploaderConfig{
+		BSLBucket:        "test-bucket",
+		VMName:           "test-vm",
+		VMNamespace:      "test-ns",
+		CheckpointName:   "cp-002",
+		BackupType:       "incremental",
+		VMBName:          "vmb-2",
+		VeleroBackupName: "backup-retry",
+	}
+	files := []CheckpointFile{
+		{Filename: "vmb-2-disk1.qcow2", DiskName: "disk1", Size: 512,
+			ObjectPath: "checkpoints/test-ns/test-vm/cp-002/vmb-2-disk1.qcow2"},
+	}
+
+	err := updateVMIndex(context.Background(), store, config, files, &archivedPaths{}, logr.Discard())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	result, err := store.GetObjectBytes(indexPath)
+	if err != nil {
+		t.Fatalf("failed to get index: %v", err)
+	}
+
+	var idx VMIndex
+	if err := json.Unmarshal(result, &idx); err != nil {
+		t.Fatalf("failed to parse index: %v", err)
+	}
+
+	cp002 := findCheckpoint(idx.Checkpoints, "cp-002")
+	if cp002 == nil {
+		t.Fatal("cp-002 not found")
+	}
+	// Parent must remain "cp-001", not get corrupted to "cp-002"
+	if cp002.Parent != "cp-001" {
+		t.Errorf("cp-002 Parent = %q, want %q", cp002.Parent, "cp-001")
+	}
+	// ReferencedBy should merge old and new
+	assertReferencedBy(t, "cp-002", cp002.ReferencedBy,
+		[]string{"backup-day2", "backup-retry"})
+
+	// Parent checkpoint should also get the propagated backup name
+	cp001 := findCheckpoint(idx.Checkpoints, "cp-001")
+	if cp001 == nil {
+		t.Fatal("cp-001 not found")
+	}
+	assertReferencedBy(t, "cp-001", cp001.ReferencedBy,
+		[]string{"backup-day1", "backup-day2", "backup-retry"})
 }
 
 func TestUpdateBackupManifests(t *testing.T) {
