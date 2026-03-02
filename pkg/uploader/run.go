@@ -356,7 +356,17 @@ func updateVMIndex(
 	found := false
 	for i, cp := range vmIndex.Checkpoints {
 		if cp.ID == checkpoint.ID {
-			// Update existing entry
+			// Guard against self-referential parent. This can happen when an
+			// incremental backup re-runs: the checkpoint is already the last
+			// entry, so validateCheckpointChain returns its own ID as the
+			// latest valid checkpoint, causing Parent to point to itself.
+			// Preserve the original parent from the existing entry instead.
+			if checkpoint.Parent == checkpoint.ID {
+				checkpoint.Parent = cp.Parent
+			}
+			// Merge ReferencedBy from the existing entry so we don't lose
+			// backup names accumulated by previous runs.
+			checkpoint.ReferencedBy = mergeReferencedBy(cp.ReferencedBy, checkpoint.ReferencedBy)
 			vmIndex.Checkpoints[i] = checkpoint
 			found = true
 			break
@@ -364,6 +374,14 @@ func updateVMIndex(
 	}
 	if !found {
 		vmIndex.Checkpoints = append(vmIndex.Checkpoints, checkpoint)
+	}
+
+	// Propagate the current backup name to all ancestor checkpoints in
+	// the parent chain. An incremental backup depends on every checkpoint
+	// back to the base full backup, so each ancestor must list this backup
+	// in its ReferencedBy for correct garbage-collection decisions.
+	if config.VeleroBackupName != "" {
+		propagateReferencedBy(vmIndex.Checkpoints, checkpoint.ID, config.VeleroBackupName)
 	}
 
 	vmIndex.LastUpdated = time.Now().UTC()
@@ -638,6 +656,65 @@ var newKubeClient = func() (client.Client, error) {
 	}
 
 	return k8sClient, nil
+}
+
+// propagateReferencedBy walks the parent chain of the given checkpoint and
+// adds backupName to each ancestor's ReferencedBy list (skipping the checkpoint
+// itself, which is handled during creation). This ensures that every checkpoint
+// in the chain correctly lists all backups that depend on it.
+func propagateReferencedBy(checkpoints []CheckpointEntry, startID, backupName string) {
+	// Build index for O(1) lookup by ID → slice position.
+	idxMap := make(map[string]int, len(checkpoints))
+	for i, cp := range checkpoints {
+		idxMap[cp.ID] = i
+	}
+
+	// Find the starting checkpoint to get its parent.
+	startIdx, ok := idxMap[startID]
+	if !ok {
+		return
+	}
+	parentID := checkpoints[startIdx].Parent
+
+	// Walk the parent chain, adding backupName to each ancestor.
+	visited := make(map[string]bool)
+	for parentID != "" {
+		if visited[parentID] {
+			break // cycle guard
+		}
+		visited[parentID] = true
+
+		idx, ok := idxMap[parentID]
+		if !ok {
+			break // parent not found
+		}
+		checkpoints[idx].ReferencedBy = mergeReferencedBy(
+			checkpoints[idx].ReferencedBy, []string{backupName})
+		parentID = checkpoints[idx].Parent
+	}
+}
+
+// mergeReferencedBy returns the union of two ReferencedBy slices, preserving
+// order (existing entries first) and eliminating duplicates.
+func mergeReferencedBy(existing, additional []string) []string {
+	seen := make(map[string]bool, len(existing)+len(additional))
+	// Deduplicate existing entries too — corrupted index data or older
+	// buggy writes may have introduced duplicates that would otherwise
+	// be carried forward on every merge.
+	merged := make([]string, 0, len(existing)+len(additional))
+	for _, v := range existing {
+		if !seen[v] {
+			merged = append(merged, v)
+			seen[v] = true
+		}
+	}
+	for _, v := range additional {
+		if !seen[v] {
+			merged = append(merged, v)
+			seen[v] = true
+		}
+	}
+	return merged
 }
 
 // buildCheckpointChain builds the ordered list of checkpoints needed for restore.
