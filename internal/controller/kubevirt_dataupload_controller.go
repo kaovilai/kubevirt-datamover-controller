@@ -66,8 +66,6 @@ const (
 	// defaultCredentialKey is the default key in BSL credential secrets
 	defaultCredentialKey = "cloud"
 
-	// vmbtLabelVMName is the label key for the VM name on a VirtualMachineBackupTracker
-	vmbtLabelVMName = "kubevirt-datamover.io/vm-name"
 	// AnnotationVMBTName is the annotation key for the generated VMBT name on a DataUpload
 	AnnotationVMBTName = "kubevirt-datamover.io/vmbt-name"
 
@@ -221,6 +219,8 @@ func (r *KubeVirtDataUploadReconciler) handleNew(ctx context.Context, logger log
 
 // handleAccepted processes DataUploads in Accepted phase
 // Creates VMBT/VMB and transitions to Prepared when ready
+//
+//nolint:gocyclo // Phase handler with necessary validation steps
 func (r *KubeVirtDataUploadReconciler) handleAccepted(ctx context.Context, logger logr.Logger, du *velerov2alpha1.DataUpload) (ctrl.Result, error) {
 	logger.Info("Handling Accepted phase DataUpload")
 
@@ -273,6 +273,17 @@ func (r *KubeVirtDataUploadReconciler) handleAccepted(ctx context.Context, logge
 	vmb, err := r.findVMBForDataUpload(ctx, du, vmRef.Namespace)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("failed to check for existing VMB: %w", err)
+	}
+
+	if vmb == nil && du.Annotations != nil && du.Annotations[AnnotationVMBTName] != "" {
+		// The VMBT annotation is set but the VMB isn't visible yet in the cached client.
+		// This happens when a rapid re-reconcile (triggered by the annotation update) runs
+		// before the informer cache has the VMB. Requeue to let the cache catch up.
+		// Without this guard, prepareVMBackupTracker would delete the VMBT that the
+		// (not-yet-visible) VMB references, leaving the VMB permanently stuck.
+		logger.Info("VMBT already prepared but VMB not yet visible in cache, requeuing",
+			"vmbtName", du.Annotations[AnnotationVMBTName])
+		return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
 	}
 
 	if vmb == nil {
@@ -335,12 +346,29 @@ func (r *KubeVirtDataUploadReconciler) handleAccepted(ctx context.Context, logge
 			// Requeue to check status
 			return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
 		}
-	} else {
+	} else if vmb != nil {
 		logger.V(1).Info("VirtualMachineBackup already exists, skipping VMBT preparation", "vmb", vmb.Name)
 	}
 
 	// Step 5: Check VMB status
 	if vmb.Status == nil {
+		// Before blindly requeuing, check if the VMB's BackupTracker still exists.
+		// If the VMBT was deleted (by a concurrent DataUpload), KubeVirt will never
+		// set status on this VMB, so we'd requeue forever.
+		vmbtName := vmb.Spec.Source.Name
+		vmbt := &kubevirtbackupv1alpha1.VirtualMachineBackupTracker{}
+		if err := r.Get(ctx, types.NamespacedName{Name: vmbtName, Namespace: vmb.Namespace}, vmbt); err != nil {
+			if errors.IsNotFound(err) {
+				logger.Error(nil, "VirtualMachineBackup's BackupTracker was deleted before processing started",
+					"vmb", vmb.Name, "vmbt", vmbtName)
+				if updateErr := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed,
+					fmt.Sprintf("VMBackup stuck: BackupTracker %s no longer exists", vmbtName)); updateErr != nil {
+					return ctrl.Result{}, updateErr
+				}
+				return ctrl.Result{}, nil
+			}
+			return ctrl.Result{}, fmt.Errorf("failed to check BackupTracker %s existence: %w", vmbtName, err)
+		}
 		logger.Info("VirtualMachineBackup status not yet available, requeuing")
 		return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
 	}
@@ -348,24 +376,27 @@ func (r *KubeVirtDataUploadReconciler) handleAccepted(ctx context.Context, logge
 	return r.evaluateVMBackupStatus(ctx, logger, du, vmb)
 }
 
-// evaluateVMBackupStatus checks the Done and Progressing conditions on a VirtualMachineBackup
-// to determine whether the backup succeeded, failed, or is still running.
-// KubeVirt uses both conditions together:
+// evaluateVMBackupStatus checks conditions on a VirtualMachineBackup to determine
+// whether the backup succeeded, failed, or is still running.
+// KubeVirt condition combinations:
 //
-//	Progressing=True  + Done=False  → backup still running
-//	Progressing=False + Done=True   → backup completed successfully
-//	Progressing=False + Done=False  → backup failed
+//	Progressing=True  + Done=False       → backup still running
+//	Progressing=False + Done=True        → backup completed successfully
+//	Progressing=False + Done=False       → backup failed
+//	Initializing=True + Progressing=False + Done=absent → stuck (e.g. VMBT deleted)
 func (r *KubeVirtDataUploadReconciler) evaluateVMBackupStatus(
 	ctx context.Context, logger logr.Logger,
 	du *velerov2alpha1.DataUpload, vmb *kubevirtbackupv1alpha1.VirtualMachineBackup,
 ) (ctrl.Result, error) {
-	var doneCond, progressingCond *kubevirtbackupv1alpha1.Condition
+	var doneCond, progressingCond, initializingCond *kubevirtbackupv1alpha1.Condition
 	for i := range vmb.Status.Conditions {
 		switch vmb.Status.Conditions[i].Type {
 		case kubevirtbackupv1alpha1.ConditionDone:
 			doneCond = &vmb.Status.Conditions[i]
 		case kubevirtbackupv1alpha1.ConditionProgressing:
 			progressingCond = &vmb.Status.Conditions[i]
+		case kubevirtbackupv1alpha1.ConditionInitializing:
+			initializingCond = &vmb.Status.Conditions[i]
 		}
 	}
 
@@ -394,6 +425,33 @@ func (r *KubeVirtDataUploadReconciler) evaluateVMBackupStatus(
 		}
 		// Done=False but Progressing is True or absent → backup still running
 		logger.Info("VirtualMachineBackup still in progress (Done=False, waiting for completion)", "vmb", vmb.Name)
+	}
+
+	// Detect stuck initialization: Initializing=True + Progressing=False + no Done condition.
+	// This can be transient (e.g. PVC being hotplugged to VMI) or permanent (VMBT deleted).
+	// To distinguish, we verify the VMB's referenced BackupTracker still exists.
+	// If it's gone, the VMB will never progress — fail immediately.
+	// If it still exists, this is a normal transient state — keep requeuing.
+	if doneCond == nil && initializingCond != nil && initializingCond.Status == corev1.ConditionTrue &&
+		progressingCond != nil && progressingCond.Status == corev1.ConditionFalse {
+		vmbtName := vmb.Spec.Source.Name
+		vmbt := &kubevirtbackupv1alpha1.VirtualMachineBackupTracker{}
+		if err := r.Get(ctx, types.NamespacedName{Name: vmbtName, Namespace: vmb.Namespace}, vmbt); err != nil {
+			if errors.IsNotFound(err) {
+				logger.Error(nil, "VirtualMachineBackup's BackupTracker was deleted, failing",
+					"vmb", vmb.Name, "vmbt", vmbtName)
+				if updateErr := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed,
+					fmt.Sprintf("VMBackup stuck: BackupTracker %s no longer exists", vmbtName)); updateErr != nil {
+					return ctrl.Result{}, updateErr
+				}
+				return ctrl.Result{}, nil
+			}
+			// Transient API error — requeue
+			return ctrl.Result{}, fmt.Errorf("failed to check BackupTracker %s existence: %w", vmbtName, err)
+		}
+		// VMBT exists, initialization is in progress (e.g. PVC being attached) — keep waiting
+		logger.Info("VirtualMachineBackup initializing (VMBT exists, waiting for progress)",
+			"vmb", vmb.Name, "reason", initializingCond.Reason)
 	}
 
 	// No Done condition yet, or backup still running - requeue
@@ -502,6 +560,8 @@ func (r *KubeVirtDataUploadReconciler) validateBSLCheckpoint(ctx context.Context
 
 // handlePrepared processes DataUploads in Prepared phase
 // Rebinds PV to OADP namespace, launches datamover pod, and transitions to InProgress
+//
+//nolint:gocyclo // Phase handler with necessary validation steps
 func (r *KubeVirtDataUploadReconciler) handlePrepared(ctx context.Context, logger logr.Logger, du *velerov2alpha1.DataUpload) (ctrl.Result, error) {
 	logger.Info("Handling Prepared phase DataUpload")
 
@@ -559,7 +619,7 @@ func (r *KubeVirtDataUploadReconciler) handlePrepared(ctx context.Context, logge
 	}
 
 	// Check if PV has already been rebound (idempotency)
-	reboundPVCName := fmt.Sprintf("%s%s", common.ReboundPVCNamePrefix, du.Name)
+	reboundPVCName := common.SafeResourceName(common.ReboundPVCNamePrefix, du.Name)
 	reboundPVC := &corev1.PersistentVolumeClaim{}
 	err = r.Get(ctx, types.NamespacedName{Name: reboundPVCName, Namespace: podNamespace}, reboundPVC)
 	pvAlreadyRebound := err == nil && reboundPVC.Status.Phase == corev1.ClaimBound
@@ -567,14 +627,25 @@ func (r *KubeVirtDataUploadReconciler) handlePrepared(ctx context.Context, logge
 	if !pvAlreadyRebound {
 		// Rebind PV from VM namespace to OADP namespace
 		// This allows the datamover pod to access both the backup data AND credentials
-		sourcePVCName := fmt.Sprintf("%s%s", common.TempPVCNamePrefix, du.Name)
+		//
+		// The temp PVC was created with GenerateName (random suffix), so we read
+		// the actual name from the VMB spec rather than recomputing it.
+		if vmb.Spec.PvcName == nil || *vmb.Spec.PvcName == "" {
+			err := fmt.Errorf("VirtualMachineBackup %s has no PVC name in spec", vmb.Name)
+			logger.Error(err, "Cannot determine source PVC for rebinding")
+			if updateErr := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed, err.Error()); updateErr != nil {
+				return ctrl.Result{}, updateErr
+			}
+			return ctrl.Result{}, nil
+		}
+		sourcePVCName := *vmb.Spec.PvcName
 
 		logger.Info("Rebinding PV from VM namespace to OADP namespace",
 			"sourcePVC", sourcePVCName,
 			"sourceNamespace", vmRef.Namespace,
 			"targetNamespace", podNamespace)
 
-		rebindResult, err := r.rebindPVToNamespace(ctx, logger, sourcePVCName, vmRef.Namespace, podNamespace, du.Name)
+		rebindResult, err := r.rebindPVToNamespace(ctx, logger, sourcePVCName, vmRef.Namespace, podNamespace, du.Name, string(du.UID))
 		if err != nil {
 			// Fail without retry: PV rebind is a multi-step operation (delete PVC, patch PV, create new PVC).
 			// If it fails partway through, automatic retries could leave resources in an inconsistent state.
@@ -742,8 +813,8 @@ func (r *KubeVirtDataUploadReconciler) cleanupDatamoverResources(ctx context.Con
 	}
 
 	// Delete the rebound PVC and PV
-	reboundPVCName := fmt.Sprintf("%s%s", common.ReboundPVCNamePrefix, du.Name)
-	if err := r.cleanupReboundPVCAndPV(ctx, logger, reboundPVCName, podNamespace, du.Name); err != nil {
+	reboundPVCName := common.SafeResourceName(common.ReboundPVCNamePrefix, du.Name)
+	if err := r.cleanupReboundPVCAndPV(ctx, logger, reboundPVCName, podNamespace, string(du.UID)); err != nil {
 		logger.Error(err, "Failed to cleanup rebound PVC and PV", "pvc", reboundPVCName)
 		// Continue - don't block completion on cleanup failures
 	}
@@ -768,7 +839,7 @@ func (r *KubeVirtDataUploadReconciler) cleanupVMBackupResources(ctx context.Cont
 	}
 
 	vmbtList := &kubevirtbackupv1alpha1.VirtualMachineBackupTrackerList{}
-	if err := r.List(ctx, vmbtList, client.InNamespace(vmNamespace), client.MatchingLabels{vmbtLabelVMName: vmName}); err != nil {
+	if err := r.List(ctx, vmbtList, client.InNamespace(vmNamespace), client.MatchingLabels{common.LabelVMNameHash: common.HashForLabel(vmName)}); err != nil {
 		logger.Error(err, "Failed to list VMBTs for cleanup")
 	} else {
 		for i := range vmbtList.Items {
@@ -933,7 +1004,7 @@ func (r *KubeVirtDataUploadReconciler) prepareVMBackupTracker(ctx context.Contex
 	// Delete any existing VMBT for this VM before creating a new one.
 	// This ensures we always start from the state restored from S3.
 	existingVMBTList := &kubevirtbackupv1alpha1.VirtualMachineBackupTrackerList{}
-	if err := r.List(ctx, existingVMBTList, client.InNamespace(vmNamespace), client.MatchingLabels{vmbtLabelVMName: vmName}); err != nil {
+	if err := r.List(ctx, existingVMBTList, client.InNamespace(vmNamespace), client.MatchingLabels{common.LabelVMNameHash: common.HashForLabel(vmName)}); err != nil {
 		return nil, fmt.Errorf("failed to list existing VMBTs: %w", err)
 	}
 	for i := range existingVMBTList.Items {
@@ -975,10 +1046,12 @@ func (r *KubeVirtDataUploadReconciler) prepareVMBackupTracker(ctx context.Contex
 			GenerateName: safeGenerateNamePrefix(fmt.Sprintf("vmbt-%s-", vmName), 63),
 			Namespace:    vmNamespace,
 			Labels: map[string]string{
-				vmbtLabelVMName: vmName,
+				common.LabelVMNameHash:    common.HashForLabel(vmName),
+				common.LabelDataUploadUID: string(du.UID),
 			},
 			Annotations: map[string]string{
 				common.AnnotationDataUploadName: du.Name,
+				common.AnnotationVMName:         vmName,
 			},
 		},
 		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupTrackerSpec{
@@ -1203,9 +1276,6 @@ func (r *KubeVirtDataUploadReconciler) buildDatamoverPodConfig(
 		return nil, fmt.Errorf("BSL %s has no credential secret configured", bsl.Name)
 	}
 
-	// Get PVC name
-	pvcName := fmt.Sprintf("%s%s", common.TempPVCNamePrefix, du.Name)
-
 	// Determine datamover image
 	image := r.DatamoverImage
 	if image == "" {
@@ -1237,7 +1307,7 @@ func (r *KubeVirtDataUploadReconciler) buildDatamoverPodConfig(
 		DataUploadUID:        string(du.UID),
 		VMBName:              vmb.Name,
 		VMBTName:             vmbtName,
-		SourcePVCName:        pvcName,
+		SourcePVCName:        "", // overridden by handlePrepared with the rebound PVC name
 		Labels:               make(map[string]string),
 	}, nil
 }

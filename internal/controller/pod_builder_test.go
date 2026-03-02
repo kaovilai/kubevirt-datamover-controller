@@ -67,8 +67,11 @@ func TestBuildDatamoverPod(t *testing.T) {
 				if pod.Labels[common.LabelDatamoverPod] != "uploader" {
 					t.Errorf("label %s = %q, want %q", common.LabelDatamoverPod, pod.Labels[common.LabelDatamoverPod], "uploader")
 				}
-				if pod.Labels[common.LabelDataUploadName] != "test-du" {
-					t.Errorf("label %s = %q, want %q", common.LabelDataUploadName, pod.Labels[common.LabelDataUploadName], "test-du")
+				if pod.Labels[common.LabelDataUploadUID] != "uid-12345" {
+					t.Errorf("label %s = %q, want %q", common.LabelDataUploadUID, pod.Labels[common.LabelDataUploadUID], "uid-12345")
+				}
+				if pod.Annotations[common.AnnotationDataUploadName] != "test-du" {
+					t.Errorf("annotation %s = %q, want %q", common.AnnotationDataUploadName, pod.Annotations[common.AnnotationDataUploadName], "test-du")
 				}
 
 				// Verify pod spec

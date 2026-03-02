@@ -514,6 +514,125 @@ func TestHandleAccepted(t *testing.T) {
 	_ = result // result.RequeueAfter may be > 0 depending on VMB state
 }
 
+// TestHandleAccepted_VMBTAnnotationSetButVMBNotVisible tests the race condition where
+// a rapid re-reconcile runs before the cached client sees the VMB that was just created.
+// The VMBT annotation is already set (from the first reconcile), so the controller must
+// NOT re-enter prepareVMBackupTracker (which would delete the VMBT the VMB references).
+// Instead it should requeue to let the cache catch up.
+func TestHandleAccepted_VMBTAnnotationSetButVMBNotVisible(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = kubevirtbackupv1alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+	_ = velerov1.AddToScheme(scheme)
+
+	vmName := "test-vm"
+	vmNamespace := "vm-ns"
+	duName := "test-du-race"
+
+	du := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      duName,
+			Namespace: "openshift-adp",
+			UID:       types.UID("du-uid-race"),
+			Annotations: map[string]string{
+				common.AnnotationVMName:      vmName,
+				common.AnnotationVMNamespace: vmNamespace,
+				// VMBT annotation already set by a previous reconcile
+				AnnotationVMBTName: "vmbt-test-vm-prev",
+			},
+		},
+		Spec: velerov2alpha1.DataUploadSpec{
+			DataMover:             common.DataMoverKubeVirt,
+			BackupStorageLocation: "default",
+			SourceNamespace:       vmNamespace,
+		},
+		Status: velerov2alpha1.DataUploadStatus{
+			Phase: velerov2alpha1.DataUploadPhaseAccepted,
+		},
+	}
+
+	bsl := &velerov1.BackupStorageLocation{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "default",
+			Namespace: "openshift-adp",
+		},
+		Spec: velerov1.BackupStorageLocationSpec{
+			Provider: "aws",
+			StorageType: velerov1.StorageType{
+				ObjectStorage: &velerov1.ObjectStorageLocation{
+					Bucket: "test-bucket",
+					Prefix: "velero",
+				},
+			},
+			Config: map[string]string{"region": "us-east-1"},
+			Credential: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "cloud-creds"},
+				Key:                  "cloud",
+			},
+		},
+		Status: velerov1.BackupStorageLocationStatus{
+			Phase: velerov1.BackupStorageLocationPhaseAvailable,
+		},
+	}
+
+	// Temp PVC that was already created by a previous reconcile
+	tempPVC := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "kubevirt-backup-" + duName + "-abc12",
+			Namespace: vmNamespace,
+			Labels: map[string]string{
+				common.LabelDataUploadUID: "du-uid-race",
+			},
+		},
+	}
+
+	// The VMBT that the (not-yet-visible) VMB references — must NOT be deleted
+	vmbt := &kubevirtbackupv1alpha1.VirtualMachineBackupTracker{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "vmbt-test-vm-prev",
+			Namespace: vmNamespace,
+			Labels: map[string]string{
+				common.LabelVMNameHash: common.HashForLabel(vmName),
+			},
+		},
+		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupTrackerSpec{},
+	}
+
+	// No VMB in the fake client — simulates cache lag where VMB isn't visible yet
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(du, bsl, tempPVC, vmbt).
+		Build()
+
+	r := &KubeVirtDataUploadReconciler{
+		Client:         fakeClient,
+		Scheme:         scheme,
+		Log:            logr.Discard(),
+		OADPNamespace:  "openshift-adp",
+		DatamoverImage: "quay.io/test/datamover:v1",
+	}
+
+	result, err := r.handleAccepted(context.Background(), logr.Discard(), du)
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Should requeue (not fail, not enter VMBT preparation)
+	if result.RequeueAfter == 0 {
+		t.Error("expected requeue but got none — controller should wait for cache to catch up")
+	}
+
+	// Verify the VMBT was NOT deleted
+	existingVMBT := &kubevirtbackupv1alpha1.VirtualMachineBackupTracker{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{
+		Name: "vmbt-test-vm-prev", Namespace: vmNamespace,
+	}, existingVMBT); err != nil {
+		t.Errorf("VMBT was deleted when it should have been preserved: %v", err)
+	}
+}
+
 func TestHandleAccepted_VMBStatusDetection(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = velerov2alpha1.AddToScheme(scheme)
@@ -525,6 +644,7 @@ func TestHandleAccepted_VMBStatusDetection(t *testing.T) {
 		vmbConditions []kubevirtbackupv1alpha1.Condition
 		expectedPhase velerov2alpha1.DataUploadPhase
 		expectRequeue bool
+		skipVMBT      bool // when true, do not create the VMBT (simulates deleted VMBT)
 	}{
 		{
 			name: "VMB Done True transitions to Prepared",
@@ -620,6 +740,41 @@ func TestHandleAccepted_VMBStatusDetection(t *testing.T) {
 			expectRequeue: true,
 		},
 		{
+			name: "VMB stuck initializing (VMBT deleted) transitions to Failed",
+			vmbConditions: []kubevirtbackupv1alpha1.Condition{
+				{
+					Type:   kubevirtbackupv1alpha1.ConditionInitializing,
+					Status: corev1.ConditionTrue,
+					Reason: "BackupTracker vmbt-test-vm does not exist",
+				},
+				{
+					Type:   kubevirtbackupv1alpha1.ConditionProgressing,
+					Status: corev1.ConditionFalse,
+					Reason: "BackupTracker vmbt-test-vm does not exist",
+				},
+			},
+			expectedPhase: velerov2alpha1.DataUploadPhaseFailed,
+			expectRequeue: false,
+			skipVMBT:      true, // VMBT is gone — this should fail
+		},
+		{
+			name: "VMB initializing with VMBT present requeues (PVC being attached)",
+			vmbConditions: []kubevirtbackupv1alpha1.Condition{
+				{
+					Type:   kubevirtbackupv1alpha1.ConditionInitializing,
+					Status: corev1.ConditionTrue,
+					Reason: "backup target PVC is being attached to VMI",
+				},
+				{
+					Type:   kubevirtbackupv1alpha1.ConditionProgressing,
+					Status: corev1.ConditionFalse,
+					Reason: "backup target PVC is being attached to VMI",
+				},
+			},
+			expectedPhase: velerov2alpha1.DataUploadPhaseAccepted, // unchanged — transient state
+			expectRequeue: true,
+		},
+		{
 			name:          "VMB no conditions requeues",
 			vmbConditions: []kubevirtbackupv1alpha1.Condition{},
 			expectedPhase: velerov2alpha1.DataUploadPhaseAccepted, // unchanged
@@ -689,7 +844,7 @@ func TestHandleAccepted_VMBStatusDetection(t *testing.T) {
 					Name:      "vmbt-" + vmName,
 					Namespace: vmNamespace,
 					Labels: map[string]string{
-						vmbtLabelVMName: vmName,
+						common.LabelVMNameHash: common.HashForLabel(vmName),
 					},
 				},
 				Spec: kubevirtbackupv1alpha1.VirtualMachineBackupTrackerSpec{
@@ -737,9 +892,13 @@ func TestHandleAccepted_VMBStatusDetection(t *testing.T) {
 				},
 			}
 
+			objects := []client.Object{du, pvc, vmb}
+			if !tt.skipVMBT {
+				objects = append(objects, vmbt)
+			}
 			fakeClient := fake.NewClientBuilder().
 				WithScheme(scheme).
-				WithObjects(du, pvc, vmbt, vmb).
+				WithObjects(objects...).
 				Build()
 
 			r := &KubeVirtDataUploadReconciler{
@@ -972,8 +1131,11 @@ func TestAnnotationConstants(t *testing.T) {
 	if common.AnnotationVMNamespace != "kubevirt-datamover.io/vm-namespace" {
 		t.Errorf("expected common.AnnotationVMNamespace='kubevirt-datamover.io/vm-namespace', got '%s'", common.AnnotationVMNamespace)
 	}
-	if common.LabelDataUploadName != "velero.io/dataupload-name" {
-		t.Errorf("expected common.LabelDataUploadName='velero.io/dataupload-name', got '%s'", common.LabelDataUploadName)
+	if common.AnnotationDataUploadName != "velero.io/dataupload-name" {
+		t.Errorf("expected common.AnnotationDataUploadName='velero.io/dataupload-name', got '%s'", common.AnnotationDataUploadName)
+	}
+	if common.LabelVMNameHash != "kubevirt-datamover.io/vm-name-hash" {
+		t.Errorf("expected common.LabelVMNameHash='kubevirt-datamover.io/vm-name-hash', got '%s'", common.LabelVMNameHash)
 	}
 	if common.LabelDataUploadUID != "velero.io/dataupload-uid" {
 		t.Errorf("expected common.LabelDataUploadUID='velero.io/dataupload-uid', got '%s'", common.LabelDataUploadUID)
@@ -1858,6 +2020,7 @@ func TestHandlePrepared(t *testing.T) {
 				}
 
 				checkpointName := "checkpoint-001"
+				tempPVCName := "kubevirt-backup-test-du-abc12"
 				vmb := &kubevirtbackupv1alpha1.VirtualMachineBackup{
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      "vmb-test-du",
@@ -1865,6 +2028,9 @@ func TestHandlePrepared(t *testing.T) {
 						Labels: map[string]string{
 							common.LabelDataUploadUID: "du-uid-123",
 						},
+					},
+					Spec: kubevirtbackupv1alpha1.VirtualMachineBackupSpec{
+						PvcName: &tempPVCName,
 					},
 					Status: &kubevirtbackupv1alpha1.VirtualMachineBackupStatus{
 						Type:           kubevirtbackupv1alpha1.Full,
@@ -1940,6 +2106,75 @@ func TestHandlePrepared(t *testing.T) {
 				},
 			},
 			setupObjects:  func() []runtime.Object { return nil },
+			expectError:   false,
+			expectedPhase: velerov2alpha1.DataUploadPhaseFailed,
+			expectRequeue: false,
+		},
+		{
+			name:         "VMB without PvcName fails when rebind is needed",
+			datamoverImg: "quay.io/test/datamover:v1",
+			du: &velerov2alpha1.DataUpload{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-du-no-pvc",
+					Namespace: "openshift-adp",
+					UID:       types.UID("du-uid-nopvc"),
+					Annotations: map[string]string{
+						common.AnnotationVMName:      "test-vm",
+						common.AnnotationVMNamespace: "vm-ns",
+						AnnotationVMBTName:           "vmbt-test-vm-abc",
+					},
+					Labels: map[string]string{
+						common.LabelVeleroBackupName: "velero-backup",
+					},
+				},
+				Spec: velerov2alpha1.DataUploadSpec{
+					DataMover:             common.DataMoverKubeVirt,
+					BackupStorageLocation: "default",
+					SourceNamespace:       "vm-ns",
+				},
+				Status: velerov2alpha1.DataUploadStatus{
+					Phase: velerov2alpha1.DataUploadPhasePrepared,
+				},
+			},
+			setupObjects: func() []runtime.Object {
+				bsl := &velerov1.BackupStorageLocation{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "default",
+						Namespace: "openshift-adp",
+					},
+					Spec: velerov1.BackupStorageLocationSpec{
+						Provider: "aws",
+						StorageType: velerov1.StorageType{
+							ObjectStorage: &velerov1.ObjectStorageLocation{
+								Bucket: "test-bucket",
+								Prefix: "velero",
+							},
+						},
+						Config: map[string]string{"region": "us-east-1"},
+						Credential: &corev1.SecretKeySelector{
+							LocalObjectReference: corev1.LocalObjectReference{Name: "cloud-creds"},
+							Key:                  "cloud",
+						},
+					},
+				}
+
+				// VMB exists but has no PvcName in spec
+				vmb := &kubevirtbackupv1alpha1.VirtualMachineBackup{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "vmb-test-du-no-pvc",
+						Namespace: "vm-ns",
+						Labels: map[string]string{
+							common.LabelDataUploadUID: "du-uid-nopvc",
+						},
+					},
+					Spec: kubevirtbackupv1alpha1.VirtualMachineBackupSpec{},
+					Status: &kubevirtbackupv1alpha1.VirtualMachineBackupStatus{
+						Type: kubevirtbackupv1alpha1.Full,
+					},
+				}
+				// No rebound PVC exists → rebind path will be taken
+				return []runtime.Object{bsl, vmb}
+			},
 			expectError:   false,
 			expectedPhase: velerov2alpha1.DataUploadPhaseFailed,
 			expectRequeue: false,
@@ -2332,8 +2567,7 @@ func TestHandleAccepted_NoBSLConfigured(t *testing.T) {
 			Name:      "kubevirt-backup-" + duName,
 			Namespace: vmNamespace,
 			Labels: map[string]string{
-				common.LabelDataUploadName: du.Name,
-				common.LabelDataUploadUID:  string(du.UID),
+				common.LabelDataUploadUID: string(du.UID),
 			},
 		},
 		Spec: corev1.PersistentVolumeClaimSpec{
@@ -3190,8 +3424,7 @@ func TestHandleAccepted_SkipsBSLValidationWhenAnnotated(t *testing.T) {
 			Name:      "vmb-" + duName,
 			Namespace: vmNamespace,
 			Labels: map[string]string{
-				common.LabelDataUploadName: duName,
-				common.LabelDataUploadUID:  "test-uid",
+				common.LabelDataUploadUID: "test-uid",
 			},
 		},
 		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupSpec{
@@ -3906,8 +4139,7 @@ func TestHandleAccepted_BSLAnnotationNotSetOnTransientFailure(t *testing.T) {
 			Name:      "vmb-" + duName,
 			Namespace: vmNamespace,
 			Labels: map[string]string{
-				common.LabelDataUploadName: duName,
-				common.LabelDataUploadUID:  "test-uid",
+				common.LabelDataUploadUID: "test-uid",
 			},
 		},
 		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupSpec{
@@ -4665,8 +4897,11 @@ func TestPrepareVMBackupTracker_FirstBackup(t *testing.T) {
 	if vmbt.Namespace != vmNamespace {
 		t.Errorf("VMBT namespace = %q, want %q", vmbt.Namespace, vmNamespace)
 	}
-	if vmbt.Labels[vmbtLabelVMName] != vmName {
-		t.Errorf("VMBT is missing label %s", vmbtLabelVMName)
+	if vmbt.Labels[common.LabelVMNameHash] != common.HashForLabel(vmName) {
+		t.Errorf("VMBT is missing label %s", common.LabelVMNameHash)
+	}
+	if vmbt.Annotations[common.AnnotationVMName] != vmName {
+		t.Errorf("VMBT annotation %s = %q, want %q", common.AnnotationVMName, vmbt.Annotations[common.AnnotationVMName], vmName)
 	}
 	// First backup: no LatestCheckpoint
 	if vmbt.Status != nil && vmbt.Status.LatestCheckpoint != nil {
@@ -4836,8 +5071,8 @@ func TestPrepareVMBackupTracker_DeletesExisting(t *testing.T) {
 			Name:      "vmbt-" + vmName + "-old",
 			Namespace: vmNamespace,
 			Labels: map[string]string{
-				"stale-label":   "old-value",
-				vmbtLabelVMName: vmName,
+				"stale-label":          "old-value",
+				common.LabelVMNameHash: common.HashForLabel(vmName),
 			},
 		},
 		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupTrackerSpec{
@@ -4874,9 +5109,9 @@ func TestPrepareVMBackupTracker_DeletesExisting(t *testing.T) {
 		t.Errorf("expected new VMBT to have DataUpload annotation %q, got %q",
 			duName, vmbt.Annotations[common.AnnotationDataUploadName])
 	}
-	if vmbt.Labels[vmbtLabelVMName] != vmName {
+	if vmbt.Labels[common.LabelVMNameHash] != common.HashForLabel(vmName) {
 		t.Errorf("expected new VMBT to have label %s, got %q",
-			vmbtLabelVMName, vmbt.Labels[vmbtLabelVMName])
+			common.LabelVMNameHash, vmbt.Labels[common.LabelVMNameHash])
 	}
 }
 

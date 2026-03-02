@@ -67,13 +67,17 @@ type DatamoverPodConfig struct {
 
 // buildDatamoverPod creates a Pod spec for the datamover.
 func buildDatamoverPod(config *DatamoverPodConfig) *corev1.Pod {
-	// Merge default labels with provided labels
+	// Merge default labels with provided labels.
+	// Use UID for labels (always ≤ 63 chars); name goes in annotations.
 	labels := map[string]string{
-		common.LabelDatamoverPod:   "uploader",
-		common.LabelDataUploadName: config.DataUploadName,
-		common.LabelDataUploadUID:  config.DataUploadUID,
+		common.LabelDatamoverPod:  "uploader",
+		common.LabelDataUploadUID: config.DataUploadUID,
 	}
 	maps.Copy(labels, config.Labels)
+
+	annotations := map[string]string{
+		common.AnnotationDataUploadName: config.DataUploadName,
+	}
 
 	// Build environment variables
 	envVars := []corev1.EnvVar{
@@ -105,9 +109,10 @@ func buildDatamoverPod(config *DatamoverPodConfig) *corev1.Pod {
 
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      config.Name,
-			Namespace: config.Namespace,
-			Labels:    labels,
+			Name:        config.Name,
+			Namespace:   config.Namespace,
+			Labels:      labels,
+			Annotations: annotations,
 		},
 		Spec: corev1.PodSpec{
 			// Use velero service account which has the SCC needed for root access

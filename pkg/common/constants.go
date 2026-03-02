@@ -49,15 +49,20 @@ const (
 	AnnotationDataUploadName = "velero.io/dataupload-name"
 )
 
-// Label keys for resources created by the controller
+// Label keys for resources created by the controller.
+// Note: Kubernetes label values are limited to 63 characters. Use UIDs or
+// hashes (which have fixed length) as label values for lookups; store
+// human-readable names in annotations instead.
 const (
-	// LabelDataUploadName is the label key for the DataUpload name.
-	// Used on datamover pods to track ownership.
-	LabelDataUploadName = "velero.io/dataupload-name"
-
 	// LabelDataUploadUID is the label key for the DataUpload UID.
-	// Used for precise ownership tracking.
+	// UIDs are always 36 characters, safe for label values.
+	// Used for precise ownership tracking and label-based lookups.
 	LabelDataUploadUID = "velero.io/dataupload-uid"
+
+	// LabelVMNameHash is the label key for a hashed VM name on VMBTs.
+	// VM names can exceed the 63-char label limit, so we store a 16-char
+	// hex hash for label-based lookups and the full name in an annotation.
+	LabelVMNameHash = "kubevirt-datamover.io/vm-name-hash"
 
 	// LabelDatamoverPod identifies the type of datamover pod.
 	LabelDatamoverPod = "kubevirt-datamover.io/pod-type"
