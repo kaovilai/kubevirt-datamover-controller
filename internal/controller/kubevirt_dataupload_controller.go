@@ -682,7 +682,7 @@ func (r *KubeVirtDataUploadReconciler) handleInProgress(ctx context.Context, log
 	}
 	if pod == nil {
 		// Pod not found - this is unexpected in InProgress phase
-		logger.Error(err, "Datamover pod not found", "dataUpload", du.Name, "namespace", podNamespace)
+		logger.Error(nil, "Datamover pod not found", "dataUpload", du.Name, "namespace", podNamespace)
 		if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed, "Datamover pod not found"); err != nil {
 			return ctrl.Result{}, err
 		}
