@@ -22,6 +22,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/go-logr/logr"
@@ -38,6 +39,7 @@ import (
 	kubevirtbackupv1alpha1 "kubevirt.io/api/backup/v1alpha1"
 	kubevirtcorev1 "kubevirt.io/api/core/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
@@ -480,6 +482,7 @@ func TestHandleAccepted(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test-du",
 			Namespace: "openshift-adp",
+			UID:       types.UID("test-uid-in-progress"),
 		},
 		Spec: velerov2alpha1.DataUploadSpec{
 			DataMover: common.DataMoverKubeVirt,
@@ -655,6 +658,9 @@ func TestHandleAccepted_VMBStatusDetection(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "kubevirt-backup-" + duName,
 					Namespace: vmNamespace,
+					Labels: map[string]string{
+						common.LabelDataUploadUID: string(du.UID),
+					},
 					OwnerReferences: []metav1.OwnerReference{
 						{
 							APIVersion: "velero.io/v2alpha1",
@@ -682,6 +688,9 @@ func TestHandleAccepted_VMBStatusDetection(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "vmbt-" + vmName,
 					Namespace: vmNamespace,
+					Labels: map[string]string{
+						vmbtLabelVMName: vmName,
+					},
 				},
 				Spec: kubevirtbackupv1alpha1.VirtualMachineBackupTrackerSpec{
 					Source: corev1.TypedLocalObjectReference{
@@ -699,8 +708,10 @@ func TestHandleAccepted_VMBStatusDetection(t *testing.T) {
 					Name:      "vmb-" + duName,
 					Namespace: vmNamespace,
 					Labels: map[string]string{
-						common.LabelDataUploadName: duName,
-						common.LabelDataUploadUID:  string(du.UID),
+						common.LabelDataUploadUID: string(du.UID),
+					},
+					Annotations: map[string]string{
+						common.AnnotationDataUploadName: duName,
 					},
 					OwnerReferences: []metav1.OwnerReference{
 						{
@@ -795,6 +806,9 @@ func TestHandleInProgress(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      common.DatamoverPodNamePrefix + du.Name,
 			Namespace: "openshift-adp",
+			Labels: map[string]string{
+				common.LabelDataUploadUID: string(du.UID),
+			},
 		},
 		Status: corev1.PodStatus{
 			Phase: corev1.PodRunning,
@@ -1088,6 +1102,7 @@ func TestHandleInProgress_PodSucceeded(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test-du",
 			Namespace: "openshift-adp",
+			UID:       types.UID("test-uid-succeeded"),
 			Annotations: map[string]string{
 				common.AnnotationVMName:      "test-vm",
 				common.AnnotationVMNamespace: "test-ns",
@@ -1106,6 +1121,9 @@ func TestHandleInProgress_PodSucceeded(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      common.DatamoverPodNamePrefix + du.Name,
 			Namespace: "openshift-adp",
+			Labels: map[string]string{
+				common.LabelDataUploadUID: string(du.UID),
+			},
 		},
 		Status: corev1.PodStatus{
 			Phase: corev1.PodSucceeded,
@@ -1156,6 +1174,7 @@ func TestHandleInProgress_PodFailed(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test-du",
 			Namespace: "openshift-adp",
+			UID:       types.UID("test-uid-failed"),
 			Annotations: map[string]string{
 				common.AnnotationVMName:      "test-vm",
 				common.AnnotationVMNamespace: "test-ns",
@@ -1174,6 +1193,9 @@ func TestHandleInProgress_PodFailed(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      common.DatamoverPodNamePrefix + du.Name,
 			Namespace: "openshift-adp",
+			Labels: map[string]string{
+				common.LabelDataUploadUID: string(du.UID),
+			},
 		},
 		Status: corev1.PodStatus{
 			Phase: corev1.PodFailed,
@@ -1234,6 +1256,7 @@ func TestHandleInProgress_PodNotFound(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test-du",
 			Namespace: "openshift-adp",
+			UID:       types.UID("test-uid-notfound"),
 			Annotations: map[string]string{
 				common.AnnotationVMName:      "test-vm",
 				common.AnnotationVMNamespace: "test-ns",
@@ -1304,6 +1327,9 @@ func TestCleanupDatamoverResources(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      common.DatamoverPodNamePrefix + du.Name,
 			Namespace: "openshift-adp",
+			Labels: map[string]string{
+				common.LabelDataUploadUID: string(du.UID),
+			},
 		},
 	}
 
@@ -1355,21 +1381,6 @@ func TestCleanupDatamoverResources(t *testing.T) {
 	}, deletedPVC)
 	if err == nil {
 		t.Error("expected rebound PVC to be deleted")
-	}
-}
-
-func TestGetDatamoverPodName(t *testing.T) {
-	du := &velerov2alpha1.DataUpload{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "my-dataupload",
-		},
-	}
-
-	expected := common.DatamoverPodNamePrefix + "my-dataupload"
-	result := getDatamoverPodName(du)
-
-	if result != expected {
-		t.Errorf("getDatamoverPodName() = %q, want %q", result, expected)
 	}
 }
 
@@ -1433,6 +1444,7 @@ func TestBuildDatamoverPodConfig(t *testing.T) {
 		vmRef          *common.VMReference
 		backupType     string
 		checkpointName string
+		vmbtName       string
 		datamoverImage string
 		expectError    bool
 		errorContains  string
@@ -1483,11 +1495,12 @@ func TestBuildDatamoverPodConfig(t *testing.T) {
 			vmRef:          &common.VMReference{Name: "my-vm", Namespace: "vm-ns"},
 			backupType:     "full",
 			checkpointName: "checkpoint-001",
+			vmbtName:       "vmbt-my-vm-xyz",
 			datamoverImage: "quay.io/test/datamover:v1",
 			expectError:    false,
 			validate: func(t *testing.T, config *DatamoverPodConfig) {
-				if config.Name != common.DatamoverPodNamePrefix+"test-du" {
-					t.Errorf("Name = %q, want %q", config.Name, common.DatamoverPodNamePrefix+"test-du")
+				if config.Name != "test-du" {
+					t.Errorf("Name = %q, want %q", config.Name, "test-du")
 				}
 				if config.Namespace != "vm-ns" {
 					t.Errorf("Namespace = %q, want %q", config.Namespace, "vm-ns")
@@ -1512,6 +1525,9 @@ func TestBuildDatamoverPodConfig(t *testing.T) {
 				}
 				if config.CheckpointName != "checkpoint-001" {
 					t.Errorf("CheckpointName = %q, want %q", config.CheckpointName, "checkpoint-001")
+				}
+				if config.VMBTName != "vmbt-my-vm-xyz" {
+					t.Errorf("VMBTName = %q, want %q", config.VMBTName, "vmbt-my-vm-xyz")
 				}
 			},
 		},
@@ -1543,6 +1559,7 @@ func TestBuildDatamoverPodConfig(t *testing.T) {
 			vmRef:          &common.VMReference{Name: "vm", Namespace: "ns"},
 			backupType:     "full",
 			checkpointName: "cp",
+			vmbtName:       "vmbt-vm-123",
 			datamoverImage: "image:v1",
 			expectError:    false,
 			validate: func(t *testing.T, config *DatamoverPodConfig) {
@@ -1645,6 +1662,7 @@ func TestBuildDatamoverPodConfig(t *testing.T) {
 				tt.vmRef,
 				tt.backupType,
 				tt.checkpointName,
+				tt.vmbtName,
 			)
 
 			if tt.expectError {
@@ -1775,81 +1793,6 @@ func TestGetBackupStorageLocation(t *testing.T) {
 	}
 }
 
-func TestGetVMBackup(t *testing.T) {
-	scheme := runtime.NewScheme()
-	_ = velerov2alpha1.AddToScheme(scheme)
-	_ = kubevirtbackupv1alpha1.AddToScheme(scheme)
-
-	tests := []struct {
-		name          string
-		du            *velerov2alpha1.DataUpload
-		vmb           *kubevirtbackupv1alpha1.VirtualMachineBackup
-		namespace     string
-		expectError   bool
-		errorContains string
-	}{
-		{
-			name: "VMB found",
-			du: &velerov2alpha1.DataUpload{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "test-du",
-				},
-			},
-			vmb: &kubevirtbackupv1alpha1.VirtualMachineBackup{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "vmb-test-du",
-					Namespace: "vm-ns",
-				},
-			},
-			namespace:   "vm-ns",
-			expectError: false,
-		},
-		{
-			name: "VMB not found",
-			du: &velerov2alpha1.DataUpload{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: "test-du",
-				},
-			},
-			vmb:           nil,
-			namespace:     "vm-ns",
-			expectError:   true,
-			errorContains: "failed to get VirtualMachineBackup",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			builder := fake.NewClientBuilder().WithScheme(scheme)
-			if tt.vmb != nil {
-				builder = builder.WithObjects(tt.vmb)
-			}
-			fakeClient := builder.Build()
-
-			r := &KubeVirtDataUploadReconciler{
-				Client: fakeClient,
-			}
-
-			vmb, err := r.getVMBackup(context.Background(), tt.du, tt.namespace)
-
-			if tt.expectError {
-				if err == nil {
-					t.Error("expected error but got none")
-				} else if tt.errorContains != "" && !contains(err.Error(), tt.errorContains) {
-					t.Errorf("error %q should contain %q", err.Error(), tt.errorContains)
-				}
-			} else {
-				if err != nil {
-					t.Errorf("unexpected error: %v", err)
-				}
-				if vmb == nil {
-					t.Error("expected VMB but got nil")
-				}
-			}
-		})
-	}
-}
-
 func TestHandlePrepared(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = velerov2alpha1.AddToScheme(scheme)
@@ -1877,6 +1820,7 @@ func TestHandlePrepared(t *testing.T) {
 					Annotations: map[string]string{
 						common.AnnotationVMName:      "test-vm",
 						common.AnnotationVMNamespace: "vm-ns",
+						AnnotationVMBTName:           "vmbt-test-vm-abc",
 					},
 					Labels: map[string]string{
 						common.LabelVeleroBackupName: "velero-backup",
@@ -1918,6 +1862,9 @@ func TestHandlePrepared(t *testing.T) {
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      "vmb-test-du",
 						Namespace: "vm-ns",
+						Labels: map[string]string{
+							common.LabelDataUploadUID: "du-uid-123",
+						},
 					},
 					Status: &kubevirtbackupv1alpha1.VirtualMachineBackupStatus{
 						Type:           kubevirtbackupv1alpha1.Full,
@@ -2285,8 +2232,10 @@ func TestHandleAccepted_WithBSLCheckpointLookup(t *testing.T) {
 			Name:      "vmb-" + duName,
 			Namespace: vmNamespace,
 			Labels: map[string]string{
-				common.LabelDataUploadName: duName,
-				common.LabelDataUploadUID:  "test-uid",
+				common.LabelDataUploadUID: "test-uid",
+			},
+			Annotations: map[string]string{
+				common.AnnotationDataUploadName: duName,
 			},
 		},
 		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupSpec{
@@ -2382,6 +2331,10 @@ func TestHandleAccepted_NoBSLConfigured(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "kubevirt-backup-" + duName,
 			Namespace: vmNamespace,
+			Labels: map[string]string{
+				common.LabelDataUploadName: du.Name,
+				common.LabelDataUploadUID:  string(du.UID),
+			},
 		},
 		Spec: corev1.PersistentVolumeClaimSpec{
 			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
@@ -2414,7 +2367,10 @@ func TestHandleAccepted_NoBSLConfigured(t *testing.T) {
 			Name:      "vmb-" + duName,
 			Namespace: vmNamespace,
 			Labels: map[string]string{
-				common.LabelDataUploadName: duName,
+				common.LabelDataUploadUID: string(du.UID),
+			},
+			Annotations: map[string]string{
+				common.AnnotationDataUploadName: duName,
 			},
 		},
 		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupSpec{
@@ -2909,8 +2865,10 @@ func TestHandleAccepted_HappyPath_IncrementalBackup(t *testing.T) {
 			Name:      "vmb-" + duName,
 			Namespace: vmNamespace,
 			Labels: map[string]string{
-				common.LabelDataUploadName: duName,
-				common.LabelDataUploadUID:  "test-uid",
+				common.LabelDataUploadUID: "test-uid",
+			},
+			Annotations: map[string]string{
+				common.AnnotationDataUploadName: duName,
 			},
 		},
 		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupSpec{
@@ -3136,13 +3094,14 @@ func TestHandleAccepted_StaleCheckpointForcesFullBackup(t *testing.T) {
 	}
 
 	// Verify VMB was created with ForceFullBackup=true
-	var createdVMB kubevirtbackupv1alpha1.VirtualMachineBackup
-	if err := fakeClient.Get(context.Background(), types.NamespacedName{
-		Name:      "vmb-" + duName,
-		Namespace: vmNamespace,
-	}, &createdVMB); err != nil {
-		t.Fatalf("failed to get created VMB: %v", err)
+	vmbList := &kubevirtbackupv1alpha1.VirtualMachineBackupList{}
+	if err := fakeClient.List(context.Background(), vmbList, client.InNamespace(vmNamespace), client.MatchingLabels{common.LabelDataUploadUID: string(du.UID)}); err != nil {
+		t.Fatalf("failed to list created VMBs: %v", err)
 	}
+	if len(vmbList.Items) != 1 {
+		t.Fatalf("expected 1 VMB to be created, but found %d", len(vmbList.Items))
+	}
+	createdVMB := vmbList.Items[0]
 
 	if !createdVMB.Spec.ForceFullBackup {
 		t.Error("expected VMB.Spec.ForceFullBackup to be true when BSL finds no valid chain")
@@ -4136,13 +4095,14 @@ func TestHandleAccepted_ForceFullBackupAnnotation(t *testing.T) {
 	}
 
 	// Verify VMB was created with ForceFullBackup=true
-	var createdVMB kubevirtbackupv1alpha1.VirtualMachineBackup
-	if err := fakeClient.Get(context.Background(), types.NamespacedName{
-		Name:      "vmb-" + duName,
-		Namespace: vmNamespace,
-	}, &createdVMB); err != nil {
-		t.Fatalf("failed to get created VMB: %v", err)
+	vmbList := &kubevirtbackupv1alpha1.VirtualMachineBackupList{}
+	if err := fakeClient.List(context.Background(), vmbList, client.InNamespace(vmNamespace), client.MatchingLabels{common.LabelDataUploadUID: string(du.UID)}); err != nil {
+		t.Fatalf("failed to list created VMBs: %v", err)
 	}
+	if len(vmbList.Items) != 1 {
+		t.Fatalf("expected 1 VMB to be created, but found %d", len(vmbList.Items))
+	}
+	createdVMB := vmbList.Items[0]
 
 	if !createdVMB.Spec.ForceFullBackup {
 		t.Error("expected VMB.Spec.ForceFullBackup to be true")
@@ -4234,13 +4194,14 @@ func TestHandleAccepted_ForceFullBackupWithNoExistingCheckpoint(t *testing.T) {
 	}
 
 	// Verify VMB was created with ForceFullBackup=true
-	var createdVMB kubevirtbackupv1alpha1.VirtualMachineBackup
-	if err := fakeClient.Get(context.Background(), types.NamespacedName{
-		Name:      "vmb-" + duName,
-		Namespace: vmNamespace,
-	}, &createdVMB); err != nil {
-		t.Fatalf("failed to get created VMB: %v", err)
+	vmbList := &kubevirtbackupv1alpha1.VirtualMachineBackupList{}
+	if err := fakeClient.List(context.Background(), vmbList, client.InNamespace(vmNamespace), client.MatchingLabels{common.LabelDataUploadUID: string(du.UID)}); err != nil {
+		t.Fatalf("failed to list created VMBs: %v", err)
 	}
+	if len(vmbList.Items) != 1 {
+		t.Fatalf("expected 1 VMB to be created, but found %d", len(vmbList.Items))
+	}
+	createdVMB := vmbList.Items[0]
 
 	if !createdVMB.Spec.ForceFullBackup {
 		t.Error("expected VMB.Spec.ForceFullBackup to be true")
@@ -4326,13 +4287,14 @@ func TestHandleAccepted_NoForceFullBackupByDefault(t *testing.T) {
 	}
 
 	// Verify VMB was created with ForceFullBackup=false
-	var createdVMB kubevirtbackupv1alpha1.VirtualMachineBackup
-	if err := fakeClient.Get(context.Background(), types.NamespacedName{
-		Name:      "vmb-" + duName,
-		Namespace: vmNamespace,
-	}, &createdVMB); err != nil {
-		t.Fatalf("failed to get created VMB: %v", err)
+	vmbList := &kubevirtbackupv1alpha1.VirtualMachineBackupList{}
+	if err := fakeClient.List(context.Background(), vmbList, client.InNamespace(vmNamespace), client.MatchingLabels{common.LabelDataUploadUID: string(du.UID)}); err != nil {
+		t.Fatalf("failed to list created VMBs: %v", err)
 	}
+	if len(vmbList.Items) != 1 {
+		t.Fatalf("expected 1 VMB to be created, but found %d", len(vmbList.Items))
+	}
+	createdVMB := vmbList.Items[0]
 
 	if createdVMB.Spec.ForceFullBackup {
 		t.Error("expected VMB.Spec.ForceFullBackup to be false when annotation is not set")
@@ -4470,13 +4432,14 @@ func TestHandleAccepted_StaleCheckpointSetsForceFullOnVMB(t *testing.T) {
 	}
 
 	// Verify VMB was created with ForceFullBackup=true
-	var createdVMB kubevirtbackupv1alpha1.VirtualMachineBackup
-	if err := fakeClient.Get(context.Background(), types.NamespacedName{
-		Name:      "vmb-" + duName,
-		Namespace: vmNamespace,
-	}, &createdVMB); err != nil {
-		t.Fatalf("failed to get created VMB: %v", err)
+	vmbList := &kubevirtbackupv1alpha1.VirtualMachineBackupList{}
+	if err := fakeClient.List(context.Background(), vmbList, client.InNamespace(vmNamespace), client.MatchingLabels{common.LabelDataUploadUID: string(du.UID)}); err != nil {
+		t.Fatalf("failed to list created VMBs: %v", err)
 	}
+	if len(vmbList.Items) != 1 {
+		t.Fatalf("expected 1 VMB to be created, but found %d", len(vmbList.Items))
+	}
+	createdVMB := vmbList.Items[0]
 
 	if !createdVMB.Spec.ForceFullBackup {
 		t.Error("expected VMB.Spec.ForceFullBackup to be true when BSL finds stale checkpoint chain")
@@ -4696,11 +4659,14 @@ func TestPrepareVMBackupTracker_FirstBackup(t *testing.T) {
 	if vmbt == nil {
 		t.Fatal("expected VMBT to be created")
 	}
-	if vmbt.Name != "vmbt-"+vmName {
-		t.Errorf("VMBT name = %q, want %q", vmbt.Name, "vmbt-"+vmName)
+	if !strings.HasPrefix(vmbt.Name, "vmbt-"+vmName) {
+		t.Errorf("VMBT name %q does not have expected prefix", vmbt.Name)
 	}
 	if vmbt.Namespace != vmNamespace {
 		t.Errorf("VMBT namespace = %q, want %q", vmbt.Namespace, vmNamespace)
+	}
+	if vmbt.Labels[vmbtLabelVMName] != vmName {
+		t.Errorf("VMBT is missing label %s", vmbtLabelVMName)
 	}
 	// First backup: no LatestCheckpoint
 	if vmbt.Status != nil && vmbt.Status.LatestCheckpoint != nil {
@@ -4867,10 +4833,11 @@ func TestPrepareVMBackupTracker_DeletesExisting(t *testing.T) {
 	// Pre-create an existing VMBT with stale label
 	existingVMBT := &kubevirtbackupv1alpha1.VirtualMachineBackupTracker{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "vmbt-" + vmName,
+			Name:      "vmbt-" + vmName + "-old",
 			Namespace: vmNamespace,
 			Labels: map[string]string{
-				"stale-label": "old-value",
+				"stale-label":   "old-value",
+				vmbtLabelVMName: vmName,
 			},
 		},
 		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupTrackerSpec{
@@ -4903,9 +4870,13 @@ func TestPrepareVMBackupTracker_DeletesExisting(t *testing.T) {
 	if vmbt.Labels["stale-label"] == "old-value" {
 		t.Error("expected old VMBT to be deleted and new one created, but old labels persist")
 	}
-	if vmbt.Labels[common.LabelDataUploadName] != duName {
-		t.Errorf("expected new VMBT to have DataUpload label %q, got %q",
-			duName, vmbt.Labels[common.LabelDataUploadName])
+	if vmbt.Annotations[common.AnnotationDataUploadName] != duName {
+		t.Errorf("expected new VMBT to have DataUpload annotation %q, got %q",
+			duName, vmbt.Annotations[common.AnnotationDataUploadName])
+	}
+	if vmbt.Labels[vmbtLabelVMName] != vmName {
+		t.Errorf("expected new VMBT to have label %s, got %q",
+			vmbtLabelVMName, vmbt.Labels[vmbtLabelVMName])
 	}
 }
 
@@ -5081,6 +5052,72 @@ func TestLookupLatestVMBTFromBSL(t *testing.T) {
 			if result.Status.LatestCheckpoint.Name != tt.expectCP {
 				t.Errorf("LatestCheckpoint.Name = %q, want %q",
 					result.Status.LatestCheckpoint.Name, tt.expectCP)
+			}
+		})
+	}
+}
+
+func TestSafeGenerateNamePrefix(t *testing.T) {
+	tests := []struct {
+		name       string
+		prefix     string
+		maxNameLen int
+		expected   string
+	}{
+		{
+			name:       "short prefix is unchanged",
+			prefix:     "short-prefix-",
+			maxNameLen: 63,
+			expected:   "short-prefix-",
+		},
+		{
+			name:       "prefix exactly at limit is unchanged",
+			prefix:     strings.Repeat("a", 58), // 58 = 63 - 5
+			maxNameLen: 63,
+			expected:   strings.Repeat("a", 58),
+		},
+		{
+			name:       "long prefix is truncated",
+			prefix:     "a-very-long-prefix-that-will-be-truncated-and-should-not-exceed-the-limit-",
+			maxNameLen: 63,
+			expected:   "a-very-long-prefix-that-will-be-truncated-and-should-not-e", // 58 chars
+		},
+		{
+			name:       "long prefix for VMB is truncated",
+			prefix:     "vmb-a-very-long-dataupload-name-that-exceeds-the-limit-for-kubevirt-hotplug-",
+			maxNameLen: maxVMBNameLen,                              // 45
+			expected:   "vmb-a-very-long-dataupload-name-that-exc", // 40 chars = 45 - 5
+		},
+		{
+			name:       "edge case: maxNameLen < random part",
+			prefix:     "short-",
+			maxNameLen: 4,
+			expected:   "s", // maxPrefix becomes 1
+		},
+		{
+			name:       "edge case: maxNameLen == random part",
+			prefix:     "short-",
+			maxNameLen: 5,
+			expected:   "s", // maxPrefix becomes 1
+		},
+		{
+			name:       "edge case: maxNameLen == random part + 1",
+			prefix:     "short-",
+			maxNameLen: 6,
+			expected:   "s", // maxPrefix is 1, so prefix is truncated to 1
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := safeGenerateNamePrefix(tt.prefix, tt.maxNameLen)
+			if result != tt.expected {
+				t.Errorf("safeGenerateNamePrefix() = %q, want %q", result, tt.expected)
+			}
+			// Sanity check length
+			maxPrefixLen := max(tt.maxNameLen-k8sGenerateNameRandomLen, 1)
+			if len(result) > maxPrefixLen {
+				t.Errorf("result length %d exceeds max prefix length %d", len(result), maxPrefixLen)
 			}
 		})
 	}

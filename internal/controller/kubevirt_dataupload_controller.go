@@ -65,6 +65,19 @@ const (
 
 	// defaultCredentialKey is the default key in BSL credential secrets
 	defaultCredentialKey = "cloud"
+
+	// vmbtLabelVMName is the label key for the VM name on a VirtualMachineBackupTracker
+	vmbtLabelVMName = "kubevirt-datamover.io/vm-name"
+	// AnnotationVMBTName is the annotation key for the generated VMBT name on a DataUpload
+	AnnotationVMBTName = "kubevirt-datamover.io/vmbt-name"
+
+	// k8sGenerateNameRandomLen is the number of random characters K8s appends to GenerateName
+	k8sGenerateNameRandomLen = 5
+
+	// maxVMBNameLen is the max allowed VMB name length. KubeVirt constructs a
+	// hotplug volume name as "<vmb-name>-backup-target-pvc" which must be a
+	// valid DNS label (≤ 63 chars). Reserve 18 chars for that suffix.
+	maxVMBNameLen = 63 - len("-backup-target-pvc") // = 45
 )
 
 // KubeVirtDataUploadReconciler reconciles DataUpload objects where Spec.DataMover is "kubevirt"
@@ -257,22 +270,12 @@ func (r *KubeVirtDataUploadReconciler) handleAccepted(ctx context.Context, logge
 	// Check if VMB already exists. If it does, the VMBT is already in the right
 	// state (set before VMB creation) and we can skip straight to monitoring.
 	// This avoids deleting/recreating the VMBT while an active VMB references it.
-	vmbName := fmt.Sprintf("%s%s", common.VMBackupNamePrefix, du.Name)
-	existingVMB := &kubevirtbackupv1alpha1.VirtualMachineBackup{}
-	vmbExists := false
-	if err := r.Get(ctx, types.NamespacedName{Name: vmbName, Namespace: vmRef.Namespace}, existingVMB); err == nil {
-		vmbExists = true
-	} else if !errors.IsNotFound(err) {
+	vmb, err := r.findVMBForDataUpload(ctx, du, vmRef.Namespace)
+	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("failed to check for existing VMB: %w", err)
 	}
 
-	var vmb *kubevirtbackupv1alpha1.VirtualMachineBackup
-	if vmbExists {
-		// VMB already exists — skip VMBT preparation and backup mode resolution.
-		// The VMBT was set up before this VMB was created and should not be disturbed.
-		vmb = existingVMB
-		logger.V(1).Info("VirtualMachineBackup already exists, skipping VMBT preparation", "vmb", vmb.Name)
-	} else {
+	if vmb == nil {
 		// Step 2: Prepare VirtualMachineBackupTracker (recreate from S3 state)
 		vmbt, err := r.prepareVMBackupTracker(ctx, logger, du, vmRef.Name, vmRef.Namespace)
 		if err != nil {
@@ -280,6 +283,15 @@ func (r *KubeVirtDataUploadReconciler) handleAccepted(ctx context.Context, logge
 			return ctrl.Result{}, err
 		}
 		logger.Info("VirtualMachineBackupTracker ready", "vmbt", vmbt.Name)
+
+		// Store generated VMBT name in annotation for later stages
+		if du.Annotations == nil {
+			du.Annotations = make(map[string]string)
+		}
+		du.Annotations[AnnotationVMBTName] = vmbt.Name
+		if err := r.Update(ctx, du); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to annotate DataUpload with VMBT name: %w", err)
+		}
 
 		// Step 3: Determine backup mode (full vs incremental).
 		forceFullBackup, checkpointLookup := r.resolveBackupMode(ctx, logger, du, vmRef)
@@ -319,10 +331,12 @@ func (r *KubeVirtDataUploadReconciler) handleAccepted(ctx context.Context, logge
 		}
 
 		if created {
-			logger.Info("Created VirtualMachineBackup", "vmb", vmb.Name)
+			logger.Info("Created VirtualMachineBackup", "generateName", vmb.GenerateName, "namespace", vmRef.Namespace)
 			// Requeue to check status
 			return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
 		}
+	} else {
+		logger.V(1).Info("VirtualMachineBackup already exists, skipping VMBT preparation", "vmb", vmb.Name)
 	}
 
 	// Step 5: Check VMB status
@@ -505,19 +519,17 @@ func (r *KubeVirtDataUploadReconciler) handlePrepared(ctx context.Context, logge
 	podNamespace := r.getPodNamespace(du)
 
 	// Check if datamover pod already exists (idempotency)
-	podName := getDatamoverPodName(du)
-	existingPod := &corev1.Pod{}
-	err = r.Get(ctx, types.NamespacedName{Name: podName, Namespace: podNamespace}, existingPod)
-	if err == nil {
+	pod, err := r.findPodForDataUpload(ctx, du, podNamespace)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to check for existing datamover pod: %w", err)
+	}
+	if pod != nil {
 		// Pod exists, transition to InProgress and monitor
-		logger.Info("Datamover pod already exists, transitioning to InProgress", "pod", podName)
+		logger.Info("Datamover pod already exists, transitioning to InProgress", "pod", pod.Name)
 		if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseInProgress, "Datamover pod running"); err != nil {
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
-	}
-	if !errors.IsNotFound(err) {
-		return ctrl.Result{}, fmt.Errorf("failed to check for existing datamover pod: %w", err)
 	}
 
 	// Validate BSL and VMB exist BEFORE rebinding PV
@@ -534,10 +546,13 @@ func (r *KubeVirtDataUploadReconciler) handlePrepared(ctx context.Context, logge
 	}
 
 	// Get VMB to extract checkpoint info
-	vmb, err := r.getVMBackup(ctx, du, vmRef.Namespace)
+	vmb, err := r.findVMBForDataUpload(ctx, du, vmRef.Namespace)
 	if err != nil {
-		logger.Error(err, "Failed to get VirtualMachineBackup")
-		if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed, fmt.Sprintf("Failed to get VMB: %v", err)); err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to get VirtualMachineBackup: %w", err)
+	}
+	if vmb == nil {
+		logger.Error(nil, "VirtualMachineBackup not found for DataUpload")
+		if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed, "VirtualMachineBackup not found"); err != nil {
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{}, nil
@@ -592,8 +607,22 @@ func (r *KubeVirtDataUploadReconciler) handlePrepared(ctx context.Context, logge
 		checkpointName = *vmb.Status.CheckpointName
 	}
 
+	// Get VMBT name from annotation
+	vmbtName := ""
+	if du.Annotations != nil {
+		vmbtName = du.Annotations[AnnotationVMBTName]
+	}
+	if vmbtName == "" {
+		err := fmt.Errorf("VMBT name annotation %s not found on DataUpload", AnnotationVMBTName)
+		logger.Error(err, "Failed to get VMBT name")
+		if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed, err.Error()); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, nil
+	}
+
 	// Build datamover pod config - now using OADP namespace and rebound PVC
-	podConfig, err := r.buildDatamoverPodConfig(du, bsl, vmb, vmRef, backupType, checkpointName)
+	podConfig, err := r.buildDatamoverPodConfig(du, bsl, vmb, vmRef, backupType, checkpointName, vmbtName)
 	if err != nil {
 		logger.Error(err, "Failed to build datamover pod config")
 		if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed, fmt.Sprintf("Failed to build pod config: %v", err)); err != nil {
@@ -607,23 +636,27 @@ func (r *KubeVirtDataUploadReconciler) handlePrepared(ctx context.Context, logge
 	podConfig.SourcePVCName = reboundPVCName
 
 	// Create the datamover pod
-	pod := buildDatamoverPod(podConfig)
+	podToCreate := buildDatamoverPod(podConfig)
+
+	// Use GenerateName instead of a fixed name
+	podToCreate.GenerateName = safeGenerateNamePrefix(fmt.Sprintf("%s%s-", common.DatamoverPodNamePrefix, du.Name), 63)
+	podToCreate.Name = ""
 
 	// Set owner reference so pod is cleaned up when DataUpload is deleted
 	// This works now because pod is in the same namespace as DataUpload
-	if err := controllerutil.SetOwnerReference(du, pod, r.Scheme); err != nil {
+	if err := controllerutil.SetOwnerReference(du, podToCreate, r.Scheme); err != nil {
 		return ctrl.Result{}, fmt.Errorf("failed to set owner reference on pod: %w", err)
 	}
 
-	if err := r.Create(ctx, pod); err != nil {
+	if err := r.Create(ctx, podToCreate); err != nil {
 		if errors.IsAlreadyExists(err) {
 			// Race condition - pod was created between check and create
-			logger.Info("Datamover pod already exists (race)", "pod", podName)
+			logger.Info("Datamover pod already exists (race)", "generateName", podToCreate.GenerateName)
 		} else {
 			return ctrl.Result{}, fmt.Errorf("failed to create datamover pod: %w", err)
 		}
 	} else {
-		logger.Info("Created datamover pod", "pod", podName, "namespace", podNamespace)
+		logger.Info("Created datamover pod", "generateName", podToCreate.GenerateName, "namespace", podNamespace)
 	}
 
 	// Transition to InProgress
@@ -643,25 +676,23 @@ func (r *KubeVirtDataUploadReconciler) handleInProgress(ctx context.Context, log
 	podNamespace := r.getPodNamespace(du)
 
 	// Get the datamover pod
-	podName := getDatamoverPodName(du)
-	pod := &corev1.Pod{}
-	err := r.Get(ctx, types.NamespacedName{Name: podName, Namespace: podNamespace}, pod)
+	pod, err := r.findPodForDataUpload(ctx, du, podNamespace)
 	if err != nil {
-		if errors.IsNotFound(err) {
-			// Pod not found - this is unexpected in InProgress phase
-			logger.Error(err, "Datamover pod not found", "pod", podName, "namespace", podNamespace)
-			if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed, "Datamover pod not found"); err != nil {
-				return ctrl.Result{}, err
-			}
-			return ctrl.Result{}, nil
-		}
 		return ctrl.Result{}, fmt.Errorf("failed to get datamover pod: %w", err)
+	}
+	if pod == nil {
+		// Pod not found - this is unexpected in InProgress phase
+		logger.Error(nil, "Datamover pod not found", "dataUpload", du.Name, "namespace", podNamespace)
+		if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed, "Datamover pod not found"); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, nil
 	}
 
 	// Check pod status
 	switch pod.Status.Phase {
 	case corev1.PodSucceeded:
-		logger.Info("Datamover pod completed successfully", "pod", podName)
+		logger.Info("Datamover pod completed successfully", "pod", pod.Name)
 
 		// Cleanup resources
 		r.cleanupDatamoverResources(ctx, logger, du, podNamespace)
@@ -673,7 +704,7 @@ func (r *KubeVirtDataUploadReconciler) handleInProgress(ctx context.Context, log
 
 	case corev1.PodFailed:
 		failureMessage := extractPodFailureMessage(pod)
-		logger.Error(nil, "Datamover pod failed", "pod", podName, "message", failureMessage)
+		logger.Error(nil, "Datamover pod failed", "pod", pod.Name, "message", failureMessage)
 
 		// Skip cleanup on failure to preserve resources for debugging.
 		// Resources (pod, rebound PVC/PV) can be manually cleaned up after investigation.
@@ -684,11 +715,11 @@ func (r *KubeVirtDataUploadReconciler) handleInProgress(ctx context.Context, log
 		return ctrl.Result{}, nil
 
 	case corev1.PodPending, corev1.PodRunning:
-		logger.V(1).Info("Datamover pod still running", "pod", podName, "phase", pod.Status.Phase)
+		logger.V(1).Info("Datamover pod still running", "pod", pod.Name, "phase", pod.Status.Phase)
 		return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
 
 	default:
-		logger.Info("Datamover pod in unknown phase", "pod", podName, "phase", pod.Status.Phase)
+		logger.Info("Datamover pod in unknown phase", "pod", pod.Name, "phase", pod.Status.Phase)
 		return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
 	}
 }
@@ -696,13 +727,17 @@ func (r *KubeVirtDataUploadReconciler) handleInProgress(ctx context.Context, log
 // cleanupDatamoverResources cleans up resources created during the datamover process
 func (r *KubeVirtDataUploadReconciler) cleanupDatamoverResources(ctx context.Context, logger logr.Logger, du *velerov2alpha1.DataUpload, podNamespace string) {
 	// Delete the datamover pod
-	podName := getDatamoverPodName(du)
-	pod := &corev1.Pod{}
-	if err := r.Get(ctx, types.NamespacedName{Name: podName, Namespace: podNamespace}, pod); err == nil {
-		if err := r.Delete(ctx, pod); err != nil && !errors.IsNotFound(err) {
-			logger.Error(err, "Failed to delete datamover pod", "pod", podName)
-		} else {
-			logger.Info("Deleted datamover pod", "pod", podName)
+	podList := &corev1.PodList{}
+	if err := r.List(ctx, podList, client.InNamespace(podNamespace), client.MatchingLabels{common.LabelDataUploadUID: string(du.UID)}); err != nil {
+		logger.Error(err, "Failed to list datamover pods for cleanup")
+	} else {
+		for i := range podList.Items {
+			pod := &podList.Items[i]
+			if err := r.Delete(ctx, pod); err != nil && !errors.IsNotFound(err) {
+				logger.Error(err, "Failed to delete datamover pod", "pod", pod.Name)
+			} else {
+				logger.Info("Deleted datamover pod", "pod", pod.Name)
+			}
 		}
 	}
 
@@ -718,23 +753,31 @@ func (r *KubeVirtDataUploadReconciler) cleanupDatamoverResources(ctx context.Con
 // cleanupVMBackupResources deletes VMB and VMBT CRs in the VM namespace.
 // Used during cancellation when the datamover pod won't run its own cleanup.
 func (r *KubeVirtDataUploadReconciler) cleanupVMBackupResources(ctx context.Context, logger logr.Logger, du *velerov2alpha1.DataUpload, vmName, vmNamespace string) {
-	vmbName := fmt.Sprintf("vmb-%s", du.Name)
-	vmb := &kubevirtbackupv1alpha1.VirtualMachineBackup{}
-	if err := r.Get(ctx, types.NamespacedName{Name: vmbName, Namespace: vmNamespace}, vmb); err == nil {
-		if err := r.Delete(ctx, vmb); err != nil && !errors.IsNotFound(err) {
-			logger.Error(err, "Failed to delete VMB", "vmb", vmbName)
-		} else {
-			logger.Info("Deleted VMB", "vmb", vmbName, "namespace", vmNamespace)
+	vmbList := &kubevirtbackupv1alpha1.VirtualMachineBackupList{}
+	if err := r.List(ctx, vmbList, client.InNamespace(vmNamespace), client.MatchingLabels{common.LabelDataUploadUID: string(du.UID)}); err != nil {
+		logger.Error(err, "Failed to list VMBs for cleanup")
+	} else {
+		for i := range vmbList.Items {
+			vmb := &vmbList.Items[i]
+			if err := r.Delete(ctx, vmb); err != nil && !errors.IsNotFound(err) {
+				logger.Error(err, "Failed to delete VMB", "vmb", vmb.Name)
+			} else {
+				logger.Info("Deleted VMB", "vmb", vmb.Name, "namespace", vmNamespace)
+			}
 		}
 	}
 
-	vmbtName := fmt.Sprintf("vmbt-%s", vmName)
-	vmbt := &kubevirtbackupv1alpha1.VirtualMachineBackupTracker{}
-	if err := r.Get(ctx, types.NamespacedName{Name: vmbtName, Namespace: vmNamespace}, vmbt); err == nil {
-		if err := r.Delete(ctx, vmbt); err != nil && !errors.IsNotFound(err) {
-			logger.Error(err, "Failed to delete VMBT", "vmbt", vmbtName)
-		} else {
-			logger.Info("Deleted VMBT", "vmbt", vmbtName, "namespace", vmNamespace)
+	vmbtList := &kubevirtbackupv1alpha1.VirtualMachineBackupTrackerList{}
+	if err := r.List(ctx, vmbtList, client.InNamespace(vmNamespace), client.MatchingLabels{vmbtLabelVMName: vmName}); err != nil {
+		logger.Error(err, "Failed to list VMBTs for cleanup")
+	} else {
+		for i := range vmbtList.Items {
+			vmbt := &vmbtList.Items[i]
+			if err := r.Delete(ctx, vmbt); err != nil && !errors.IsNotFound(err) {
+				logger.Error(err, "Failed to delete VMBT", "vmbt", vmbt.Name)
+			} else {
+				logger.Info("Deleted VMBT", "vmbt", vmbt.Name, "namespace", vmNamespace)
+			}
 		}
 	}
 }
@@ -839,28 +882,28 @@ func (r *KubeVirtDataUploadReconciler) filterKubeVirtDataMover() predicate.Predi
 // while DataUpload is in OADP namespace (cross-namespace owner refs not allowed).
 // The PVC will be cleaned up during PV rebinding or explicit cleanup.
 func (r *KubeVirtDataUploadReconciler) ensureTempPVC(ctx context.Context, logger logr.Logger, du *velerov2alpha1.DataUpload, namespace string) (*corev1.PersistentVolumeClaim, error) {
-	pvcName := fmt.Sprintf("kubevirt-backup-%s", du.Name)
-
-	// Check if PVC already exists
-	existingPVC := &corev1.PersistentVolumeClaim{}
-	err := r.Get(ctx, types.NamespacedName{Name: pvcName, Namespace: namespace}, existingPVC)
-	if err == nil {
-		logger.V(1).Info("Temporary PVC already exists", "pvc", pvcName)
-		return existingPVC, nil
+	pvcList := &corev1.PersistentVolumeClaimList{}
+	if err := r.List(ctx, pvcList, client.InNamespace(namespace), client.MatchingLabels{common.LabelDataUploadUID: string(du.UID)}); err != nil {
+		return nil, fmt.Errorf("failed to list temporary PVCs: %w", err)
 	}
-
-	if !errors.IsNotFound(err) {
-		return nil, fmt.Errorf("failed to check for existing PVC: %w", err)
+	if len(pvcList.Items) > 1 {
+		return nil, fmt.Errorf("found multiple temporary PVCs for DataUpload %s", du.Name)
+	}
+	if len(pvcList.Items) == 1 {
+		logger.V(1).Info("Temporary PVC already exists", "pvc", pvcList.Items[0].Name)
+		return &pvcList.Items[0], nil
 	}
 
 	// Create new PVC
 	pvc := &corev1.PersistentVolumeClaim{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      pvcName,
-			Namespace: namespace,
+			GenerateName: safeGenerateNamePrefix(fmt.Sprintf("kubevirt-backup-%s-", du.Name), 63),
+			Namespace:    namespace,
 			Labels: map[string]string{
-				common.LabelDataUploadName: du.Name,
-				common.LabelDataUploadUID:  string(du.UID),
+				common.LabelDataUploadUID: string(du.UID),
+			},
+			Annotations: map[string]string{
+				common.AnnotationDataUploadName: du.Name,
 			},
 		},
 		Spec: corev1.PersistentVolumeClaimSpec{
@@ -879,7 +922,7 @@ func (r *KubeVirtDataUploadReconciler) ensureTempPVC(ctx context.Context, logger
 		return nil, fmt.Errorf("failed to create temporary PVC: %w", err)
 	}
 
-	logger.Info("Created temporary PVC", "pvc", pvcName, "namespace", namespace)
+	logger.Info("Created temporary PVC", "generateName", pvc.GenerateName, "namespace", namespace)
 	return pvc, nil
 }
 
@@ -887,7 +930,19 @@ func (r *KubeVirtDataUploadReconciler) ensureTempPVC(ctx context.Context, logger
 // restoring the LatestCheckpoint from the archived VMBT in S3 if available.
 // Any existing VMBT is deleted first to avoid conflicts (S3 is the source of truth).
 func (r *KubeVirtDataUploadReconciler) prepareVMBackupTracker(ctx context.Context, logger logr.Logger, du *velerov2alpha1.DataUpload, vmName, vmNamespace string) (*kubevirtbackupv1alpha1.VirtualMachineBackupTracker, error) {
-	vmbtName := fmt.Sprintf("vmbt-%s", vmName)
+	// Delete any existing VMBT for this VM before creating a new one.
+	// This ensures we always start from the state restored from S3.
+	existingVMBTList := &kubevirtbackupv1alpha1.VirtualMachineBackupTrackerList{}
+	if err := r.List(ctx, existingVMBTList, client.InNamespace(vmNamespace), client.MatchingLabels{vmbtLabelVMName: vmName}); err != nil {
+		return nil, fmt.Errorf("failed to list existing VMBTs: %w", err)
+	}
+	for i := range existingVMBTList.Items {
+		vmbtToDelete := &existingVMBTList.Items[i]
+		logger.Info("Deleting existing VMBT before recreation", "vmbt", vmbtToDelete.Name)
+		if err := r.Delete(ctx, vmbtToDelete); err != nil && !errors.IsNotFound(err) {
+			return nil, fmt.Errorf("failed to delete existing VMBT %s: %w", vmbtToDelete.Name, err)
+		}
+	}
 
 	// Try to fetch the archived VMBT from S3 to restore LatestCheckpoint.
 	// This is non-fatal: if BSL is unreachable or no VMBT exists yet (first backup),
@@ -913,26 +968,17 @@ func (r *KubeVirtDataUploadReconciler) prepareVMBackupTracker(ctx context.Contex
 		}
 	}
 
-	// Delete existing VMBT unconditionally (we're recreating from S3 state)
-	existingVMBT := &kubevirtbackupv1alpha1.VirtualMachineBackupTracker{}
-	err := r.Get(ctx, types.NamespacedName{Name: vmbtName, Namespace: vmNamespace}, existingVMBT)
-	if err == nil {
-		logger.Info("Deleting existing VMBT before recreation", "vmbt", vmbtName)
-		if err := r.Delete(ctx, existingVMBT); err != nil && !errors.IsNotFound(err) {
-			return nil, fmt.Errorf("failed to delete existing VMBT %s: %w", vmbtName, err)
-		}
-	} else if !errors.IsNotFound(err) {
-		return nil, fmt.Errorf("failed to check for existing VMBT: %w", err)
-	}
-
 	// Create new VMBT
 	apiGroup := "kubevirt.io"
 	vmbt := &kubevirtbackupv1alpha1.VirtualMachineBackupTracker{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      vmbtName,
-			Namespace: vmNamespace,
+			GenerateName: safeGenerateNamePrefix(fmt.Sprintf("vmbt-%s-", vmName), 63),
+			Namespace:    vmNamespace,
 			Labels: map[string]string{
-				common.LabelDataUploadName: du.Name,
+				vmbtLabelVMName: vmName,
+			},
+			Annotations: map[string]string{
+				common.AnnotationDataUploadName: du.Name,
 			},
 		},
 		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupTrackerSpec{
@@ -948,7 +994,7 @@ func (r *KubeVirtDataUploadReconciler) prepareVMBackupTracker(ctx context.Contex
 		return nil, fmt.Errorf("failed to create VirtualMachineBackupTracker: %w", err)
 	}
 
-	logger.Info("Created VirtualMachineBackupTracker", "vmbt", vmbtName, "namespace", vmNamespace)
+	logger.Info("Created VirtualMachineBackupTracker", "generateName", vmbt.GenerateName, "namespace", vmNamespace)
 
 	// If we have an archived VMBT with LatestCheckpoint, set it on the new VMBT's status.
 	// K8s ignores Status during creation, so we must use Status().Update() separately.
@@ -960,7 +1006,7 @@ func (r *KubeVirtDataUploadReconciler) prepareVMBackupTracker(ctx context.Contex
 			return nil, fmt.Errorf("failed to update VMBT status with LatestCheckpoint: %w", err)
 		}
 		logger.Info("Set VMBT LatestCheckpoint from S3 archive",
-			"vmbt", vmbtName,
+			"vmbt", vmbt.Name,
 			"latestCheckpoint", archivedVMBT.Status.LatestCheckpoint.Name)
 	}
 
@@ -1038,30 +1084,27 @@ func (r *KubeVirtDataUploadReconciler) lookupLatestVMBTFromBSL(ctx context.Conte
 // while DataUpload is in OADP namespace (cross-namespace owner refs not allowed).
 // VMB and VMBT are archived to S3 and deleted by the datamover pod after upload.
 func (r *KubeVirtDataUploadReconciler) ensureVMBackup(ctx context.Context, logger logr.Logger, du *velerov2alpha1.DataUpload, vmbt *kubevirtbackupv1alpha1.VirtualMachineBackupTracker, pvcName, namespace string, forceFullBackup bool) (*kubevirtbackupv1alpha1.VirtualMachineBackup, bool, error) {
-	// Use DataUpload name for VMB to ensure 1:1 mapping
-	vmbName := fmt.Sprintf("vmb-%s", du.Name)
-
-	// Check if VMB already exists
-	existingVMB := &kubevirtbackupv1alpha1.VirtualMachineBackup{}
-	err := r.Get(ctx, types.NamespacedName{Name: vmbName, Namespace: namespace}, existingVMB)
-	if err == nil {
-		logger.V(1).Info("VirtualMachineBackup already exists", "vmb", vmbName)
-		return existingVMB, false, nil
-	}
-
-	if !errors.IsNotFound(err) {
+	// Find existing VMB for this DataUpload
+	existingVMB, err := r.findVMBForDataUpload(ctx, du, namespace)
+	if err != nil {
 		return nil, false, fmt.Errorf("failed to check for existing VMB: %w", err)
+	}
+	if existingVMB != nil {
+		logger.V(1).Info("VirtualMachineBackup already exists", "vmb", existingVMB.Name)
+		return existingVMB, false, nil
 	}
 
 	// Create new VMB referencing the VMBT (enables incremental backups)
 	apiGroup := "backup.kubevirt.io"
 	vmb := &kubevirtbackupv1alpha1.VirtualMachineBackup{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      vmbName,
-			Namespace: namespace,
+			GenerateName: safeGenerateNamePrefix(fmt.Sprintf("vmb-%s-", du.Name), maxVMBNameLen),
+			Namespace:    namespace,
 			Labels: map[string]string{
-				common.LabelDataUploadName: du.Name,
-				common.LabelDataUploadUID:  string(du.UID),
+				common.LabelDataUploadUID: string(du.UID),
+			},
+			Annotations: map[string]string{
+				common.AnnotationDataUploadName: du.Name,
 			},
 		},
 		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupSpec{
@@ -1075,21 +1118,15 @@ func (r *KubeVirtDataUploadReconciler) ensureVMBackup(ctx context.Context, logge
 		},
 	}
 
-	if forceFullBackup {
-		logger.Info("Creating VirtualMachineBackup with ForceFullBackup=true", "vmb", vmbName)
-	}
-
 	if err := r.Create(ctx, vmb); err != nil {
 		return nil, false, fmt.Errorf("failed to create VirtualMachineBackup: %w", err)
 	}
+	if forceFullBackup {
+		logger.Info("Creating VirtualMachineBackup with ForceFullBackup=true", "vmb", vmb.Name)
+	}
 
-	logger.Info("Created VirtualMachineBackup", "vmb", vmbName, "namespace", namespace, "tracker", vmbt.Name)
+	logger.Info("Created VirtualMachineBackup", "generateName", vmb.GenerateName, "namespace", namespace, "tracker", vmbt.Name)
 	return vmb, true, nil
-}
-
-// getDatamoverPodName returns the name for the datamover pod
-func getDatamoverPodName(du *velerov2alpha1.DataUpload) string {
-	return fmt.Sprintf("%s%s", common.DatamoverPodNamePrefix, du.Name)
 }
 
 // getBackupStorageLocation fetches the BSL referenced by the DataUpload
@@ -1114,16 +1151,19 @@ func (r *KubeVirtDataUploadReconciler) getBackupStorageLocation(ctx context.Cont
 	return bsl, nil
 }
 
-// getVMBackup fetches the VirtualMachineBackup for this DataUpload
-func (r *KubeVirtDataUploadReconciler) getVMBackup(ctx context.Context, du *velerov2alpha1.DataUpload, namespace string) (*kubevirtbackupv1alpha1.VirtualMachineBackup, error) {
-	vmbName := fmt.Sprintf("%s%s", common.VMBackupNamePrefix, du.Name)
-
-	vmb := &kubevirtbackupv1alpha1.VirtualMachineBackup{}
-	if err := r.Get(ctx, types.NamespacedName{Name: vmbName, Namespace: namespace}, vmb); err != nil {
-		return nil, fmt.Errorf("failed to get VirtualMachineBackup %s/%s: %w", namespace, vmbName, err)
+// findVMBForDataUpload finds the unique VirtualMachineBackup associated with a DataUpload.
+func (r *KubeVirtDataUploadReconciler) findVMBForDataUpload(ctx context.Context, du *velerov2alpha1.DataUpload, namespace string) (*kubevirtbackupv1alpha1.VirtualMachineBackup, error) {
+	vmbList := &kubevirtbackupv1alpha1.VirtualMachineBackupList{}
+	if err := r.List(ctx, vmbList, client.InNamespace(namespace), client.MatchingLabels{common.LabelDataUploadUID: string(du.UID)}); err != nil {
+		return nil, err
 	}
-
-	return vmb, nil
+	if len(vmbList.Items) == 0 {
+		return nil, nil
+	}
+	if len(vmbList.Items) > 1 {
+		return nil, fmt.Errorf("found multiple VirtualMachineBackups for DataUpload %s", du.Name)
+	}
+	return &vmbList.Items[0], nil
 }
 
 // getVeleroBackupName extracts the Velero backup name from DataUpload labels
@@ -1134,6 +1174,16 @@ func getVeleroBackupName(du *velerov2alpha1.DataUpload) string {
 	return du.Labels[common.LabelVeleroBackupName]
 }
 
+// safeGenerateNamePrefix truncates a GenerateName prefix so that the final
+// name (prefix + 5 random chars) does not exceed maxNameLen.
+func safeGenerateNamePrefix(prefix string, maxNameLen int) string {
+	maxPrefix := max(maxNameLen-k8sGenerateNameRandomLen, 1)
+	if len(prefix) > maxPrefix {
+		prefix = prefix[:maxPrefix]
+	}
+	return prefix
+}
+
 // buildDatamoverPodConfig assembles the configuration for the datamover pod
 func (r *KubeVirtDataUploadReconciler) buildDatamoverPodConfig(
 	du *velerov2alpha1.DataUpload,
@@ -1142,6 +1192,7 @@ func (r *KubeVirtDataUploadReconciler) buildDatamoverPodConfig(
 	vmRef *common.VMReference,
 	backupType string,
 	checkpointName string,
+	vmbtName string,
 ) (*DatamoverPodConfig, error) {
 	cfg, err := extractBSLConfig(bsl)
 	if err != nil {
@@ -1167,7 +1218,7 @@ func (r *KubeVirtDataUploadReconciler) buildDatamoverPodConfig(
 	}
 
 	return &DatamoverPodConfig{
-		Name:                 getDatamoverPodName(du),
+		Name:                 du.Name, // Used as a prefix for GenerateName
 		Namespace:            vmRef.Namespace,
 		Image:                image,
 		ImagePullPolicy:      pullPolicy,
@@ -1185,7 +1236,7 @@ func (r *KubeVirtDataUploadReconciler) buildDatamoverPodConfig(
 		DataUploadName:       du.Name,
 		DataUploadUID:        string(du.UID),
 		VMBName:              vmb.Name,
-		VMBTName:             fmt.Sprintf("vmbt-%s", vmRef.Name),
+		VMBTName:             vmbtName,
 		SourcePVCName:        pvcName,
 		Labels:               make(map[string]string),
 	}, nil
@@ -1373,4 +1424,19 @@ func (r *KubeVirtDataUploadReconciler) getCredentialsFromBSL(
 	}
 
 	return credData, nil
+}
+
+// findPodForDataUpload finds the unique datamover pod associated with a DataUpload.
+func (r *KubeVirtDataUploadReconciler) findPodForDataUpload(ctx context.Context, du *velerov2alpha1.DataUpload, namespace string) (*corev1.Pod, error) {
+	podList := &corev1.PodList{}
+	if err := r.List(ctx, podList, client.InNamespace(namespace), client.MatchingLabels{common.LabelDataUploadUID: string(du.UID)}); err != nil {
+		return nil, err
+	}
+	if len(podList.Items) == 0 {
+		return nil, nil
+	}
+	if len(podList.Items) > 1 {
+		return nil, fmt.Errorf("found multiple datamover pods for DataUpload %s", du.Name)
+	}
+	return &podList.Items[0], nil
 }
