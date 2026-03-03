@@ -81,6 +81,7 @@ func (r *KubeVirtDataUploadReconciler) rebindPVToNamespace(
 	sourceNamespace string,
 	targetNamespace string,
 	dataUploadName string,
+	dataUploadUID string,
 ) (*PVRebindResult, error) {
 	// Step 1: Get the source PVC and its bound PV
 	sourcePVC := &corev1.PersistentVolumeClaim{}
@@ -125,15 +126,20 @@ func (r *KubeVirtDataUploadReconciler) rebindPVToNamespace(
 	}
 
 	// Step 4: Create new PVC in target namespace with volumeName and selector
-	labelKey := common.LabelDataUploadName
-	labelValue := dataUploadName
-	newPVCName := fmt.Sprintf("%s%s", common.ReboundPVCNamePrefix, dataUploadName)
+	// Use LabelDataUploadUID for labels/selector (always ≤ 63 chars) instead of
+	// LabelDataUploadName which can exceed the 63-char Kubernetes label value limit.
+	labelKey := common.LabelDataUploadUID
+	labelValue := dataUploadUID
+	newPVCName := common.SafeResourceName(common.ReboundPVCNamePrefix, dataUploadName)
 	newPVC := &corev1.PersistentVolumeClaim{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      newPVCName,
 			Namespace: targetNamespace,
 			Labels: map[string]string{
-				common.LabelDataUploadName: dataUploadName,
+				common.LabelDataUploadUID: dataUploadUID,
+			},
+			Annotations: map[string]string{
+				common.AnnotationDataUploadName: dataUploadName,
 			},
 		},
 		Spec: corev1.PersistentVolumeClaimSpec{
@@ -323,14 +329,14 @@ func (r *KubeVirtDataUploadReconciler) waitForPVCBound(ctx context.Context, pvcN
 }
 
 // cleanupReboundPVCAndPV deletes the rebound PVC and PV after upload completes.
-// The dataUploadName is used to find the PV by label if the PVC is already gone,
+// The dataUploadUID is used to find the PV by label if the PVC is already gone,
 // preventing storage leakage.
 func (r *KubeVirtDataUploadReconciler) cleanupReboundPVCAndPV(
 	ctx context.Context,
 	logger logr.Logger,
 	pvcName string,
 	pvcNamespace string,
-	dataUploadName string,
+	dataUploadUID string,
 ) error {
 	var pvName string
 
@@ -374,11 +380,11 @@ func (r *KubeVirtDataUploadReconciler) cleanupReboundPVCAndPV(
 	} else {
 		// Find PV by label (PVC was already deleted)
 		pvList := &corev1.PersistentVolumeList{}
-		if err := r.List(ctx, pvList, client.MatchingLabels{common.LabelDataUploadName: dataUploadName}); err != nil {
+		if err := r.List(ctx, pvList, client.MatchingLabels{common.LabelDataUploadUID: dataUploadUID}); err != nil {
 			return fmt.Errorf("failed to list PVs by label: %w", err)
 		}
 		if len(pvList.Items) == 0 {
-			logger.V(1).Info("No PV found with label, already cleaned up", "label", common.LabelDataUploadName, "value", dataUploadName)
+			logger.V(1).Info("No PV found with label, already cleaned up", "label", common.LabelDataUploadUID, "value", dataUploadUID)
 			return nil
 		}
 		if len(pvList.Items) > 1 {
@@ -386,7 +392,7 @@ func (r *KubeVirtDataUploadReconciler) cleanupReboundPVCAndPV(
 		}
 		pv = &pvList.Items[0]
 		pvName = pv.Name
-		logger.Info("Found PV by label", "pv", pvName, "label", common.LabelDataUploadName)
+		logger.Info("Found PV by label", "pv", pvName, "label", common.LabelDataUploadUID)
 	}
 
 	// Set reclaim policy to Delete to ensure underlying storage is cleaned up

@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
+	"github.com/migtools/kubevirt-datamover-controller/pkg/common"
 	velero "github.com/vmware-tanzu/velero/pkg/plugin/velero"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -156,7 +157,7 @@ func LoadConfigFromEnv() (*UploaderConfig, error) {
 		config.BackupType = "full"
 	}
 	if config.VMBTName == "" && config.VMName != "" {
-		config.VMBTName = "vmbt-" + config.VMName
+		config.VMBTName = common.SafeResourceName("vmbt-", config.VMName)
 	}
 
 	// Validate required fields
