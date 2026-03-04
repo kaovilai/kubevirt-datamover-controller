@@ -1476,7 +1476,7 @@ func TestArchiveKubeResources(t *testing.T) {
 			expectError: true,
 		},
 		{
-			name: "fails when VMBT not found (fatal)",
+			name: "reconstructs VMBT when not found in cluster",
 			config: &UploaderConfig{
 				BSLBucket:      "test-bucket",
 				VMName:         "test-vm",
@@ -1500,7 +1500,30 @@ func TestArchiveKubeResources(t *testing.T) {
 					},
 				},
 			},
-			expectError: true,
+			expectError: false,
+			validateResult: func(t *testing.T, store *MockObjectStore, paths *archivedPaths) {
+				if paths.VMBTObjectPath == "" {
+					t.Error("expected VMBT to be archived even when reconstructed")
+				}
+				// Verify the reconstructed VMBT was archived with correct checkpoint
+				data, err := getObjectBytes(store, "test-bucket", paths.VMBTObjectPath)
+				if err != nil {
+					t.Fatalf("failed to read archived VMBT: %v", err)
+				}
+				var vmbt kubevirtbackupv1alpha1.VirtualMachineBackupTracker
+				if err := json.Unmarshal(data, &vmbt); err != nil {
+					t.Fatalf("failed to unmarshal archived VMBT: %v", err)
+				}
+				if vmbt.Name != "vmbt-nonexistent" {
+					t.Errorf("reconstructed VMBT name = %q, want %q", vmbt.Name, "vmbt-nonexistent")
+				}
+				if vmbt.Status == nil || vmbt.Status.LatestCheckpoint == nil {
+					t.Fatal("expected LatestCheckpoint to be set on reconstructed VMBT")
+				}
+				if vmbt.Status.LatestCheckpoint.Name != "cp-001" {
+					t.Errorf("LatestCheckpoint = %q, want %q", vmbt.Status.LatestCheckpoint.Name, "cp-001")
+				}
+			},
 		},
 		{
 			name: "handles empty VMBName and VMBTName",

@@ -234,6 +234,20 @@ func (r *KubeVirtDataUploadReconciler) handleAccepted(ctx context.Context, logge
 		return ctrl.Result{}, nil
 	}
 
+	// Serialize per VM: only the oldest DataUpload for a given VM proceeds.
+	// All younger DUs wait until the older one reaches a terminal phase (Completed/Failed).
+	// This ensures the previous backup's checkpoint is uploaded to S3 before the
+	// next backup starts, enabling incremental backups.
+	shouldWait, blockingDU, err := r.hasOlderActiveDUForVM(ctx, du)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if shouldWait {
+		logger.Info("Another DataUpload is still active for this VM, waiting",
+			"vm", vmRef.Name, "blockingDU", blockingDU)
+		return ctrl.Result{RequeueAfter: RequeueAfterLong}, nil
+	}
+
 	// Step 0: Verify BSL exists and is Available before creating any resources.
 	// BSL must be in Available phase — if it's not, fail immediately rather than
 	// creating resources (PVC, VMBT, VMB) that will be wasted.
@@ -999,16 +1013,40 @@ func (r *KubeVirtDataUploadReconciler) ensureTempPVC(ctx context.Context, logger
 
 // prepareVMBackupTracker creates a VirtualMachineBackupTracker for the VM,
 // restoring the LatestCheckpoint from the archived VMBT in S3 if available.
-// Any existing VMBT is deleted first to avoid conflicts (S3 is the source of truth).
+// Existing VMBTs are deleted first unless they are still referenced by an active
+// (non-terminal) VMB, to avoid destroying VMBTs used by concurrent DataUploads.
 func (r *KubeVirtDataUploadReconciler) prepareVMBackupTracker(ctx context.Context, logger logr.Logger, du *velerov2alpha1.DataUpload, vmName, vmNamespace string) (*kubevirtbackupv1alpha1.VirtualMachineBackupTracker, error) {
-	// Delete any existing VMBT for this VM before creating a new one.
-	// This ensures we always start from the state restored from S3.
+	// Delete existing VMBTs for this VM before creating a new one, but only if
+	// they are not still referenced by an active (non-terminal) VMB. This prevents
+	// concurrent DataUploads from destroying each other's VMBTs.
 	existingVMBTList := &kubevirtbackupv1alpha1.VirtualMachineBackupTrackerList{}
 	if err := r.List(ctx, existingVMBTList, client.InNamespace(vmNamespace), client.MatchingLabels{common.LabelVMNameHash: common.HashForLabel(vmName)}); err != nil {
 		return nil, fmt.Errorf("failed to list existing VMBTs: %w", err)
 	}
+
+	// Pre-fetch all VMBs in the namespace to check references
+	allVMBs := &kubevirtbackupv1alpha1.VirtualMachineBackupList{}
+	if err := r.List(ctx, allVMBs, client.InNamespace(vmNamespace)); err != nil {
+		return nil, fmt.Errorf("failed to list VMBs: %w", err)
+	}
+
 	for i := range existingVMBTList.Items {
 		vmbtToDelete := &existingVMBTList.Items[i]
+
+		// Check if any non-terminal VMB still references this VMBT
+		referenced := false
+		for j := range allVMBs.Items {
+			if allVMBs.Items[j].Spec.Source.Name == vmbtToDelete.Name && !isVMBTerminal(&allVMBs.Items[j]) {
+				referenced = true
+				break
+			}
+		}
+		if referenced {
+			logger.Info("Skipping VMBT deletion, still referenced by active VMB",
+				"vmbt", vmbtToDelete.Name)
+			continue
+		}
+
 		logger.Info("Deleting existing VMBT before recreation", "vmbt", vmbtToDelete.Name)
 		if err := r.Delete(ctx, vmbtToDelete); err != nil && !errors.IsNotFound(err) {
 			return nil, fmt.Errorf("failed to delete existing VMBT %s: %w", vmbtToDelete.Name, err)
@@ -1237,6 +1275,93 @@ func (r *KubeVirtDataUploadReconciler) findVMBForDataUpload(ctx context.Context,
 		return nil, fmt.Errorf("found multiple VirtualMachineBackups for DataUpload %s", du.Name)
 	}
 	return &vmbList.Items[0], nil
+}
+
+// isVMBTerminal returns true if the VMB has reached a terminal state:
+// Done=True (success) or Done=False + Progressing=False (failure).
+func isVMBTerminal(vmb *kubevirtbackupv1alpha1.VirtualMachineBackup) bool {
+	if vmb.Status == nil {
+		return false
+	}
+	var doneCond, progressingCond *kubevirtbackupv1alpha1.Condition
+	for i := range vmb.Status.Conditions {
+		switch vmb.Status.Conditions[i].Type {
+		case kubevirtbackupv1alpha1.ConditionDone:
+			doneCond = &vmb.Status.Conditions[i]
+		case kubevirtbackupv1alpha1.ConditionProgressing:
+			progressingCond = &vmb.Status.Conditions[i]
+		}
+	}
+	if doneCond == nil {
+		return false
+	}
+	if doneCond.Status == corev1.ConditionTrue {
+		return true
+	}
+	return progressingCond != nil && progressingCond.Status == corev1.ConditionFalse
+}
+
+// hasOlderActiveDUForVM checks if an older DataUpload targeting the same VM is
+// still in an active phase (Accepted, Prepared, InProgress). This serializes
+// backups per VM so that each backup completes (including S3 upload) before the
+// next one starts, enabling incremental backups through checkpoint chaining.
+// The oldest DU (by CreationTimestamp, then UID) always wins.
+func (r *KubeVirtDataUploadReconciler) hasOlderActiveDUForVM(ctx context.Context, du *velerov2alpha1.DataUpload) (bool, string, error) {
+	vmName := du.Annotations[common.AnnotationVMName]
+	if vmName == "" {
+		return false, "", nil
+	}
+	vmNamespace := du.Annotations[common.AnnotationVMNamespace]
+	if vmNamespace == "" {
+		vmNamespace = du.Spec.SourceNamespace
+	}
+
+	duList := &velerov2alpha1.DataUploadList{}
+	if err := r.List(ctx, duList, client.InNamespace(du.Namespace)); err != nil {
+		return false, "", fmt.Errorf("failed to list DataUploads: %w", err)
+	}
+
+	for i := range duList.Items {
+		other := &duList.Items[i]
+		if other.UID == du.UID {
+			continue
+		}
+		if other.Spec.DataMover != common.DataMoverKubeVirt {
+			continue
+		}
+
+		// Must target the same VM
+		otherVMName := other.Annotations[common.AnnotationVMName]
+		if otherVMName != vmName {
+			continue
+		}
+		otherVMNs := other.Annotations[common.AnnotationVMNamespace]
+		if otherVMNs == "" {
+			otherVMNs = other.Spec.SourceNamespace
+		}
+		if otherVMNs != vmNamespace {
+			continue
+		}
+
+		// Must be in an active (non-terminal) phase
+		switch other.Status.Phase {
+		case "", velerov2alpha1.DataUploadPhaseNew,
+			velerov2alpha1.DataUploadPhaseAccepted,
+			velerov2alpha1.DataUploadPhasePrepared,
+			velerov2alpha1.DataUploadPhaseInProgress:
+		default:
+			continue
+		}
+
+		// Older DU takes priority; same timestamp uses UID as tiebreaker
+		if other.CreationTimestamp.Before(&du.CreationTimestamp) {
+			return true, other.Name, nil
+		}
+		if other.CreationTimestamp.Equal(&du.CreationTimestamp) && string(other.UID) < string(du.UID) {
+			return true, other.Name, nil
+		}
+	}
+	return false, "", nil
 }
 
 // getVeleroBackupName extracts the Velero backup name from DataUpload labels
