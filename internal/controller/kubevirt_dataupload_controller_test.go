@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-logr/logr"
 	"github.com/migtools/kubevirt-datamover-controller/pkg/common"
@@ -935,6 +936,478 @@ func TestHandleAccepted_VMBStatusDetection(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestIsVMBTerminal(t *testing.T) {
+	tests := []struct {
+		name     string
+		vmb      *kubevirtbackupv1alpha1.VirtualMachineBackup
+		expected bool
+	}{
+		{
+			name: "nil status is not terminal",
+			vmb: &kubevirtbackupv1alpha1.VirtualMachineBackup{
+				Status: nil,
+			},
+			expected: false,
+		},
+		{
+			name: "no conditions is not terminal",
+			vmb: &kubevirtbackupv1alpha1.VirtualMachineBackup{
+				Status: &kubevirtbackupv1alpha1.VirtualMachineBackupStatus{
+					Conditions: []kubevirtbackupv1alpha1.Condition{},
+				},
+			},
+			expected: false,
+		},
+		{
+			name: "Done=True is terminal (success)",
+			vmb: &kubevirtbackupv1alpha1.VirtualMachineBackup{
+				Status: &kubevirtbackupv1alpha1.VirtualMachineBackupStatus{
+					Conditions: []kubevirtbackupv1alpha1.Condition{
+						{Type: kubevirtbackupv1alpha1.ConditionDone, Status: corev1.ConditionTrue},
+						{Type: kubevirtbackupv1alpha1.ConditionProgressing, Status: corev1.ConditionFalse},
+					},
+				},
+			},
+			expected: true,
+		},
+		{
+			name: "Done=False + Progressing=False is terminal (failure)",
+			vmb: &kubevirtbackupv1alpha1.VirtualMachineBackup{
+				Status: &kubevirtbackupv1alpha1.VirtualMachineBackupStatus{
+					Conditions: []kubevirtbackupv1alpha1.Condition{
+						{Type: kubevirtbackupv1alpha1.ConditionDone, Status: corev1.ConditionFalse},
+						{Type: kubevirtbackupv1alpha1.ConditionProgressing, Status: corev1.ConditionFalse},
+					},
+				},
+			},
+			expected: true,
+		},
+		{
+			name: "Progressing=True + Done=False is not terminal (in progress)",
+			vmb: &kubevirtbackupv1alpha1.VirtualMachineBackup{
+				Status: &kubevirtbackupv1alpha1.VirtualMachineBackupStatus{
+					Conditions: []kubevirtbackupv1alpha1.Condition{
+						{Type: kubevirtbackupv1alpha1.ConditionDone, Status: corev1.ConditionFalse},
+						{Type: kubevirtbackupv1alpha1.ConditionProgressing, Status: corev1.ConditionTrue},
+					},
+				},
+			},
+			expected: false,
+		},
+		{
+			name: "Initializing=True only is not terminal",
+			vmb: &kubevirtbackupv1alpha1.VirtualMachineBackup{
+				Status: &kubevirtbackupv1alpha1.VirtualMachineBackupStatus{
+					Conditions: []kubevirtbackupv1alpha1.Condition{
+						{Type: kubevirtbackupv1alpha1.ConditionInitializing, Status: corev1.ConditionTrue},
+						{Type: kubevirtbackupv1alpha1.ConditionProgressing, Status: corev1.ConditionFalse},
+					},
+				},
+			},
+			expected: false,
+		},
+		{
+			name: "Done=False without Progressing is not terminal",
+			vmb: &kubevirtbackupv1alpha1.VirtualMachineBackup{
+				Status: &kubevirtbackupv1alpha1.VirtualMachineBackupStatus{
+					Conditions: []kubevirtbackupv1alpha1.Condition{
+						{Type: kubevirtbackupv1alpha1.ConditionDone, Status: corev1.ConditionFalse},
+					},
+				},
+			},
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isVMBTerminal(tt.vmb)
+			if got != tt.expected {
+				t.Errorf("isVMBTerminal() = %v, want %v", got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestHasOlderActiveDUForVM(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+
+	vmName := "test-vm"
+	vmNamespace := "vm-ns"
+	oadpNs := "openshift-adp"
+
+	// Use second-precision times to avoid nanosecond issues with fake client
+	baseTime := metav1.NewTime(time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC))
+	olderTime := metav1.NewTime(time.Date(2026, 1, 1, 11, 59, 0, 0, time.UTC))
+	newerTime := metav1.NewTime(time.Date(2026, 1, 1, 12, 1, 0, 0, time.UTC))
+
+	makeDU := func(name string, uid types.UID, phase velerov2alpha1.DataUploadPhase, creationTime metav1.Time, vm, vmNs string) *velerov2alpha1.DataUpload {
+		return &velerov2alpha1.DataUpload{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              name,
+				Namespace:         oadpNs,
+				UID:               uid,
+				CreationTimestamp: creationTime,
+				Annotations: map[string]string{
+					common.AnnotationVMName:      vm,
+					common.AnnotationVMNamespace: vmNs,
+				},
+			},
+			Spec: velerov2alpha1.DataUploadSpec{
+				DataMover:       common.DataMoverKubeVirt,
+				SourceNamespace: vmNs,
+			},
+			Status: velerov2alpha1.DataUploadStatus{
+				Phase: phase,
+			},
+		}
+	}
+
+	// The DU we're testing (current)
+	currentDU := makeDU("du-current", "current-uid", velerov2alpha1.DataUploadPhaseAccepted, baseTime, vmName, vmNamespace)
+
+	tests := []struct {
+		name        string
+		otherDUs    []client.Object
+		wantWait    bool
+		wantBlocked string
+	}{
+		{
+			name:     "no other DUs",
+			otherDUs: []client.Object{},
+			wantWait: false,
+		},
+		{
+			name: "other DU targets different VM",
+			otherDUs: []client.Object{
+				makeDU("du-other", "other-uid", velerov2alpha1.DataUploadPhaseAccepted, olderTime, "different-vm", vmNamespace),
+			},
+			wantWait: false,
+		},
+		{
+			name: "other DU targets same VM in different namespace",
+			otherDUs: []client.Object{
+				makeDU("du-other", "other-uid", velerov2alpha1.DataUploadPhaseAccepted, olderTime, vmName, "other-ns"),
+			},
+			wantWait: false,
+		},
+		{
+			name: "older DU in Completed phase (terminal)",
+			otherDUs: []client.Object{
+				makeDU("du-other", "other-uid", velerov2alpha1.DataUploadPhaseCompleted, olderTime, vmName, vmNamespace),
+			},
+			wantWait: false,
+		},
+		{
+			name: "older DU in Failed phase (terminal)",
+			otherDUs: []client.Object{
+				makeDU("du-other", "other-uid", velerov2alpha1.DataUploadPhaseFailed, olderTime, vmName, vmNamespace),
+			},
+			wantWait: false,
+		},
+		{
+			name: "older DU in New phase — should wait",
+			otherDUs: []client.Object{
+				makeDU("du-other", "other-uid", velerov2alpha1.DataUploadPhaseNew, olderTime, vmName, vmNamespace),
+			},
+			wantWait:    true,
+			wantBlocked: "du-other",
+		},
+		{
+			name: "older DU in Accepted phase — should wait",
+			otherDUs: []client.Object{
+				makeDU("du-other", "other-uid", velerov2alpha1.DataUploadPhaseAccepted, olderTime, vmName, vmNamespace),
+			},
+			wantWait:    true,
+			wantBlocked: "du-other",
+		},
+		{
+			name: "older DU in Prepared phase — should wait",
+			otherDUs: []client.Object{
+				makeDU("du-other", "other-uid", velerov2alpha1.DataUploadPhasePrepared, olderTime, vmName, vmNamespace),
+			},
+			wantWait:    true,
+			wantBlocked: "du-other",
+		},
+		{
+			name: "older DU in InProgress phase — should wait",
+			otherDUs: []client.Object{
+				makeDU("du-other", "other-uid", velerov2alpha1.DataUploadPhaseInProgress, olderTime, vmName, vmNamespace),
+			},
+			wantWait:    true,
+			wantBlocked: "du-other",
+		},
+		{
+			name: "newer DU in Accepted phase — should NOT wait",
+			otherDUs: []client.Object{
+				makeDU("du-other", "other-uid", velerov2alpha1.DataUploadPhaseAccepted, newerTime, vmName, vmNamespace),
+			},
+			wantWait: false,
+		},
+		{
+			name: "same timestamp, lower UID — should wait",
+			otherDUs: []client.Object{
+				makeDU("du-other", "aaa-uid", velerov2alpha1.DataUploadPhaseAccepted, baseTime, vmName, vmNamespace),
+			},
+			wantWait:    true,
+			wantBlocked: "du-other",
+		},
+		{
+			name: "same timestamp, higher UID — should NOT wait",
+			otherDUs: []client.Object{
+				makeDU("du-other", "zzz-uid", velerov2alpha1.DataUploadPhaseAccepted, baseTime, vmName, vmNamespace),
+			},
+			wantWait: false,
+		},
+		{
+			name: "non-kubevirt DU is ignored",
+			otherDUs: []client.Object{
+				func() *velerov2alpha1.DataUpload {
+					du := makeDU("du-other", "other-uid", velerov2alpha1.DataUploadPhaseAccepted, olderTime, vmName, vmNamespace)
+					du.Spec.DataMover = "kopia"
+					return du
+				}(),
+			},
+			wantWait: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			objs := append([]client.Object{currentDU.DeepCopy()}, tt.otherDUs...)
+			fakeClient := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(objs...).
+				Build()
+
+			r := &KubeVirtDataUploadReconciler{
+				Client:        fakeClient,
+				Scheme:        scheme,
+				Log:           logr.Discard(),
+				OADPNamespace: oadpNs,
+			}
+
+			shouldWait, blockingDU, err := r.hasOlderActiveDUForVM(context.Background(), currentDU.DeepCopy())
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if shouldWait != tt.wantWait {
+				t.Errorf("hasOlderActiveDUForVM() shouldWait = %v, want %v", shouldWait, tt.wantWait)
+			}
+			if tt.wantWait && blockingDU != tt.wantBlocked {
+				t.Errorf("hasOlderActiveDUForVM() blockingDU = %q, want %q", blockingDU, tt.wantBlocked)
+			}
+		})
+	}
+}
+
+func TestHandleAccepted_RequeuesWhenOlderDUActive(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = kubevirtbackupv1alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+	_ = velerov1.AddToScheme(scheme)
+
+	vmName := "test-vm"
+	vmNamespace := "vm-ns"
+	oadpNs := "openshift-adp"
+
+	olderTime := metav1.NewTime(time.Date(2026, 1, 1, 11, 59, 0, 0, time.UTC))
+	newerTime := metav1.NewTime(time.Date(2026, 1, 1, 12, 1, 0, 0, time.UTC))
+
+	// DU-1 (older) is in InProgress — still uploading to S3
+	du1 := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "du-1",
+			Namespace:         oadpNs,
+			UID:               types.UID("du-1-uid"),
+			CreationTimestamp: olderTime,
+			Annotations: map[string]string{
+				common.AnnotationVMName:      vmName,
+				common.AnnotationVMNamespace: vmNamespace,
+			},
+		},
+		Spec: velerov2alpha1.DataUploadSpec{
+			DataMover:       common.DataMoverKubeVirt,
+			SourceNamespace: vmNamespace,
+		},
+		Status: velerov2alpha1.DataUploadStatus{
+			Phase: velerov2alpha1.DataUploadPhaseInProgress,
+		},
+	}
+
+	// DU-2 (newer) just entered Accepted — should wait for DU-1
+	du2 := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "du-2",
+			Namespace:         oadpNs,
+			UID:               types.UID("du-2-uid"),
+			CreationTimestamp: newerTime,
+			Annotations: map[string]string{
+				common.AnnotationVMName:      vmName,
+				common.AnnotationVMNamespace: vmNamespace,
+			},
+		},
+		Spec: velerov2alpha1.DataUploadSpec{
+			DataMover:             common.DataMoverKubeVirt,
+			BackupStorageLocation: "default",
+			SourceNamespace:       vmNamespace,
+		},
+		Status: velerov2alpha1.DataUploadStatus{
+			Phase: velerov2alpha1.DataUploadPhaseAccepted,
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(du1, du2).
+		Build()
+
+	r := &KubeVirtDataUploadReconciler{
+		Client:        fakeClient,
+		Scheme:        scheme,
+		Log:           logr.Discard(),
+		OADPNamespace: oadpNs,
+	}
+
+	result, err := r.handleAccepted(context.Background(), logr.Discard(), du2)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if result.RequeueAfter != RequeueAfterLong {
+		t.Errorf("expected RequeueAfter=%v (RequeueAfterLong), got %v", RequeueAfterLong, result.RequeueAfter)
+	}
+}
+
+func TestHandleAccepted_ProceedsWhenOlderDUCompleted(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = kubevirtbackupv1alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+	_ = velerov1.AddToScheme(scheme)
+
+	vmName := "test-vm"
+	vmNamespace := "vm-ns"
+	oadpNs := "openshift-adp"
+
+	olderTime := metav1.NewTime(time.Date(2026, 1, 1, 11, 59, 0, 0, time.UTC))
+	newerTime := metav1.NewTime(time.Date(2026, 1, 1, 12, 1, 0, 0, time.UTC))
+
+	// DU-1 (older) is Completed — should not block
+	du1 := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "du-1",
+			Namespace:         oadpNs,
+			UID:               types.UID("du-1-uid"),
+			CreationTimestamp: olderTime,
+			Annotations: map[string]string{
+				common.AnnotationVMName:      vmName,
+				common.AnnotationVMNamespace: vmNamespace,
+			},
+		},
+		Spec: velerov2alpha1.DataUploadSpec{
+			DataMover:       common.DataMoverKubeVirt,
+			SourceNamespace: vmNamespace,
+		},
+		Status: velerov2alpha1.DataUploadStatus{
+			Phase: velerov2alpha1.DataUploadPhaseCompleted,
+		},
+	}
+
+	// DU-1's old VMBT still exists in the VM namespace
+	vmbt1 := &kubevirtbackupv1alpha1.VirtualMachineBackupTracker{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "vmbt-test-vm-aaa",
+			Namespace: vmNamespace,
+			Labels: map[string]string{
+				common.LabelVMNameHash:    common.HashForLabel(vmName),
+				common.LabelDataUploadUID: string(du1.UID),
+			},
+		},
+	}
+
+	// DU-2 (newer) — should proceed since DU-1 is terminal
+	du2 := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "du-2",
+			Namespace:         oadpNs,
+			UID:               types.UID("du-2-uid"),
+			CreationTimestamp: newerTime,
+			Annotations: map[string]string{
+				common.AnnotationVMName:      vmName,
+				common.AnnotationVMNamespace: vmNamespace,
+			},
+		},
+		Spec: velerov2alpha1.DataUploadSpec{
+			DataMover:             common.DataMoverKubeVirt,
+			BackupStorageLocation: "default",
+			SourceNamespace:       vmNamespace,
+		},
+		Status: velerov2alpha1.DataUploadStatus{
+			Phase: velerov2alpha1.DataUploadPhaseAccepted,
+		},
+	}
+
+	bsl := &velerov1.BackupStorageLocation{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "default",
+			Namespace: oadpNs,
+		},
+		Spec: velerov1.BackupStorageLocationSpec{
+			Provider: "aws",
+			StorageType: velerov1.StorageType{
+				ObjectStorage: &velerov1.ObjectStorageLocation{Bucket: "b", Prefix: "v"},
+			},
+			Config:     map[string]string{"region": "us-east-1"},
+			Credential: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "c"}, Key: "cloud"},
+		},
+		Status: velerov1.BackupStorageLocationStatus{Phase: velerov1.BackupStorageLocationPhaseAvailable},
+	}
+
+	// Temp PVC for DU-2
+	tempPVC := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "kubevirt-backup-du-2",
+			Namespace: vmNamespace,
+			Labels:    map[string]string{common.LabelDataUploadUID: "du-2-uid"},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(du1, du2, bsl, tempPVC, vmbt1).
+		Build()
+
+	r := &KubeVirtDataUploadReconciler{
+		Client:        fakeClient,
+		Scheme:        scheme,
+		Log:           logr.Discard(),
+		OADPNamespace: oadpNs,
+	}
+
+	_, err := r.handleAccepted(context.Background(), logr.Discard(), du2)
+
+	// DU-2 should NOT be blocked — DU-1 is Completed (terminal).
+	// It will proceed into prepareVMBackupTracker, which will fail because
+	// BSL credentials aren't fully set up in this test. That's fine — we're
+	// testing that the serialization guard does NOT block.
+	// The important assertion is that DU-1's VMBT gets deleted (normal cleanup).
+	deletedVMBT := &kubevirtbackupv1alpha1.VirtualMachineBackupTracker{}
+	getErr := fakeClient.Get(context.Background(), types.NamespacedName{
+		Name: vmbt1.Name, Namespace: vmNamespace,
+	}, deletedVMBT)
+
+	// prepareVMBackupTracker should have deleted DU-1's old VMBT
+	if getErr == nil {
+		t.Error("expected DU-1's VMBT to be deleted by prepareVMBackupTracker, but it still exists")
+	}
+	// We don't care about the error from handleAccepted itself — it may fail
+	// on BSL credential lookup. The point is it got past the serialization guard.
+	_ = err
 }
 
 // strPtr returns a pointer to the given string
@@ -5112,6 +5585,197 @@ func TestPrepareVMBackupTracker_DeletesExisting(t *testing.T) {
 	if vmbt.Labels[common.LabelVMNameHash] != common.HashForLabel(vmName) {
 		t.Errorf("expected new VMBT to have label %s, got %q",
 			common.LabelVMNameHash, vmbt.Labels[common.LabelVMNameHash])
+	}
+}
+
+func TestPrepareVMBackupTracker_SkipsReferencedVMBT(t *testing.T) {
+	// A VMBT referenced by a non-terminal VMB must NOT be deleted.
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = kubevirtbackupv1alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	vmName := "test-vm"
+	vmNamespace := "test-ns"
+
+	du := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "du-new",
+			Namespace: vmNamespace,
+			UID:       types.UID("du-new-uid"),
+			Annotations: map[string]string{
+				common.AnnotationVMName:      vmName,
+				common.AnnotationVMNamespace: vmNamespace,
+			},
+		},
+		Spec: velerov2alpha1.DataUploadSpec{
+			DataMover: common.DataMoverKubeVirt,
+		},
+	}
+
+	// VMBT from another DU, still referenced by an active VMB
+	otherVMBT := &kubevirtbackupv1alpha1.VirtualMachineBackupTracker{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "vmbt-test-vm-other",
+			Namespace: vmNamespace,
+			Labels: map[string]string{
+				common.LabelVMNameHash:    common.HashForLabel(vmName),
+				common.LabelDataUploadUID: "other-du-uid",
+			},
+		},
+		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupTrackerSpec{
+			Source: corev1.TypedLocalObjectReference{
+				APIGroup: strPtr("kubevirt.io"),
+				Kind:     "VirtualMachine",
+				Name:     vmName,
+			},
+		},
+	}
+
+	// Active (non-terminal) VMB referencing the other VMBT
+	activeVMB := &kubevirtbackupv1alpha1.VirtualMachineBackup{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "vmb-other-du",
+			Namespace: vmNamespace,
+			Labels: map[string]string{
+				common.LabelDataUploadUID: "other-du-uid",
+			},
+		},
+		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupSpec{
+			Source: corev1.TypedLocalObjectReference{
+				APIGroup: strPtr("backup.kubevirt.io"),
+				Kind:     "VirtualMachineBackupTracker",
+				Name:     otherVMBT.Name,
+			},
+		},
+		// nil status = non-terminal
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(du, otherVMBT, activeVMB).
+		Build()
+
+	r := &KubeVirtDataUploadReconciler{
+		Client:        fakeClient,
+		Scheme:        scheme,
+		Log:           logr.Discard(),
+		OADPNamespace: vmNamespace,
+	}
+
+	vmbt, err := r.prepareVMBackupTracker(context.Background(), logr.Discard(), du, vmName, vmNamespace)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// New VMBT should be created
+	if vmbt == nil {
+		t.Fatal("expected new VMBT to be created")
+	}
+	if vmbt.Name == otherVMBT.Name {
+		t.Error("new VMBT should not be the same object as the protected VMBT")
+	}
+
+	// The other VMBT must NOT be deleted
+	preserved := &kubevirtbackupv1alpha1.VirtualMachineBackupTracker{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{
+		Name: otherVMBT.Name, Namespace: vmNamespace,
+	}, preserved); err != nil {
+		t.Errorf("referenced VMBT was deleted when it should have been preserved: %v", err)
+	}
+}
+
+func TestPrepareVMBackupTracker_DeletesVMBTWithTerminalVMB(t *testing.T) {
+	// A VMBT referenced by a terminal VMB (Done=True) should be deleted normally.
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = kubevirtbackupv1alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	vmName := "test-vm"
+	vmNamespace := "test-ns"
+
+	du := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "du-new",
+			Namespace: vmNamespace,
+			UID:       types.UID("du-new-uid"),
+			Annotations: map[string]string{
+				common.AnnotationVMName:      vmName,
+				common.AnnotationVMNamespace: vmNamespace,
+			},
+		},
+		Spec: velerov2alpha1.DataUploadSpec{
+			DataMover: common.DataMoverKubeVirt,
+		},
+	}
+
+	// VMBT from a completed DU
+	oldVMBT := &kubevirtbackupv1alpha1.VirtualMachineBackupTracker{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "vmbt-test-vm-done",
+			Namespace: vmNamespace,
+			Labels: map[string]string{
+				common.LabelVMNameHash:    common.HashForLabel(vmName),
+				common.LabelDataUploadUID: "old-du-uid",
+			},
+		},
+		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupTrackerSpec{
+			Source: corev1.TypedLocalObjectReference{
+				APIGroup: strPtr("kubevirt.io"),
+				Kind:     "VirtualMachine",
+				Name:     vmName,
+			},
+		},
+	}
+
+	// Terminal VMB (Done=True) referencing the old VMBT
+	terminalVMB := &kubevirtbackupv1alpha1.VirtualMachineBackup{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "vmb-old-du",
+			Namespace: vmNamespace,
+			Labels: map[string]string{
+				common.LabelDataUploadUID: "old-du-uid",
+			},
+		},
+		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupSpec{
+			Source: corev1.TypedLocalObjectReference{
+				APIGroup: strPtr("backup.kubevirt.io"),
+				Kind:     "VirtualMachineBackupTracker",
+				Name:     oldVMBT.Name,
+			},
+		},
+		Status: &kubevirtbackupv1alpha1.VirtualMachineBackupStatus{
+			Conditions: []kubevirtbackupv1alpha1.Condition{
+				{Type: kubevirtbackupv1alpha1.ConditionDone, Status: corev1.ConditionTrue},
+				{Type: kubevirtbackupv1alpha1.ConditionProgressing, Status: corev1.ConditionFalse},
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(du, oldVMBT, terminalVMB).
+		Build()
+
+	r := &KubeVirtDataUploadReconciler{
+		Client:        fakeClient,
+		Scheme:        scheme,
+		Log:           logr.Discard(),
+		OADPNamespace: vmNamespace,
+	}
+
+	_, err := r.prepareVMBackupTracker(context.Background(), logr.Discard(), du, vmName, vmNamespace)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// The old VMBT should be deleted (its VMB is terminal)
+	deleted := &kubevirtbackupv1alpha1.VirtualMachineBackupTracker{}
+	if err := fakeClient.Get(context.Background(), types.NamespacedName{
+		Name: oldVMBT.Name, Namespace: vmNamespace,
+	}, deleted); err == nil {
+		t.Error("expected old VMBT to be deleted (VMB is terminal), but it still exists")
 	}
 }
 

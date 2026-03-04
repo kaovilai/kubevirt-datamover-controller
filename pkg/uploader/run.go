@@ -31,13 +31,17 @@ import (
 	"github.com/go-logr/logr"
 	"github.com/migtools/kubevirt-datamover-controller/pkg/common"
 	velero "github.com/vmware-tanzu/velero/pkg/plugin/velero"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	kubevirtbackupv1alpha1 "kubevirt.io/api/backup/v1alpha1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	restcfg "sigs.k8s.io/controller-runtime/pkg/client/config"
 )
+
+const apiGroupKubeVirt = "kubevirt.io"
 
 // Helper functions for working with velero.ObjectStore interface
 
@@ -568,8 +572,16 @@ func archiveKubeResources(
 		if err := k8sClient.Get(ctx, types.NamespacedName{
 			Name: cfg.VMBTName, Namespace: cfg.VMNamespace,
 		}, vmbt); err != nil {
-			return nil, fmt.Errorf("failed to fetch VMBT %s/%s: %w",
-				cfg.VMNamespace, cfg.VMBTName, err)
+			if !apierrors.IsNotFound(err) {
+				return nil, fmt.Errorf("failed to fetch VMBT %s/%s: %w",
+					cfg.VMNamespace, cfg.VMBTName, err)
+			}
+			// VMBT was deleted by a concurrent DataUpload's prepareVMBackupTracker.
+			// Reconstruct a minimal VMBT for archiving — the only field the controller
+			// reads back is Status.LatestCheckpoint, which we set below anyway.
+			logger.Info("VMBT not found in cluster, reconstructing for archival",
+				"vmbt", cfg.VMBTName)
+			vmbt = reconstructVMBT(cfg)
 		}
 
 		// Set LatestCheckpoint to the current checkpoint so the next backup
@@ -599,6 +611,28 @@ func archiveKubeResources(
 	}
 
 	return paths, nil
+}
+
+// reconstructVMBT builds a minimal VirtualMachineBackupTracker from the uploader
+// config. Used when the VMBT was deleted from the cluster by a concurrent
+// DataUpload before the datamover pod could archive it. The only field the
+// controller reads from the archived vmbt.json is Status.LatestCheckpoint,
+// which is set by the caller after this function returns.
+func reconstructVMBT(cfg *UploaderConfig) *kubevirtbackupv1alpha1.VirtualMachineBackupTracker {
+	apiGroup := apiGroupKubeVirt
+	return &kubevirtbackupv1alpha1.VirtualMachineBackupTracker{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      cfg.VMBTName,
+			Namespace: cfg.VMNamespace,
+		},
+		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupTrackerSpec{
+			Source: corev1.TypedLocalObjectReference{
+				APIGroup: &apiGroup,
+				Kind:     "VirtualMachine",
+				Name:     cfg.VMName,
+			},
+		},
+	}
 }
 
 // cleanupKubeResources deletes VMB and VMBT CRs from the cluster after they have
