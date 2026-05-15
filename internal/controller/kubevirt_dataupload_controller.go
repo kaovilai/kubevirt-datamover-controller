@@ -611,8 +611,8 @@ func (r *KubeVirtDataUploadReconciler) validateBSLCheckpoint(ctx context.Context
 			"message", checkpointLookup.Message)
 	} else if checkpointLookup != nil && !checkpointLookup.Found {
 		// No checkpoint found — first backup or all data deleted.
-		// ForceFullBackup not strictly needed (KubeVirt will do full anyway
-		// without a checkpoint), but set it for clarity.
+		// The default full-backup decision remains in effect (KubeVirt would
+		// also do a full backup without a checkpoint).
 		logger.Info("No valid checkpoint found in BSL, will perform full backup",
 			"message", checkpointLookup.Message)
 	}
