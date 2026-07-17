@@ -804,7 +804,7 @@ func (r *KubeVirtDataUploadReconciler) handlePrepared(ctx context.Context, logge
 			"sourceNamespace", vmRef.Namespace,
 			"targetNamespace", podNamespace)
 
-		rebindResult, err := rebindPVToNamespace(ctx, r.Client, logger, sourcePVCName, vmRef.Namespace, podNamespace, du.Name, string(du.UID), common.LabelDataUploadUID, common.AnnotationDataUploadName)
+		rebindResult, err := rebindPVToNamespace(ctx, r.Client, logger, sourcePVCName, vmRef.Namespace, podNamespace, du.Name, string(du.UID), common.LabelDataUploadUID, common.AnnotationDataUploadName, BindTargetCreate, "")
 		if err != nil {
 			// Fail without retry: PV rebind is a multi-step operation (delete PVC, patch PV, create new PVC).
 			// If it fails partway through, automatic retries could leave resources in an inconsistent state.

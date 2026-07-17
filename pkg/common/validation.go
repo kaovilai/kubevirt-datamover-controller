@@ -36,22 +36,40 @@ func GetVMReference(du *velerov2alpha1api.DataUpload) (*VMReference, error) {
 	if du == nil {
 		return nil, fmt.Errorf("DataUpload is nil")
 	}
+	return vmReferenceFrom(du.GetAnnotations(), du.Spec.SourceNamespace, du.Namespace, du.Name, "DataUpload")
+}
 
-	annotations := du.GetAnnotations()
+// GetVMReferenceFromDataDownload extracts the VirtualMachine reference from DataDownload annotations.
+// It returns the VM name and namespace, or an error if the required annotation is missing.
+// If the namespace annotation is not set, it defaults to the DataDownload's source namespace.
+func GetVMReferenceFromDataDownload(dd *velerov2alpha1api.DataDownload) (*VMReference, error) {
+	if dd == nil {
+		return nil, fmt.Errorf("DataDownload is nil")
+	}
+	return vmReferenceFrom(dd.GetAnnotations(), dd.Spec.SourceNamespace, dd.Namespace, dd.Name, "DataDownload")
+}
+
+// vmReferenceFrom is the shared implementation behind GetVMReference and
+// GetVMReferenceFromDataDownload -- both resolve the same two annotations the
+// same way, differing only in which resource's fields/kind name show up in
+// error messages.
+func vmReferenceFrom(
+	annotations map[string]string, sourceNamespace, namespace, name, kind string,
+) (*VMReference, error) {
 	if annotations == nil {
-		return nil, fmt.Errorf("DataUpload %s/%s has no annotations", du.Namespace, du.Name)
+		return nil, fmt.Errorf("%s %s/%s has no annotations", kind, namespace, name)
 	}
 
 	vmName, ok := annotations[AnnotationVMName]
 	if !ok || vmName == "" {
-		return nil, fmt.Errorf("DataUpload %s/%s missing required annotation %s",
-			du.Namespace, du.Name, AnnotationVMName)
+		return nil, fmt.Errorf("%s %s/%s missing required annotation %s",
+			kind, namespace, name, AnnotationVMName)
 	}
 
 	// Namespace is optional - defaults to source namespace
 	vmNamespace := annotations[AnnotationVMNamespace]
 	if vmNamespace == "" {
-		vmNamespace = du.Spec.SourceNamespace
+		vmNamespace = sourceNamespace
 	}
 
 	return &VMReference{

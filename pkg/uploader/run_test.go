@@ -1399,6 +1399,92 @@ func TestUpdateVMIndex_DedupIncrementalPreservesParent(t *testing.T) {
 		[]string{"backup-day1", "backup-day2", "backup-retry"})
 }
 
+// TestUpdateVMIndex_PVCSizeUsesBoundPVCapacity covers issue #160: storage
+// backends that enforce a minimum volume size above the request (e.g. AWS
+// EBS's 1GiB floor) still expose the full underlying block device to the
+// guest, so the recorded PVCSizes entry must reflect the bound PV's actual
+// capacity, not the smaller PVC request -- otherwise a later restore
+// undersizes its scratch volume against the real on-disk data.
+func TestUpdateVMIndex_PVCSizeUsesBoundPVCapacity(t *testing.T) {
+	scheme := getTestScheme()
+	store := NewMockObjectStore("test-bucket", "")
+
+	config := &UploaderConfig{
+		ObjectStoreConfig: common.ObjectStoreConfig{
+			BSLBucket: "test-bucket",
+		},
+		VMName:           "test-vm",
+		VMNamespace:      "test-ns",
+		CheckpointName:   "cp-001",
+		BackupType:       "full",
+		VMBName:          "vmb-1",
+		VeleroBackupName: "backup-001",
+	}
+	files := []CheckpointFile{
+		{Filename: "vmb-1-disk1.qcow2", DiskName: "disk1", Size: 512,
+			ObjectPath: "checkpoints/test-ns/test-vm/cp-001/vmb-1-disk1.qcow2"},
+	}
+
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "disk1", Namespace: "test-ns"},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			VolumeName: "pv-disk1",
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("150Mi")},
+			},
+		},
+	}
+	pv := &corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{Name: "pv-disk1"},
+		Spec: corev1.PersistentVolumeSpec{
+			Capacity: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("1Gi")},
+		},
+	}
+	vm := &kubevirtcorev1.VirtualMachine{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-vm", Namespace: "test-ns"},
+		Spec: kubevirtcorev1.VirtualMachineSpec{
+			Template: &kubevirtcorev1.VirtualMachineInstanceTemplateSpec{
+				Spec: kubevirtcorev1.VirtualMachineInstanceSpec{
+					Volumes: []kubevirtcorev1.Volume{
+						{Name: "disk1", VolumeSource: kubevirtcorev1.VolumeSource{
+							DataVolume: &kubevirtcorev1.DataVolumeSource{Name: "disk1"},
+						}},
+					},
+				},
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pvc, pv, vm).Build()
+
+	err := updateVMIndex(context.Background(), store, fakeClient, config, files, &archivedPaths{}, logr.Discard())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	result, err := store.GetObjectBytes("checkpoints/test-ns/test-vm/index.json")
+	if err != nil {
+		t.Fatalf("failed to get index: %v", err)
+	}
+	var idx VMIndex
+	if err := json.Unmarshal(result, &idx); err != nil {
+		t.Fatalf("failed to parse index: %v", err)
+	}
+
+	cp := findCheckpoint(idx.Checkpoints, "cp-001")
+	if cp == nil {
+		t.Fatal("cp-001 not found")
+	}
+	if len(cp.PVCSizes) != 1 {
+		t.Fatalf("expected 1 PVCSizes entry, got %d", len(cp.PVCSizes))
+	}
+	want := resource.MustParse("1Gi")
+	if cp.PVCSizes[0].Cmp(want) != 0 {
+		t.Errorf("PVCSizes[0] = %s, want %s (bound PV's actual capacity, not the 150Mi PVC request)",
+			cp.PVCSizes[0].String(), want.String())
+	}
+}
+
 func TestUpdateBackupManifests(t *testing.T) {
 	tests := []struct {
 		name           string
