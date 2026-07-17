@@ -156,7 +156,9 @@ func (s *S3ObjectStore) Init(configMap map[string]string) error {
 			o.UsePathStyle = true
 		}
 	})
-	s.uploader = transfermanager.New(s.client)
+	s.uploader = transfermanager.New(s.client, func(o *transfermanager.Options) {
+		o.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
+	})
 
 	return nil
 }
