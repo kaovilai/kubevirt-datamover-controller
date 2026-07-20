@@ -24,6 +24,8 @@ require (
 
 replace github.com/vmware-tanzu/velero => github.com/openshift/velero v0.10.2-0.20260716151240-e2178e7e7c29
 
+replace github.com/vmware-tanzu/velero/pkg/apis => github.com/openshift/velero/pkg/apis v0.0.0-20260716151240-e2178e7e7c29
+
 require (
 	cel.dev/expr v0.25.1 // indirect
 	github.com/Masterminds/semver/v3 v3.5.0 // indirect
