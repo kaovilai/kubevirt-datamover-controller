@@ -870,7 +870,7 @@ func TestHandleAccepted_VMBStatusDetection(t *testing.T) {
 				},
 				Spec: kubevirtbackupv1alpha1.VirtualMachineBackupTrackerSpec{
 					Source: corev1.TypedLocalObjectReference{
-						APIGroup: strPtr("kubevirt.io"),
+						APIGroup: new("kubevirt.io"),
 						Kind:     "VirtualMachine",
 						Name:     vmName,
 					},
@@ -900,11 +900,11 @@ func TestHandleAccepted_VMBStatusDetection(t *testing.T) {
 				},
 				Spec: kubevirtbackupv1alpha1.VirtualMachineBackupSpec{
 					Source: corev1.TypedLocalObjectReference{
-						APIGroup: strPtr("backup.kubevirt.io"),
+						APIGroup: new("backup.kubevirt.io"),
 						Kind:     "VirtualMachineBackupTracker",
 						Name:     vmbt.Name,
 					},
-					PvcName: strPtr(pvc.Name),
+					PvcName: new(pvc.Name),
 				},
 				Status: &kubevirtbackupv1alpha1.VirtualMachineBackupStatus{
 					Type:           kubevirtbackupv1alpha1.Full,
@@ -1428,11 +1428,6 @@ func TestHandleAccepted_ProceedsWhenOlderDUCompleted(t *testing.T) {
 	// We don't care about the error from handleAccepted itself — it may fail
 	// on BSL credential lookup. The point is it got past the serialization guard.
 	_ = err
-}
-
-// strPtr returns a pointer to the given string
-func strPtr(s string) *string {
-	return &s
 }
 
 func TestHandleInProgress(t *testing.T) {
@@ -2941,7 +2936,7 @@ func TestHandleAccepted_WithBSLCheckpointLookup(t *testing.T) {
 		},
 		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupTrackerSpec{
 			Source: corev1.TypedLocalObjectReference{
-				APIGroup: strPtr("kubevirt.io"),
+				APIGroup: new("kubevirt.io"),
 				Kind:     "VirtualMachine",
 				Name:     vmName,
 			},
@@ -2963,11 +2958,11 @@ func TestHandleAccepted_WithBSLCheckpointLookup(t *testing.T) {
 		},
 		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupSpec{
 			Source: corev1.TypedLocalObjectReference{
-				APIGroup: strPtr("backup.kubevirt.io"),
+				APIGroup: new("backup.kubevirt.io"),
 				Kind:     "VirtualMachineBackupTracker",
 				Name:     vmbt.Name,
 			},
-			PvcName: strPtr(pvc.Name),
+			PvcName: new(pvc.Name),
 		},
 		Status: &kubevirtbackupv1alpha1.VirtualMachineBackupStatus{
 			Type:           kubevirtbackupv1alpha1.Full,
@@ -3075,7 +3070,7 @@ func TestHandleAccepted_NoBSLConfigured(t *testing.T) {
 		},
 		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupTrackerSpec{
 			Source: corev1.TypedLocalObjectReference{
-				APIGroup: strPtr("kubevirt.io"),
+				APIGroup: new("kubevirt.io"),
 				Kind:     "VirtualMachine",
 				Name:     vmName,
 			},
@@ -3097,11 +3092,11 @@ func TestHandleAccepted_NoBSLConfigured(t *testing.T) {
 		},
 		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupSpec{
 			Source: corev1.TypedLocalObjectReference{
-				APIGroup: strPtr("backup.kubevirt.io"),
+				APIGroup: new("backup.kubevirt.io"),
 				Kind:     "VirtualMachineBackupTracker",
 				Name:     vmbt.Name,
 			},
-			PvcName: strPtr(pvc.Name),
+			PvcName: new(pvc.Name),
 		},
 		Status: &kubevirtbackupv1alpha1.VirtualMachineBackupStatus{
 			Type:           kubevirtbackupv1alpha1.Full,
@@ -3574,7 +3569,7 @@ func TestHandleAccepted_HappyPath_IncrementalBackup(t *testing.T) {
 		},
 		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupTrackerSpec{
 			Source: corev1.TypedLocalObjectReference{
-				APIGroup: strPtr("kubevirt.io"),
+				APIGroup: new("kubevirt.io"),
 				Kind:     "VirtualMachine",
 				Name:     vmName,
 			},
@@ -3595,11 +3590,11 @@ func TestHandleAccepted_HappyPath_IncrementalBackup(t *testing.T) {
 		},
 		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupSpec{
 			Source: corev1.TypedLocalObjectReference{
-				APIGroup: strPtr("backup.kubevirt.io"),
+				APIGroup: new("backup.kubevirt.io"),
 				Kind:     "VirtualMachineBackupTracker",
 				Name:     vmbt.Name,
 			},
-			PvcName: strPtr(pvc.Name),
+			PvcName: new(pvc.Name),
 		},
 		Status: &kubevirtbackupv1alpha1.VirtualMachineBackupStatus{
 			Type:           kubevirtbackupv1alpha1.Full,
@@ -3777,7 +3772,7 @@ func TestHandleAccepted_StaleCheckpointForcesFullBackup(t *testing.T) {
 		},
 		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupTrackerSpec{
 			Source: corev1.TypedLocalObjectReference{
-				APIGroup: strPtr("kubevirt.io"),
+				APIGroup: new("kubevirt.io"),
 				Kind:     "VirtualMachine",
 				Name:     vmName,
 			},
@@ -3899,7 +3894,7 @@ func TestHandleAccepted_SkipsBSLValidationWhenAnnotated(t *testing.T) {
 		},
 		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupTrackerSpec{
 			Source: corev1.TypedLocalObjectReference{
-				APIGroup: strPtr("kubevirt.io"),
+				APIGroup: new("kubevirt.io"),
 				Kind:     "VirtualMachine",
 				Name:     vmName,
 			},
@@ -3917,11 +3912,11 @@ func TestHandleAccepted_SkipsBSLValidationWhenAnnotated(t *testing.T) {
 		},
 		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupSpec{
 			Source: corev1.TypedLocalObjectReference{
-				APIGroup: strPtr("backup.kubevirt.io"),
+				APIGroup: new("backup.kubevirt.io"),
 				Kind:     "VirtualMachineBackupTracker",
 				Name:     vmbt.Name,
 			},
-			PvcName: strPtr(pvc.Name),
+			PvcName: new(pvc.Name),
 		},
 		Status: &kubevirtbackupv1alpha1.VirtualMachineBackupStatus{},
 	}
@@ -4546,7 +4541,7 @@ func TestHandleAccepted_VMBConflictRequeuesGracefully(t *testing.T) {
 		},
 		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupTrackerSpec{
 			Source: corev1.TypedLocalObjectReference{
-				APIGroup: strPtr("kubevirt.io"),
+				APIGroup: new("kubevirt.io"),
 				Kind:     "VirtualMachine",
 				Name:     vmName,
 			},
@@ -4709,7 +4704,7 @@ func TestHandleAccepted_BSLAnnotationNotSetOnTransientFailure(t *testing.T) {
 		},
 		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupTrackerSpec{
 			Source: corev1.TypedLocalObjectReference{
-				APIGroup: strPtr("kubevirt.io"),
+				APIGroup: new("kubevirt.io"),
 				Kind:     "VirtualMachine",
 				Name:     vmName,
 			},
@@ -4728,11 +4723,11 @@ func TestHandleAccepted_BSLAnnotationNotSetOnTransientFailure(t *testing.T) {
 		},
 		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupSpec{
 			Source: corev1.TypedLocalObjectReference{
-				APIGroup: strPtr("backup.kubevirt.io"),
+				APIGroup: new("backup.kubevirt.io"),
 				Kind:     "VirtualMachineBackupTracker",
 				Name:     vmbt.Name,
 			},
-			PvcName: strPtr(pvc.Name),
+			PvcName: new(pvc.Name),
 		},
 		Status: &kubevirtbackupv1alpha1.VirtualMachineBackupStatus{
 			Type:           kubevirtbackupv1alpha1.Full,
@@ -4846,7 +4841,7 @@ func TestHandleAccepted_ForceFullBackupAnnotation(t *testing.T) {
 		},
 		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupTrackerSpec{
 			Source: corev1.TypedLocalObjectReference{
-				APIGroup: strPtr("kubevirt.io"),
+				APIGroup: new("kubevirt.io"),
 				Kind:     "VirtualMachine",
 				Name:     vmName,
 			},
@@ -4981,7 +4976,7 @@ func TestHandleAccepted_ForceFullBackupWithNoExistingCheckpoint(t *testing.T) {
 		},
 		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupTrackerSpec{
 			Source: corev1.TypedLocalObjectReference{
-				APIGroup: strPtr("kubevirt.io"),
+				APIGroup: new("kubevirt.io"),
 				Kind:     "VirtualMachine",
 				Name:     vmName,
 			},
@@ -5078,7 +5073,7 @@ func TestHandleAccepted_NoForceFullBackupByDefault(t *testing.T) {
 		},
 		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupTrackerSpec{
 			Source: corev1.TypedLocalObjectReference{
-				APIGroup: strPtr("kubevirt.io"),
+				APIGroup: new("kubevirt.io"),
 				Kind:     "VirtualMachine",
 				Name:     vmName,
 			},
@@ -5210,7 +5205,7 @@ func TestHandleAccepted_StaleCheckpointSetsForceFullOnVMB(t *testing.T) {
 		},
 		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupTrackerSpec{
 			Source: corev1.TypedLocalObjectReference{
-				APIGroup: strPtr("kubevirt.io"),
+				APIGroup: new("kubevirt.io"),
 				Kind:     "VirtualMachine",
 				Name:     vmName,
 			},
@@ -5342,7 +5337,7 @@ func TestValidateBSLCheckpoint_ForceFullOnChainFallback(t *testing.T) {
 		},
 		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupTrackerSpec{
 			Source: corev1.TypedLocalObjectReference{
-				APIGroup: strPtr("kubevirt.io"),
+				APIGroup: new("kubevirt.io"),
 				Kind:     "VirtualMachine",
 				Name:     vmName,
 			},
@@ -5661,7 +5656,7 @@ func TestPrepareVMBackupTracker_ReusesExisting(t *testing.T) {
 		},
 		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupTrackerSpec{
 			Source: corev1.TypedLocalObjectReference{
-				APIGroup: strPtr("kubevirt.io"),
+				APIGroup: new("kubevirt.io"),
 				Kind:     "VirtualMachine",
 				Name:     vmName,
 			},
@@ -5741,7 +5736,7 @@ func TestPrepareVMBackupTracker_ReusesVMBTEvenIfReferencedByActiveVMB(t *testing
 		},
 		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupTrackerSpec{
 			Source: corev1.TypedLocalObjectReference{
-				APIGroup: strPtr("kubevirt.io"),
+				APIGroup: new("kubevirt.io"),
 				Kind:     "VirtualMachine",
 				Name:     vmName,
 			},
@@ -5759,7 +5754,7 @@ func TestPrepareVMBackupTracker_ReusesVMBTEvenIfReferencedByActiveVMB(t *testing
 		},
 		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupSpec{
 			Source: corev1.TypedLocalObjectReference{
-				APIGroup: strPtr("backup.kubevirt.io"),
+				APIGroup: new("backup.kubevirt.io"),
 				Kind:     "VirtualMachineBackupTracker",
 				Name:     otherVMBT.Name,
 			},
@@ -5839,7 +5834,7 @@ func TestPrepareVMBackupTracker_ReusesVMBTWithTerminalVMB(t *testing.T) {
 		},
 		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupTrackerSpec{
 			Source: corev1.TypedLocalObjectReference{
-				APIGroup: strPtr("kubevirt.io"),
+				APIGroup: new("kubevirt.io"),
 				Kind:     "VirtualMachine",
 				Name:     vmName,
 			},
@@ -5857,7 +5852,7 @@ func TestPrepareVMBackupTracker_ReusesVMBTWithTerminalVMB(t *testing.T) {
 		},
 		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupSpec{
 			Source: corev1.TypedLocalObjectReference{
-				APIGroup: strPtr("backup.kubevirt.io"),
+				APIGroup: new("backup.kubevirt.io"),
 				Kind:     "VirtualMachineBackupTracker",
 				Name:     oldVMBT.Name,
 			},
@@ -6176,7 +6171,7 @@ func TestCleanupVMBackupResources_PreservesVMBT(t *testing.T) {
 		},
 		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupSpec{
 			Source: corev1.TypedLocalObjectReference{
-				APIGroup: strPtr("backup.kubevirt.io"),
+				APIGroup: new("backup.kubevirt.io"),
 				Kind:     "VirtualMachineBackupTracker",
 				Name:     "vmbt-test-cleanup",
 			},
@@ -6194,7 +6189,7 @@ func TestCleanupVMBackupResources_PreservesVMBT(t *testing.T) {
 		},
 		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupTrackerSpec{
 			Source: corev1.TypedLocalObjectReference{
-				APIGroup: strPtr("kubevirt.io"),
+				APIGroup: new("kubevirt.io"),
 				Kind:     "VirtualMachine",
 				Name:     vmName,
 			},
@@ -6634,35 +6629,35 @@ func TestResolveBackupMode_MaxIncrementalBackups(t *testing.T) {
 			name:                  "per-VM annotation overrides global to force full",
 			maxIncrementalBackups: 10,
 			numIncrementals:       3,
-			vmAnnotation:          strPtr("3"),
+			vmAnnotation:          new("3"),
 			wantForceFullBackup:   true,
 		},
 		{
 			name:                  "per-VM annotation allows incremental when below its limit",
 			maxIncrementalBackups: 10,
 			numIncrementals:       2,
-			vmAnnotation:          strPtr("5"),
+			vmAnnotation:          new("5"),
 			wantForceFullBackup:   false,
 		},
 		{
 			name:                  "per-VM annotation 0 means unlimited overriding global",
 			maxIncrementalBackups: 3,
 			numIncrementals:       9,
-			vmAnnotation:          strPtr("0"),
+			vmAnnotation:          new("0"),
 			wantForceFullBackup:   false,
 		},
 		{
 			name:                  "invalid annotation falls back to global",
 			maxIncrementalBackups: 3,
 			numIncrementals:       3,
-			vmAnnotation:          strPtr("abc"),
+			vmAnnotation:          new("abc"),
 			wantForceFullBackup:   true,
 		},
 		{
 			name:                  "negative annotation falls back to global",
 			maxIncrementalBackups: 3,
 			numIncrementals:       3,
-			vmAnnotation:          strPtr("-1"),
+			vmAnnotation:          new("-1"),
 			wantForceFullBackup:   true,
 		},
 	}
@@ -7038,28 +7033,28 @@ func TestGetEffectiveMaxIncrementalBackups(t *testing.T) {
 		{
 			name:         "VM annotation overrides global",
 			globalMax:    5,
-			vmAnnotation: strPtr("3"),
+			vmAnnotation: new("3"),
 			vmExists:     true,
 			expectedMax:  3,
 		},
 		{
 			name:         "VM annotation 0 overrides global",
 			globalMax:    5,
-			vmAnnotation: strPtr("0"),
+			vmAnnotation: new("0"),
 			vmExists:     true,
 			expectedMax:  0,
 		},
 		{
 			name:         "invalid VM annotation falls back to global",
 			globalMax:    5,
-			vmAnnotation: strPtr("invalid"),
+			vmAnnotation: new("invalid"),
 			vmExists:     true,
 			expectedMax:  5,
 		},
 		{
 			name:         "negative VM annotation falls back to global",
 			globalMax:    5,
-			vmAnnotation: strPtr("-1"),
+			vmAnnotation: new("-1"),
 			vmExists:     true,
 			expectedMax:  5,
 		},
