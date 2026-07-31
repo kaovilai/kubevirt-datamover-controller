@@ -385,6 +385,46 @@ func TestDataDownloadReconcile_OperationTimeout(t *testing.T) {
 			t.Errorf("phase = %q, want %q (timeout not yet exceeded)", updated.Status.Phase, velerov2alpha1.DataDownloadPhaseAccepted)
 		}
 	})
+
+	t.Run("New phase's first requeue is capped when Spec.OperationTimeout is shorter than RequeueAfterShort", func(t *testing.T) {
+		// handleNew sets AcceptedTimestamp and transitions New -> Accepted in the
+		// same reconcile that creates it, returning RequeueAfterShort (5s). With a
+		// custom OperationTimeout shorter than that, the very first requeue --
+		// not just subsequent ones -- must already be capped to the deadline.
+		bslAvailable := &velerov1.BackupStorageLocation{
+			ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: "openshift-adp"},
+			Status:     velerov1.BackupStorageLocationStatus{Phase: velerov1.BackupStorageLocationPhaseAvailable},
+		}
+		dd := &velerov2alpha1.DataDownload{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "dd-new-cap-requeue", Namespace: "openshift-adp",
+				Annotations: map[string]string{common.AnnotationVMName: "vm-1"},
+			},
+			Spec: velerov2alpha1.DataDownloadSpec{
+				DataMover:             common.DataMoverKubeVirt,
+				BackupStorageLocation: "default",
+				OperationTimeout:      metav1.Duration{Duration: 2 * time.Second},
+				TargetVolume: velerov2alpha1.TargetVolumeSpec{
+					PVC: "restored-disk-1", Namespace: "restore-ns",
+				},
+			},
+			Status: velerov2alpha1.DataDownloadStatus{Phase: velerov2alpha1.DataDownloadPhaseNew},
+		}
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(dd, bslAvailable).Build()
+		r := &KubeVirtDataDownloadReconciler{Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp"}
+
+		result, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: dd.Name, Namespace: dd.Namespace}})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		updated := get(t, fakeClient, dd.Name, dd.Namespace)
+		if updated.Status.Phase != velerov2alpha1.DataDownloadPhaseAccepted {
+			t.Fatalf("phase = %q, want %q", updated.Status.Phase, velerov2alpha1.DataDownloadPhaseAccepted)
+		}
+		if result.RequeueAfter <= 0 || result.RequeueAfter >= RequeueAfterShort {
+			t.Errorf("RequeueAfter = %v, want it capped below RequeueAfterShort (%v) to the ~2s remaining before the 2s OperationTimeout deadline", result.RequeueAfter, RequeueAfterShort)
+		}
+	})
 }
 
 func TestDataDownloadUpdatePhase(t *testing.T) {

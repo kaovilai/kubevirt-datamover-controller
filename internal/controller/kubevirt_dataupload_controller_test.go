@@ -340,6 +340,7 @@ func TestReconcile_OperationTimeout(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = velerov2alpha1.AddToScheme(scheme)
 	_ = kubevirtbackupv1alpha1.AddToScheme(scheme)
+	_ = kubevirtcorev1.AddToScheme(scheme)
 	_ = corev1.AddToScheme(scheme)
 	_ = velerov1.AddToScheme(scheme)
 
@@ -490,6 +491,50 @@ func TestReconcile_OperationTimeout(t *testing.T) {
 		updated := get(t, fakeClient, du.Name, du.Namespace)
 		if updated.Status.Phase != velerov2alpha1.DataUploadPhaseInProgress {
 			t.Errorf("phase = %q, want %q (timeout not yet exceeded)", updated.Status.Phase, velerov2alpha1.DataUploadPhaseInProgress)
+		}
+	})
+
+	t.Run("New phase's first requeue is capped when Spec.OperationTimeout is shorter than RequeueAfterShort", func(t *testing.T) {
+		// handleNew sets AcceptedTimestamp and transitions New -> Accepted in the
+		// same reconcile that creates it, returning RequeueAfterShort (5s). With a
+		// custom OperationTimeout shorter than that, the very first requeue --
+		// not just subsequent ones -- must already be capped to the deadline.
+		vm := &kubevirtcorev1.VirtualMachine{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-vm", Namespace: "default"},
+			Status: kubevirtcorev1.VirtualMachineStatus{
+				PrintableStatus: kubevirtcorev1.VirtualMachineStatusRunning,
+				ChangedBlockTracking: &kubevirtcorev1.ChangedBlockTrackingStatus{
+					State: kubevirtcorev1.ChangedBlockTrackingEnabled,
+				},
+			},
+		}
+		du := &velerov2alpha1.DataUpload{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "du-new-cap-requeue", Namespace: "openshift-adp",
+				Annotations: map[string]string{
+					common.AnnotationVMName:      "test-vm",
+					common.AnnotationVMNamespace: "default",
+				},
+			},
+			Spec: velerov2alpha1.DataUploadSpec{
+				DataMover:        common.DataMoverKubeVirt,
+				OperationTimeout: metav1.Duration{Duration: 2 * time.Second},
+			},
+			Status: velerov2alpha1.DataUploadStatus{Phase: velerov2alpha1.DataUploadPhaseNew},
+		}
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(du, vm).Build()
+		r := &KubeVirtDataUploadReconciler{Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp"}
+
+		result, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: du.Name, Namespace: du.Namespace}})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		updated := get(t, fakeClient, du.Name, du.Namespace)
+		if updated.Status.Phase != velerov2alpha1.DataUploadPhaseAccepted {
+			t.Fatalf("phase = %q, want %q", updated.Status.Phase, velerov2alpha1.DataUploadPhaseAccepted)
+		}
+		if result.RequeueAfter <= 0 || result.RequeueAfter >= RequeueAfterShort {
+			t.Errorf("RequeueAfter = %v, want it capped below RequeueAfterShort (%v) to the ~2s remaining before the 2s OperationTimeout deadline", result.RequeueAfter, RequeueAfterShort)
 		}
 	})
 }

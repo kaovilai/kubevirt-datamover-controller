@@ -188,7 +188,11 @@ func (r *KubeVirtDataUploadReconciler) Reconcile(ctx context.Context, req ctrl.R
 		return ctrl.Result{}, nil
 	}
 
-	if timeoutBound && err == nil {
+	// dataUpload.Status.AcceptedTimestamp (rather than the pre-dispatch timeoutBound)
+	// so a New DataUpload that handleNew just transitioned to Accepted in this same
+	// reconcile -- setting AcceptedTimestamp along the way -- gets its first
+	// RequeueAfter capped too, not just subsequent reconciles.
+	if err == nil && dataUpload.Status.AcceptedTimestamp != nil {
 		result = capRequeueToOperationDeadline(result, dataUpload.Status.AcceptedTimestamp, dataUpload.Spec.OperationTimeout.Duration)
 	}
 	return result, err
