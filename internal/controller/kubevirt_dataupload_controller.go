@@ -148,12 +148,8 @@ func (r *KubeVirtDataUploadReconciler) Reconcile(ctx context.Context, req ctrl.R
 	// Accepted: without this, any of the several unbounded-requeue branches below
 	// (waiting on VMB status, waiting on the datamover pod, etc.) would retry
 	// forever instead of eventually failing per Spec.OperationTimeout.
-	timeoutBound := false
-	switch dataUpload.Status.Phase {
-	case velerov2alpha1.DataUploadPhaseAccepted,
-		velerov2alpha1.DataUploadPhasePrepared,
-		velerov2alpha1.DataUploadPhaseInProgress:
-		timeoutBound = true
+	timeoutBound := isDataUploadTimeoutBound(dataUpload.Status.Phase)
+	if timeoutBound {
 		if failed, err := r.checkOperationTimeout(ctx, logger, dataUpload); err != nil {
 			return ctrl.Result{}, err
 		} else if failed {
@@ -251,6 +247,22 @@ func (r *KubeVirtDataUploadReconciler) handleNew(ctx context.Context, logger log
 	}
 
 	return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
+}
+
+// isDataUploadTimeoutBound reports whether phase is one of the non-terminal
+// phases (Accepted, Prepared, InProgress) subject to Spec.OperationTimeout
+// enforcement. Kept as the single source of truth for that phase set so a
+// future phase added to the dispatch switch below can't silently drift out of
+// sync with which phases get timeout-checked.
+func isDataUploadTimeoutBound(phase velerov2alpha1.DataUploadPhase) bool {
+	switch phase {
+	case velerov2alpha1.DataUploadPhaseAccepted,
+		velerov2alpha1.DataUploadPhasePrepared,
+		velerov2alpha1.DataUploadPhaseInProgress:
+		return true
+	default:
+		return false
+	}
 }
 
 // checkOperationTimeout fails du if too much time has elapsed since it was

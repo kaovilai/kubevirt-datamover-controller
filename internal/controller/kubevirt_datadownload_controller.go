@@ -151,12 +151,8 @@ func (r *KubeVirtDataDownloadReconciler) Reconcile(ctx context.Context, req ctrl
 	// Accepted: without this, any of the several unbounded-requeue branches below
 	// (target PVC never appearing, downloader pod never reaching a terminal state,
 	// etc.) would retry forever instead of eventually failing per Spec.OperationTimeout.
-	timeoutBound := false
-	switch dataDownload.Status.Phase {
-	case velerov2alpha1.DataDownloadPhaseAccepted,
-		velerov2alpha1.DataDownloadPhasePrepared,
-		velerov2alpha1.DataDownloadPhaseInProgress:
-		timeoutBound = true
+	timeoutBound := isDataDownloadTimeoutBound(dataDownload.Status.Phase)
+	if timeoutBound {
 		if failed, err := r.checkOperationTimeout(ctx, logger, dataDownload); err != nil {
 			return ctrl.Result{}, err
 		} else if failed {
@@ -252,6 +248,22 @@ func (r *KubeVirtDataDownloadReconciler) handleNew(ctx context.Context, logger l
 	}
 
 	return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
+}
+
+// isDataDownloadTimeoutBound reports whether phase is one of the non-terminal
+// phases (Accepted, Prepared, InProgress) subject to Spec.OperationTimeout
+// enforcement. Kept as the single source of truth for that phase set so a
+// future phase added to the dispatch switch below can't silently drift out of
+// sync with which phases get timeout-checked.
+func isDataDownloadTimeoutBound(phase velerov2alpha1.DataDownloadPhase) bool {
+	switch phase {
+	case velerov2alpha1.DataDownloadPhaseAccepted,
+		velerov2alpha1.DataDownloadPhasePrepared,
+		velerov2alpha1.DataDownloadPhaseInProgress:
+		return true
+	default:
+		return false
+	}
 }
 
 // checkOperationTimeout fails dd if too much time has elapsed since it was
