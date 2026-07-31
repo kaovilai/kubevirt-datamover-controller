@@ -234,6 +234,34 @@ func TestDataDownloadReconcile_OperationTimeout(t *testing.T) {
 		}
 	})
 
+	t.Run("Prepared phase past default operation timeout fails", func(t *testing.T) {
+		dd := &velerov2alpha1.DataDownload{
+			ObjectMeta: metav1.ObjectMeta{Name: "dd-prepared-timeout", Namespace: "openshift-adp"},
+			Spec:       velerov2alpha1.DataDownloadSpec{DataMover: common.DataMoverKubeVirt},
+			Status: velerov2alpha1.DataDownloadStatus{
+				Phase:             velerov2alpha1.DataDownloadPhasePrepared,
+				AcceptedTimestamp: ptrTime(time.Now().Add(-(DefaultOperationTimeout + time.Minute))),
+			},
+		}
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(dd).Build()
+		r := &KubeVirtDataDownloadReconciler{Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp"}
+
+		result, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: dd.Name, Namespace: dd.Namespace}})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if result.RequeueAfter != 0 {
+			t.Errorf("expected no requeue after timeout failure, got %v", result.RequeueAfter)
+		}
+		updated := get(t, fakeClient, dd.Name, dd.Namespace)
+		if updated.Status.Phase != velerov2alpha1.DataDownloadPhaseFailed {
+			t.Errorf("phase = %q, want %q", updated.Status.Phase, velerov2alpha1.DataDownloadPhaseFailed)
+		}
+		if !strings.Contains(updated.Status.Message, "operation timed out") {
+			t.Errorf("message = %q, want it to mention the timeout", updated.Status.Message)
+		}
+	})
+
 	t.Run("InProgress phase respects custom Spec.OperationTimeout", func(t *testing.T) {
 		dd := &velerov2alpha1.DataDownload{
 			ObjectMeta: metav1.ObjectMeta{Name: "dd-custom-timeout", Namespace: "openshift-adp"},
