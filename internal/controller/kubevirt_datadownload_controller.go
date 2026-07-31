@@ -273,11 +273,6 @@ func isDataDownloadTimeoutBound(phase velerov2alpha1.DataDownloadPhase) bool {
 // accepted, per Spec.OperationTimeout (falling back to DefaultOperationTimeout
 // when unset). Self-heals a missing AcceptedTimestamp -- e.g. a DataDownload
 // already past New when this check was introduced -- by backfilling it to now
-// rather than leaving the operation unbounded forever.
-// checkOperationTimeout fails dd if too much time has elapsed since it was
-// accepted, per Spec.OperationTimeout (falling back to DefaultOperationTimeout
-// when unset). Self-heals a missing AcceptedTimestamp -- e.g. a DataDownload
-// already past New when this check was introduced -- by backfilling it to now
 // rather than leaving the operation unbounded forever. A thin adapter over
 // checkOperationTimeoutCore, which DataUpload's own checkOperationTimeout
 // shares -- see that method's doc comment for why the core logic isn't

@@ -134,7 +134,7 @@ func checkOperationTimeoutCore(ctx context.Context, logger logr.Logger, resource
 	logger.Error(nil, resourceKind+" exceeded operation timeout",
 		"phase", t.phase(), "elapsed", elapsed.Round(time.Second), "timeout", effective)
 	if err := t.fail(ctx, fmt.Sprintf("operation timed out after %s in phase %s (limit %s)", elapsed.Round(time.Second), t.phase(), effective)); err != nil {
-		return false, err
+		return false, fmt.Errorf("failed to transition %s to Failed: %w", resourceKind, err)
 	}
 	return true, nil
 }

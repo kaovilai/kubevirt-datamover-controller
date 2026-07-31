@@ -494,6 +494,40 @@ func TestReconcile_OperationTimeout(t *testing.T) {
 		}
 	})
 
+	t.Run("unset Spec.OperationTimeout uses the default and does not over-eagerly cap", func(t *testing.T) {
+		// Complements the "handler's RequeueAfterShort is capped" case above:
+		// with Spec.OperationTimeout left at its zero value and a fresh
+		// AcceptedTimestamp, the effective deadline is DefaultOperationTimeout
+		// (4h) away -- nowhere near RequeueAfterShort (5s) -- so the requeue
+		// must come back uncapped, confirming the fallback default is used
+		// consistently for both expiry and capping.
+		du := &velerov2alpha1.DataUpload{
+			ObjectMeta: metav1.ObjectMeta{Name: "du-default-timeout-no-cap", Namespace: "openshift-adp", UID: types.UID("du-default-timeout-no-cap-uid")},
+			Spec:       velerov2alpha1.DataUploadSpec{DataMover: common.DataMoverKubeVirt},
+			Status: velerov2alpha1.DataUploadStatus{
+				Phase:             velerov2alpha1.DataUploadPhaseInProgress,
+				AcceptedTimestamp: ptrTime(time.Now()),
+			},
+		}
+		pendingPod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "du-default-timeout-no-cap-pod", Namespace: "openshift-adp",
+				Labels: map[string]string{common.LabelDataUploadUID: string(du.UID)},
+			},
+			Status: corev1.PodStatus{Phase: corev1.PodPending},
+		}
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(du, pendingPod).Build()
+		r := &KubeVirtDataUploadReconciler{Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp"}
+
+		result, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: du.Name, Namespace: du.Namespace}})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if result.RequeueAfter != RequeueAfterShort {
+			t.Errorf("RequeueAfter = %v, want exactly RequeueAfterShort (%v) -- unset OperationTimeout must not be treated as an immediate deadline", result.RequeueAfter, RequeueAfterShort)
+		}
+	})
+
 	t.Run("New phase's first requeue is capped when Spec.OperationTimeout is shorter than RequeueAfterShort", func(t *testing.T) {
 		// handleNew sets AcceptedTimestamp and transitions New -> Accepted in the
 		// same reconcile that creates it, returning RequeueAfterShort (5s). With a

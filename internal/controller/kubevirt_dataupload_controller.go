@@ -273,11 +273,6 @@ func isDataUploadTimeoutBound(phase velerov2alpha1.DataUploadPhase) bool {
 // accepted, per Spec.OperationTimeout (falling back to DefaultOperationTimeout
 // when unset). Self-heals a missing AcceptedTimestamp -- e.g. a DataUpload
 // already past New when this check was introduced -- by backfilling it to now
-// rather than leaving the operation unbounded forever.
-// checkOperationTimeout fails du if too much time has elapsed since it was
-// accepted, per Spec.OperationTimeout (falling back to DefaultOperationTimeout
-// when unset). Self-heals a missing AcceptedTimestamp -- e.g. a DataUpload
-// already past New when this check was introduced -- by backfilling it to now
 // rather than leaving the operation unbounded forever. A thin adapter over
 // checkOperationTimeoutCore (in helpers.go), shared with DataDownload's own
 // checkOperationTimeout: DataUpload and DataDownload are distinct vendored

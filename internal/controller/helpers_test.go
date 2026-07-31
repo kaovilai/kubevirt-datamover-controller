@@ -17,9 +17,12 @@ limitations under the License.
 package controller
 
 import (
+	"context"
+	"errors"
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
 )
@@ -153,4 +156,118 @@ func TestCapRequeueToOperationDeadline(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestCheckOperationTimeoutCore(t *testing.T) {
+	newTarget := func(acceptedAt *metav1.Time, specTimeout time.Duration, persistErr, failErr error) (*operationTimeoutTarget, *int, *int) {
+		persistCalls, failCalls := 0, 0
+		target := &operationTimeoutTarget{
+			acceptedTimestamp:    func() *metav1.Time { return acceptedAt },
+			setAcceptedTimestamp: func(t *metav1.Time) { acceptedAt = t },
+			operationTimeout:     specTimeout,
+			phase:                func() string { return "Accepted" },
+			persist: func(ctx context.Context) error {
+				persistCalls++
+				return persistErr
+			},
+			fail: func(ctx context.Context, message string) error {
+				failCalls++
+				return failErr
+			},
+		}
+		return target, &persistCalls, &failCalls
+	}
+
+	t.Run("nil acceptedAt backfills and succeeds", func(t *testing.T) {
+		target, persistCalls, failCalls := newTarget(nil, time.Hour, nil, nil)
+		failed, err := checkOperationTimeoutCore(context.Background(), logr.Discard(), "TestResource", *target)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if failed {
+			t.Error("failed = true, want false (backfilling must not itself fail the resource)")
+		}
+		if *persistCalls != 1 {
+			t.Errorf("persist calls = %d, want 1", *persistCalls)
+		}
+		if *failCalls != 0 {
+			t.Errorf("fail calls = %d, want 0", *failCalls)
+		}
+		if target.acceptedTimestamp() == nil {
+			t.Error("acceptedTimestamp still nil after backfill")
+		}
+	})
+
+	t.Run("nil acceptedAt backfill persist failure is propagated", func(t *testing.T) {
+		persistErr := errors.New("boom")
+		target, persistCalls, failCalls := newTarget(nil, time.Hour, persistErr, nil)
+		failed, err := checkOperationTimeoutCore(context.Background(), logr.Discard(), "TestResource", *target)
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		if !errors.Is(err, persistErr) {
+			t.Errorf("error = %v, want it to wrap %v", err, persistErr)
+		}
+		if failed {
+			t.Error("failed = true, want false")
+		}
+		if *persistCalls != 1 {
+			t.Errorf("persist calls = %d, want 1", *persistCalls)
+		}
+		if *failCalls != 0 {
+			t.Errorf("fail calls = %d, want 0", *failCalls)
+		}
+	})
+
+	t.Run("not yet exceeded is a no-op", func(t *testing.T) {
+		target, persistCalls, failCalls := newTarget(ptrTime(time.Now().Add(-time.Second)), time.Hour, nil, nil)
+		failed, err := checkOperationTimeoutCore(context.Background(), logr.Discard(), "TestResource", *target)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if failed {
+			t.Error("failed = true, want false")
+		}
+		if *persistCalls != 0 {
+			t.Errorf("persist calls = %d, want 0", *persistCalls)
+		}
+		if *failCalls != 0 {
+			t.Errorf("fail calls = %d, want 0", *failCalls)
+		}
+	})
+
+	t.Run("exceeded transitions to failed", func(t *testing.T) {
+		target, persistCalls, failCalls := newTarget(ptrTime(time.Now().Add(-2*time.Hour)), time.Hour, nil, nil)
+		failed, err := checkOperationTimeoutCore(context.Background(), logr.Discard(), "TestResource", *target)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !failed {
+			t.Error("failed = false, want true")
+		}
+		if *failCalls != 1 {
+			t.Errorf("fail calls = %d, want 1", *failCalls)
+		}
+		if *persistCalls != 0 {
+			t.Errorf("persist calls = %d, want 0", *persistCalls)
+		}
+	})
+
+	t.Run("exceeded but fail callback errors is propagated", func(t *testing.T) {
+		failErr := errors.New("update conflict")
+		target, _, failCalls := newTarget(ptrTime(time.Now().Add(-2*time.Hour)), time.Hour, nil, failErr)
+		failed, err := checkOperationTimeoutCore(context.Background(), logr.Discard(), "TestResource", *target)
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		if !errors.Is(err, failErr) {
+			t.Errorf("error = %v, want it to wrap %v", err, failErr)
+		}
+		if failed {
+			t.Error("failed = true, want false (the phase transition itself did not persist)")
+		}
+		if *failCalls != 1 {
+			t.Errorf("fail calls = %d, want 1", *failCalls)
+		}
+	})
 }
