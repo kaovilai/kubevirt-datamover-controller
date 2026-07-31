@@ -87,6 +87,58 @@ func capRequeueToOperationDeadline(result ctrl.Result, acceptedAt *metav1.Time, 
 	return result
 }
 
+// operationTimeoutTarget adapts a DataUpload/DataDownload to checkOperationTimeoutCore
+// via accessors, since the two are distinct vendored Velero types (different Phase
+// enums, different updatePhase methods) with no shared interface to dispatch on directly.
+// This keeps the backfill / exceeded-check / failure-message logic in exactly one
+// place instead of duplicated per controller.
+type operationTimeoutTarget struct {
+	// acceptedTimestamp returns the resource's current Status.AcceptedTimestamp.
+	acceptedTimestamp func() *metav1.Time
+	// setAcceptedTimestamp backfills Status.AcceptedTimestamp on the in-memory object.
+	setAcceptedTimestamp func(*metav1.Time)
+	// operationTimeout is the resource's Spec.OperationTimeout.Duration.
+	operationTimeout time.Duration
+	// phase returns the resource's current Status.Phase as a string, for logging
+	// and the failure message.
+	phase func() string
+	// persist writes back an in-place mutation (the AcceptedTimestamp backfill)
+	// without also changing phase.
+	persist func(ctx context.Context) error
+	// fail transitions the resource to its Failed phase with the given message.
+	fail func(ctx context.Context, message string) error
+}
+
+// checkOperationTimeoutCore fails the target if too much time has elapsed since
+// it was accepted, per its effective OperationTimeout (falling back to
+// DefaultOperationTimeout when unset -- see operationTimeoutExceeded). Self-heals
+// a missing AcceptedTimestamp -- e.g. a resource already past New when this check
+// was introduced -- by backfilling it to now rather than leaving the operation
+// unbounded forever.
+func checkOperationTimeoutCore(ctx context.Context, logger logr.Logger, resourceKind string, t operationTimeoutTarget) (failed bool, err error) {
+	if t.acceptedTimestamp() == nil {
+		now := metav1.Now()
+		t.setAcceptedTimestamp(&now)
+		logger.Info("Backfilling missing AcceptedTimestamp", "kind", resourceKind, "phase", t.phase())
+		if err := t.persist(ctx); err != nil {
+			return false, fmt.Errorf("failed to backfill AcceptedTimestamp: %w", err)
+		}
+		return false, nil
+	}
+
+	exceeded, elapsed, effective := operationTimeoutExceeded(t.acceptedTimestamp(), t.operationTimeout)
+	if !exceeded {
+		return false, nil
+	}
+
+	logger.Error(nil, resourceKind+" exceeded operation timeout",
+		"phase", t.phase(), "elapsed", elapsed.Round(time.Second), "timeout", effective)
+	if err := t.fail(ctx, fmt.Sprintf("operation timed out after %s in phase %s (limit %s)", elapsed.Round(time.Second), t.phase(), effective)); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // getBackupStorageLocation fetches the BSL by name from the OADP namespace,
 // falling back to fallbackNamespace if oadpNamespace is empty.
 func getBackupStorageLocation(ctx context.Context, k8sClient client.Client, bslName, oadpNamespace, fallbackNamespace string) (*velerov1.BackupStorageLocation, error) {

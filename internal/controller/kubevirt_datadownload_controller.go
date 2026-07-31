@@ -21,7 +21,6 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/go-logr/logr"
 	"github.com/migtools/kubevirt-datamover-controller/pkg/common"
@@ -275,28 +274,25 @@ func isDataDownloadTimeoutBound(phase velerov2alpha1.DataDownloadPhase) bool {
 // when unset). Self-heals a missing AcceptedTimestamp -- e.g. a DataDownload
 // already past New when this check was introduced -- by backfilling it to now
 // rather than leaving the operation unbounded forever.
+// checkOperationTimeout fails dd if too much time has elapsed since it was
+// accepted, per Spec.OperationTimeout (falling back to DefaultOperationTimeout
+// when unset). Self-heals a missing AcceptedTimestamp -- e.g. a DataDownload
+// already past New when this check was introduced -- by backfilling it to now
+// rather than leaving the operation unbounded forever. A thin adapter over
+// checkOperationTimeoutCore, which DataUpload's own checkOperationTimeout
+// shares -- see that method's doc comment for why the core logic isn't
+// directly shared as a method on a common type.
 func (r *KubeVirtDataDownloadReconciler) checkOperationTimeout(ctx context.Context, logger logr.Logger, dd *velerov2alpha1.DataDownload) (failed bool, err error) {
-	if dd.Status.AcceptedTimestamp == nil {
-		now := metav1.Now()
-		dd.Status.AcceptedTimestamp = &now
-		if err := r.Update(ctx, dd); err != nil {
-			return false, fmt.Errorf("failed to backfill AcceptedTimestamp: %w", err)
-		}
-		return false, nil
-	}
-
-	exceeded, elapsed, effective := operationTimeoutExceeded(dd.Status.AcceptedTimestamp, dd.Spec.OperationTimeout.Duration)
-	if !exceeded {
-		return false, nil
-	}
-
-	logger.Error(nil, "DataDownload exceeded operation timeout",
-		"phase", dd.Status.Phase, "elapsed", elapsed.Round(time.Second), "timeout", effective)
-	if err := r.updatePhase(ctx, dd, velerov2alpha1.DataDownloadPhaseFailed,
-		fmt.Sprintf("operation timed out after %s in phase %s (limit %s)", elapsed.Round(time.Second), dd.Status.Phase, effective)); err != nil {
-		return false, err
-	}
-	return true, nil
+	return checkOperationTimeoutCore(ctx, logger, "DataDownload", operationTimeoutTarget{
+		acceptedTimestamp:    func() *metav1.Time { return dd.Status.AcceptedTimestamp },
+		setAcceptedTimestamp: func(t *metav1.Time) { dd.Status.AcceptedTimestamp = t },
+		operationTimeout:     dd.Spec.OperationTimeout.Duration,
+		phase:                func() string { return string(dd.Status.Phase) },
+		persist:              func(ctx context.Context) error { return r.Update(ctx, dd) },
+		fail: func(ctx context.Context, message string) error {
+			return r.updatePhase(ctx, dd, velerov2alpha1.DataDownloadPhaseFailed, message)
+		},
+	})
 }
 
 // handleAccepted processes DataDownloads in Accepted phase.
