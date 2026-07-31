@@ -19,6 +19,7 @@ package controller
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -193,6 +194,121 @@ func TestDataDownloadReconcile(t *testing.T) {
 	})
 }
 
+func TestDataDownloadReconcile_OperationTimeout(t *testing.T) {
+	scheme := ddScheme()
+
+	get := func(t *testing.T, c client.Client, name, namespace string) *velerov2alpha1.DataDownload {
+		t.Helper()
+		var out velerov2alpha1.DataDownload
+		if err := c.Get(context.Background(), types.NamespacedName{Name: name, Namespace: namespace}, &out); err != nil {
+			t.Fatalf("failed to get DataDownload: %v", err)
+		}
+		return &out
+	}
+
+	t.Run("Accepted phase past default operation timeout fails", func(t *testing.T) {
+		dd := &velerov2alpha1.DataDownload{
+			ObjectMeta: metav1.ObjectMeta{Name: "dd-timeout", Namespace: "openshift-adp"},
+			Spec:       velerov2alpha1.DataDownloadSpec{DataMover: common.DataMoverKubeVirt},
+			Status: velerov2alpha1.DataDownloadStatus{
+				Phase:             velerov2alpha1.DataDownloadPhaseAccepted,
+				AcceptedTimestamp: ptrTime(time.Now().Add(-(DefaultOperationTimeout + time.Minute))),
+			},
+		}
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(dd).Build()
+		r := &KubeVirtDataDownloadReconciler{Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp"}
+
+		result, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: dd.Name, Namespace: dd.Namespace}})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if result.RequeueAfter != 0 {
+			t.Errorf("expected no requeue after timeout failure, got %v", result.RequeueAfter)
+		}
+		updated := get(t, fakeClient, dd.Name, dd.Namespace)
+		if updated.Status.Phase != velerov2alpha1.DataDownloadPhaseFailed {
+			t.Errorf("phase = %q, want %q", updated.Status.Phase, velerov2alpha1.DataDownloadPhaseFailed)
+		}
+		if !strings.Contains(updated.Status.Message, "operation timed out") {
+			t.Errorf("message = %q, want it to mention the timeout", updated.Status.Message)
+		}
+	})
+
+	t.Run("InProgress phase respects custom Spec.OperationTimeout", func(t *testing.T) {
+		dd := &velerov2alpha1.DataDownload{
+			ObjectMeta: metav1.ObjectMeta{Name: "dd-custom-timeout", Namespace: "openshift-adp"},
+			Spec: velerov2alpha1.DataDownloadSpec{
+				DataMover:        common.DataMoverKubeVirt,
+				OperationTimeout: metav1.Duration{Duration: time.Hour},
+			},
+			Status: velerov2alpha1.DataDownloadStatus{
+				Phase:             velerov2alpha1.DataDownloadPhaseInProgress,
+				AcceptedTimestamp: ptrTime(time.Now().Add(-2 * time.Hour)),
+			},
+		}
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(dd).Build()
+		r := &KubeVirtDataDownloadReconciler{Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp"}
+
+		if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: dd.Name, Namespace: dd.Namespace}}); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		updated := get(t, fakeClient, dd.Name, dd.Namespace)
+		if updated.Status.Phase != velerov2alpha1.DataDownloadPhaseFailed {
+			t.Errorf("phase = %q, want %q (custom 1h OperationTimeout exceeded by 2h elapsed)", updated.Status.Phase, velerov2alpha1.DataDownloadPhaseFailed)
+		}
+	})
+
+	t.Run("nil AcceptedTimestamp is backfilled without failing", func(t *testing.T) {
+		dd := &velerov2alpha1.DataDownload{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "dd-backfill", Namespace: "openshift-adp",
+				Annotations: map[string]string{common.AnnotationVMName: "vm-1"},
+			},
+			Spec: velerov2alpha1.DataDownloadSpec{
+				DataMover: common.DataMoverKubeVirt,
+				TargetVolume: velerov2alpha1.TargetVolumeSpec{
+					PVC: "restored-disk-1", Namespace: "restore-ns",
+				},
+			},
+			Status: velerov2alpha1.DataDownloadStatus{Phase: velerov2alpha1.DataDownloadPhaseAccepted},
+		}
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(dd).Build()
+		r := &KubeVirtDataDownloadReconciler{Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp"}
+
+		if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: dd.Name, Namespace: dd.Namespace}}); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		updated := get(t, fakeClient, dd.Name, dd.Namespace)
+		if updated.Status.Phase == velerov2alpha1.DataDownloadPhaseFailed && strings.Contains(updated.Status.Message, "operation timed out") {
+			t.Errorf("backfilling a missing AcceptedTimestamp must not itself fail the DataDownload, got message %q", updated.Status.Message)
+		}
+		if updated.Status.AcceptedTimestamp == nil {
+			t.Errorf("expected AcceptedTimestamp to be backfilled, got nil")
+		}
+	})
+
+	t.Run("Canceling phase is not subject to operation timeout", func(t *testing.T) {
+		dd := &velerov2alpha1.DataDownload{
+			ObjectMeta: metav1.ObjectMeta{Name: "dd-canceling", Namespace: "openshift-adp"},
+			Spec:       velerov2alpha1.DataDownloadSpec{DataMover: common.DataMoverKubeVirt},
+			Status: velerov2alpha1.DataDownloadStatus{
+				Phase:             velerov2alpha1.DataDownloadPhaseCanceling,
+				AcceptedTimestamp: ptrTime(time.Now().Add(-(DefaultOperationTimeout + time.Hour))),
+			},
+		}
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(dd).Build()
+		r := &KubeVirtDataDownloadReconciler{Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp"}
+
+		if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: dd.Name, Namespace: dd.Namespace}}); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		updated := get(t, fakeClient, dd.Name, dd.Namespace)
+		if updated.Status.Phase != velerov2alpha1.DataDownloadPhaseCanceled {
+			t.Errorf("phase = %q, want %q (Canceling must run to completion, not be preempted by the timeout check)", updated.Status.Phase, velerov2alpha1.DataDownloadPhaseCanceled)
+		}
+	})
+}
+
 func TestDataDownloadUpdatePhase(t *testing.T) {
 	scheme := ddScheme()
 	dd := &velerov2alpha1.DataDownload{
@@ -332,6 +448,9 @@ func TestHandleNewDataDownload(t *testing.T) {
 			}
 			if updated.Status.Phase != tt.expectedPhase {
 				t.Errorf("phase = %q, want %q (message: %s)", updated.Status.Phase, tt.expectedPhase, updated.Status.Message)
+			}
+			if tt.expectedPhase == velerov2alpha1.DataDownloadPhaseAccepted && updated.Status.AcceptedTimestamp == nil {
+				t.Error("AcceptedTimestamp not set when transitioning to Accepted")
 			}
 		})
 	}

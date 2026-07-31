@@ -20,18 +20,41 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"time"
 
 	"github.com/go-logr/logr"
 	velerov1 "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/migtools/kubevirt-datamover-controller/pkg/common"
 )
+
+// DefaultOperationTimeout bounds how long a DataUpload/DataDownload may remain
+// in a non-terminal phase after being Accepted when Spec.OperationTimeout is
+// unset or zero. Matches Velero server's own default item-operation-timeout.
+const DefaultOperationTimeout = 4 * time.Hour
+
+// operationTimeoutExceeded reports whether the time elapsed since acceptedAt
+// exceeds the effective operation timeout: specTimeout when positive, otherwise
+// DefaultOperationTimeout. Returns exceeded=false if acceptedAt is nil (nothing
+// to measure against yet).
+func operationTimeoutExceeded(acceptedAt *metav1.Time, specTimeout time.Duration) (exceeded bool, elapsed, effective time.Duration) {
+	if acceptedAt == nil {
+		return false, 0, 0
+	}
+	effective = specTimeout
+	if effective <= 0 {
+		effective = DefaultOperationTimeout
+	}
+	elapsed = time.Since(acceptedAt.Time)
+	return elapsed >= effective, elapsed, effective
+}
 
 // getBackupStorageLocation fetches the BSL by name from the OADP namespace,
 // falling back to fallbackNamespace if oadpNamespace is empty.

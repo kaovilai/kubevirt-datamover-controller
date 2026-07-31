@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/go-logr/logr"
 	"github.com/migtools/kubevirt-datamover-controller/pkg/common"
@@ -146,6 +147,21 @@ func (r *KubeVirtDataDownloadReconciler) Reconcile(ctx context.Context, req ctrl
 		}
 	}
 
+	// Bound how long a DataDownload may sit in a non-terminal phase after being
+	// Accepted: without this, any of the several unbounded-requeue branches below
+	// (target PVC never appearing, downloader pod never reaching a terminal state,
+	// etc.) would retry forever instead of eventually failing per Spec.OperationTimeout.
+	switch dataDownload.Status.Phase {
+	case velerov2alpha1.DataDownloadPhaseAccepted,
+		velerov2alpha1.DataDownloadPhasePrepared,
+		velerov2alpha1.DataDownloadPhaseInProgress:
+		if failed, err := r.checkOperationTimeout(ctx, logger, dataDownload); err != nil {
+			return ctrl.Result{}, err
+		} else if failed {
+			return ctrl.Result{}, nil
+		}
+	}
+
 	switch dataDownload.Status.Phase {
 	case "", velerov2alpha1.DataDownloadPhaseNew:
 		return r.handleNew(ctx, logger, dataDownload)
@@ -217,11 +233,45 @@ func (r *KubeVirtDataDownloadReconciler) handleNew(ctx context.Context, logger l
 		return ctrl.Result{}, nil
 	}
 
+	// Record when this DataDownload was accepted so checkOperationTimeout can bound
+	// how long it's allowed to remain non-terminal against Spec.OperationTimeout.
+	now := metav1.Now()
+	dd.Status.AcceptedTimestamp = &now
+
 	if err := r.updatePhase(ctx, dd, velerov2alpha1.DataDownloadPhaseAccepted, "DataDownload accepted by kubevirt datamover"); err != nil {
 		return ctrl.Result{}, err
 	}
 
 	return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
+}
+
+// checkOperationTimeout fails dd if too much time has elapsed since it was
+// accepted, per Spec.OperationTimeout (falling back to DefaultOperationTimeout
+// when unset). Self-heals a missing AcceptedTimestamp -- e.g. a DataDownload
+// already past New when this check was introduced -- by backfilling it to now
+// rather than leaving the operation unbounded forever.
+func (r *KubeVirtDataDownloadReconciler) checkOperationTimeout(ctx context.Context, logger logr.Logger, dd *velerov2alpha1.DataDownload) (failed bool, err error) {
+	if dd.Status.AcceptedTimestamp == nil {
+		now := metav1.Now()
+		dd.Status.AcceptedTimestamp = &now
+		if err := r.Update(ctx, dd); err != nil {
+			return false, fmt.Errorf("failed to backfill AcceptedTimestamp: %w", err)
+		}
+		return false, nil
+	}
+
+	exceeded, elapsed, effective := operationTimeoutExceeded(dd.Status.AcceptedTimestamp, dd.Spec.OperationTimeout.Duration)
+	if !exceeded {
+		return false, nil
+	}
+
+	logger.Error(nil, "DataDownload exceeded operation timeout",
+		"phase", dd.Status.Phase, "elapsed", elapsed.Round(time.Second), "timeout", effective)
+	if err := r.updatePhase(ctx, dd, velerov2alpha1.DataDownloadPhaseFailed,
+		fmt.Sprintf("operation timed out after %s in phase %s (limit %s)", elapsed.Round(time.Second), dd.Status.Phase, effective)); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // handleAccepted processes DataDownloads in Accepted phase.

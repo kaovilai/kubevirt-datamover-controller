@@ -144,6 +144,21 @@ func (r *KubeVirtDataUploadReconciler) Reconcile(ctx context.Context, req ctrl.R
 		"dataUpload", req.NamespacedName,
 		"phase", dataUpload.Status.Phase)
 
+	// Bound how long a DataUpload may sit in a non-terminal phase after being
+	// Accepted: without this, any of the several unbounded-requeue branches below
+	// (waiting on VMB status, waiting on the datamover pod, etc.) would retry
+	// forever instead of eventually failing per Spec.OperationTimeout.
+	switch dataUpload.Status.Phase {
+	case velerov2alpha1.DataUploadPhaseAccepted,
+		velerov2alpha1.DataUploadPhasePrepared,
+		velerov2alpha1.DataUploadPhaseInProgress:
+		if failed, err := r.checkOperationTimeout(ctx, logger, dataUpload); err != nil {
+			return ctrl.Result{}, err
+		} else if failed {
+			return ctrl.Result{}, nil
+		}
+	}
+
 	// Handle based on current phase
 	switch dataUpload.Status.Phase {
 	case "", velerov2alpha1.DataUploadPhaseNew:
@@ -216,12 +231,46 @@ func (r *KubeVirtDataUploadReconciler) handleNew(ctx context.Context, logger log
 
 	logger.Info("VM validation passed", "vmName", vmRef.Name, "vmNamespace", vmRef.Namespace)
 
+	// Record when this DataUpload was accepted so checkOperationTimeout can bound
+	// how long it's allowed to remain non-terminal against Spec.OperationTimeout.
+	now := metav1.Now()
+	du.Status.AcceptedTimestamp = &now
+
 	// Transition to Accepted phase
 	if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseAccepted, "DataUpload accepted by kubevirt datamover"); err != nil {
 		return ctrl.Result{}, err
 	}
 
 	return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
+}
+
+// checkOperationTimeout fails du if too much time has elapsed since it was
+// accepted, per Spec.OperationTimeout (falling back to DefaultOperationTimeout
+// when unset). Self-heals a missing AcceptedTimestamp -- e.g. a DataUpload
+// already past New when this check was introduced -- by backfilling it to now
+// rather than leaving the operation unbounded forever.
+func (r *KubeVirtDataUploadReconciler) checkOperationTimeout(ctx context.Context, logger logr.Logger, du *velerov2alpha1.DataUpload) (failed bool, err error) {
+	if du.Status.AcceptedTimestamp == nil {
+		now := metav1.Now()
+		du.Status.AcceptedTimestamp = &now
+		if err := r.Update(ctx, du); err != nil {
+			return false, fmt.Errorf("failed to backfill AcceptedTimestamp: %w", err)
+		}
+		return false, nil
+	}
+
+	exceeded, elapsed, effective := operationTimeoutExceeded(du.Status.AcceptedTimestamp, du.Spec.OperationTimeout.Duration)
+	if !exceeded {
+		return false, nil
+	}
+
+	logger.Error(nil, "DataUpload exceeded operation timeout",
+		"phase", du.Status.Phase, "elapsed", elapsed.Round(time.Second), "timeout", effective)
+	if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed,
+		fmt.Sprintf("operation timed out after %s in phase %s (limit %s)", elapsed.Round(time.Second), du.Status.Phase, effective)); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // handleAccepted processes DataUploads in Accepted phase

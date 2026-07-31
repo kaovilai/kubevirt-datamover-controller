@@ -296,6 +296,9 @@ func TestReconcile(t *testing.T) {
 				if updatedDU.Status.Phase != tt.expectedPhase {
 					t.Errorf("expected phase=%s, got phase=%s", tt.expectedPhase, updatedDU.Status.Phase)
 				}
+				if tt.expectedPhase == velerov2alpha1.DataUploadPhaseAccepted && updatedDU.Status.AcceptedTimestamp == nil {
+					t.Error("AcceptedTimestamp not set when transitioning to Accepted")
+				}
 			}
 		})
 	}
@@ -331,6 +334,123 @@ func TestReconcile_NotFound(t *testing.T) {
 	if result.RequeueAfter > 0 {
 		t.Errorf("expected no requeue for not-found, got RequeueAfter=%v", result.RequeueAfter)
 	}
+}
+
+func TestReconcile_OperationTimeout(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = kubevirtbackupv1alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+	_ = velerov1.AddToScheme(scheme)
+
+	get := func(t *testing.T, c client.Client, name, namespace string) *velerov2alpha1.DataUpload {
+		t.Helper()
+		var out velerov2alpha1.DataUpload
+		if err := c.Get(context.Background(), types.NamespacedName{Name: name, Namespace: namespace}, &out); err != nil {
+			t.Fatalf("failed to get DataUpload: %v", err)
+		}
+		return &out
+	}
+
+	t.Run("Accepted phase past default operation timeout fails", func(t *testing.T) {
+		du := &velerov2alpha1.DataUpload{
+			ObjectMeta: metav1.ObjectMeta{Name: "du-timeout", Namespace: "openshift-adp"},
+			Spec:       velerov2alpha1.DataUploadSpec{DataMover: common.DataMoverKubeVirt},
+			Status: velerov2alpha1.DataUploadStatus{
+				Phase:             velerov2alpha1.DataUploadPhaseAccepted,
+				AcceptedTimestamp: ptrTime(time.Now().Add(-(DefaultOperationTimeout + time.Minute))),
+			},
+		}
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(du).Build()
+		r := &KubeVirtDataUploadReconciler{Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp"}
+
+		result, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: du.Name, Namespace: du.Namespace}})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if result.RequeueAfter != 0 {
+			t.Errorf("expected no requeue after timeout failure, got %v", result.RequeueAfter)
+		}
+		updated := get(t, fakeClient, du.Name, du.Namespace)
+		if updated.Status.Phase != velerov2alpha1.DataUploadPhaseFailed {
+			t.Errorf("phase = %q, want %q", updated.Status.Phase, velerov2alpha1.DataUploadPhaseFailed)
+		}
+		if !strings.Contains(updated.Status.Message, "operation timed out") {
+			t.Errorf("message = %q, want it to mention the timeout", updated.Status.Message)
+		}
+	})
+
+	t.Run("InProgress phase respects custom Spec.OperationTimeout", func(t *testing.T) {
+		du := &velerov2alpha1.DataUpload{
+			ObjectMeta: metav1.ObjectMeta{Name: "du-custom-timeout", Namespace: "openshift-adp"},
+			Spec: velerov2alpha1.DataUploadSpec{
+				DataMover:        common.DataMoverKubeVirt,
+				OperationTimeout: metav1.Duration{Duration: time.Hour},
+			},
+			Status: velerov2alpha1.DataUploadStatus{
+				Phase:             velerov2alpha1.DataUploadPhaseInProgress,
+				AcceptedTimestamp: ptrTime(time.Now().Add(-2 * time.Hour)),
+			},
+		}
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(du).Build()
+		r := &KubeVirtDataUploadReconciler{Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp"}
+
+		if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: du.Name, Namespace: du.Namespace}}); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		updated := get(t, fakeClient, du.Name, du.Namespace)
+		if updated.Status.Phase != velerov2alpha1.DataUploadPhaseFailed {
+			t.Errorf("phase = %q, want %q (custom 1h OperationTimeout exceeded by 2h elapsed)", updated.Status.Phase, velerov2alpha1.DataUploadPhaseFailed)
+		}
+	})
+
+	t.Run("nil AcceptedTimestamp is backfilled without failing", func(t *testing.T) {
+		du := &velerov2alpha1.DataUpload{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "du-backfill", Namespace: "openshift-adp",
+				Annotations: map[string]string{
+					common.AnnotationVMName:      "test-vm",
+					common.AnnotationVMNamespace: "default",
+				},
+			},
+			Spec:   velerov2alpha1.DataUploadSpec{DataMover: common.DataMoverKubeVirt},
+			Status: velerov2alpha1.DataUploadStatus{Phase: velerov2alpha1.DataUploadPhaseAccepted},
+		}
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(du).Build()
+		r := &KubeVirtDataUploadReconciler{Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp"}
+
+		if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: du.Name, Namespace: du.Namespace}}); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		updated := get(t, fakeClient, du.Name, du.Namespace)
+		if updated.Status.Phase == velerov2alpha1.DataUploadPhaseFailed {
+			t.Errorf("phase = %q, backfilling a missing AcceptedTimestamp must not itself fail the DataUpload", updated.Status.Phase)
+		}
+		if updated.Status.AcceptedTimestamp == nil {
+			t.Errorf("expected AcceptedTimestamp to be backfilled, got nil")
+		}
+	})
+
+	t.Run("Canceling phase is not subject to operation timeout", func(t *testing.T) {
+		du := &velerov2alpha1.DataUpload{
+			ObjectMeta: metav1.ObjectMeta{Name: "du-canceling", Namespace: "openshift-adp"},
+			Spec:       velerov2alpha1.DataUploadSpec{DataMover: common.DataMoverKubeVirt},
+			Status: velerov2alpha1.DataUploadStatus{
+				Phase:             velerov2alpha1.DataUploadPhaseCanceling,
+				AcceptedTimestamp: ptrTime(time.Now().Add(-(DefaultOperationTimeout + time.Hour))),
+			},
+		}
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(du).Build()
+		r := &KubeVirtDataUploadReconciler{Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp"}
+
+		if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: du.Name, Namespace: du.Namespace}}); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		updated := get(t, fakeClient, du.Name, du.Namespace)
+		if updated.Status.Phase != velerov2alpha1.DataUploadPhaseCanceled {
+			t.Errorf("phase = %q, want %q (Canceling must run to completion, not be preempted by the timeout check)", updated.Status.Phase, velerov2alpha1.DataUploadPhaseCanceled)
+		}
+	})
 }
 
 func TestFilterKubeVirtDataMover(t *testing.T) {
