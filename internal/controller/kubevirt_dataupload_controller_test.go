@@ -451,6 +451,45 @@ func TestReconcile_OperationTimeout(t *testing.T) {
 			t.Errorf("phase = %q, want %q (Canceling must run to completion, not be preempted by the timeout check)", updated.Status.Phase, velerov2alpha1.DataUploadPhaseCanceled)
 		}
 	})
+
+	t.Run("handler's RequeueAfterShort is capped to the remaining custom OperationTimeout", func(t *testing.T) {
+		// handleInProgress's pod-Pending branch normally requeues after
+		// RequeueAfterShort (5s) -- with a short custom OperationTimeout that has
+		// mostly elapsed, the returned RequeueAfter must be capped to (roughly)
+		// what's left instead of overshooting the deadline.
+		du := &velerov2alpha1.DataUpload{
+			ObjectMeta: metav1.ObjectMeta{Name: "du-cap-requeue", Namespace: "openshift-adp", UID: types.UID("du-cap-requeue-uid")},
+			Spec: velerov2alpha1.DataUploadSpec{
+				DataMover:        common.DataMoverKubeVirt,
+				OperationTimeout: metav1.Duration{Duration: 3 * time.Second},
+			},
+			Status: velerov2alpha1.DataUploadStatus{
+				Phase:             velerov2alpha1.DataUploadPhaseInProgress,
+				AcceptedTimestamp: ptrTime(time.Now().Add(-2 * time.Second)),
+			},
+		}
+		pendingPod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "du-cap-requeue-pod", Namespace: "openshift-adp",
+				Labels: map[string]string{common.LabelDataUploadUID: string(du.UID)},
+			},
+			Status: corev1.PodStatus{Phase: corev1.PodPending},
+		}
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(du, pendingPod).Build()
+		r := &KubeVirtDataUploadReconciler{Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp"}
+
+		result, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: du.Name, Namespace: du.Namespace}})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if result.RequeueAfter <= 0 || result.RequeueAfter >= RequeueAfterShort {
+			t.Errorf("RequeueAfter = %v, want it capped below RequeueAfterShort (%v) to the ~1s remaining before the 3s OperationTimeout deadline", result.RequeueAfter, RequeueAfterShort)
+		}
+		updated := get(t, fakeClient, du.Name, du.Namespace)
+		if updated.Status.Phase != velerov2alpha1.DataUploadPhaseInProgress {
+			t.Errorf("phase = %q, want %q (timeout not yet exceeded)", updated.Status.Phase, velerov2alpha1.DataUploadPhaseInProgress)
+		}
+	})
 }
 
 func TestFilterKubeVirtDataMover(t *testing.T) {

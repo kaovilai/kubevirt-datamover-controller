@@ -30,6 +30,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/migtools/kubevirt-datamover-controller/pkg/common"
@@ -54,6 +55,22 @@ func operationTimeoutExceeded(acceptedAt *metav1.Time, specTimeout time.Duration
 	}
 	elapsed = time.Since(acceptedAt.Time)
 	return elapsed >= effective, elapsed, effective
+}
+
+// capRequeueToOperationDeadline caps result.RequeueAfter so a phase handler's
+// own requeue delay (e.g. RequeueAfterLong) can never push the next reconcile
+// past the operation's timeout deadline -- otherwise a short Spec.OperationTimeout
+// could be overshot by however long the handler's own poll interval is before
+// checkOperationTimeout gets a chance to re-evaluate it.
+func capRequeueToOperationDeadline(result ctrl.Result, acceptedAt *metav1.Time, specTimeout time.Duration) ctrl.Result {
+	if result.RequeueAfter <= 0 || acceptedAt == nil {
+		return result
+	}
+	_, elapsed, effective := operationTimeoutExceeded(acceptedAt, specTimeout)
+	if remaining := effective - elapsed; remaining > 0 && remaining < result.RequeueAfter {
+		result.RequeueAfter = remaining
+	}
+	return result
 }
 
 // getBackupStorageLocation fetches the BSL by name from the OADP namespace,

@@ -151,10 +151,12 @@ func (r *KubeVirtDataDownloadReconciler) Reconcile(ctx context.Context, req ctrl
 	// Accepted: without this, any of the several unbounded-requeue branches below
 	// (target PVC never appearing, downloader pod never reaching a terminal state,
 	// etc.) would retry forever instead of eventually failing per Spec.OperationTimeout.
+	timeoutBound := false
 	switch dataDownload.Status.Phase {
 	case velerov2alpha1.DataDownloadPhaseAccepted,
 		velerov2alpha1.DataDownloadPhasePrepared,
 		velerov2alpha1.DataDownloadPhaseInProgress:
+		timeoutBound = true
 		if failed, err := r.checkOperationTimeout(ctx, logger, dataDownload); err != nil {
 			return ctrl.Result{}, err
 		} else if failed {
@@ -162,18 +164,20 @@ func (r *KubeVirtDataDownloadReconciler) Reconcile(ctx context.Context, req ctrl
 		}
 	}
 
+	var result ctrl.Result
+	var err error
 	switch dataDownload.Status.Phase {
 	case "", velerov2alpha1.DataDownloadPhaseNew:
-		return r.handleNew(ctx, logger, dataDownload)
+		result, err = r.handleNew(ctx, logger, dataDownload)
 
 	case velerov2alpha1.DataDownloadPhaseAccepted:
-		return r.handleAccepted(ctx, logger, dataDownload)
+		result, err = r.handleAccepted(ctx, logger, dataDownload)
 
 	case velerov2alpha1.DataDownloadPhasePrepared:
-		return r.handlePrepared(ctx, logger, dataDownload)
+		result, err = r.handlePrepared(ctx, logger, dataDownload)
 
 	case velerov2alpha1.DataDownloadPhaseInProgress:
-		return r.handleInProgress(ctx, logger, dataDownload)
+		result, err = r.handleInProgress(ctx, logger, dataDownload)
 
 	case velerov2alpha1.DataDownloadPhaseCanceling:
 		return r.handleCanceling(ctx, logger, dataDownload)
@@ -188,6 +192,11 @@ func (r *KubeVirtDataDownloadReconciler) Reconcile(ctx context.Context, req ctrl
 		logger.Info("Unknown DataDownload phase", "phase", dataDownload.Status.Phase)
 		return ctrl.Result{}, nil
 	}
+
+	if timeoutBound && err == nil {
+		result = capRequeueToOperationDeadline(result, dataDownload.Status.AcceptedTimestamp, dataDownload.Spec.OperationTimeout.Duration)
+	}
+	return result, err
 }
 
 // handleNew processes DataDownloads in New phase.

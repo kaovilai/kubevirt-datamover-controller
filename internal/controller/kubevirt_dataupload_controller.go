@@ -148,10 +148,12 @@ func (r *KubeVirtDataUploadReconciler) Reconcile(ctx context.Context, req ctrl.R
 	// Accepted: without this, any of the several unbounded-requeue branches below
 	// (waiting on VMB status, waiting on the datamover pod, etc.) would retry
 	// forever instead of eventually failing per Spec.OperationTimeout.
+	timeoutBound := false
 	switch dataUpload.Status.Phase {
 	case velerov2alpha1.DataUploadPhaseAccepted,
 		velerov2alpha1.DataUploadPhasePrepared,
 		velerov2alpha1.DataUploadPhaseInProgress:
+		timeoutBound = true
 		if failed, err := r.checkOperationTimeout(ctx, logger, dataUpload); err != nil {
 			return ctrl.Result{}, err
 		} else if failed {
@@ -160,18 +162,20 @@ func (r *KubeVirtDataUploadReconciler) Reconcile(ctx context.Context, req ctrl.R
 	}
 
 	// Handle based on current phase
+	var result ctrl.Result
+	var err error
 	switch dataUpload.Status.Phase {
 	case "", velerov2alpha1.DataUploadPhaseNew:
-		return r.handleNew(ctx, logger, dataUpload)
+		result, err = r.handleNew(ctx, logger, dataUpload)
 
 	case velerov2alpha1.DataUploadPhaseAccepted:
-		return r.handleAccepted(ctx, logger, dataUpload)
+		result, err = r.handleAccepted(ctx, logger, dataUpload)
 
 	case velerov2alpha1.DataUploadPhasePrepared:
-		return r.handlePrepared(ctx, logger, dataUpload)
+		result, err = r.handlePrepared(ctx, logger, dataUpload)
 
 	case velerov2alpha1.DataUploadPhaseInProgress:
-		return r.handleInProgress(ctx, logger, dataUpload)
+		result, err = r.handleInProgress(ctx, logger, dataUpload)
 
 	case velerov2alpha1.DataUploadPhaseCanceling:
 		return r.handleCanceling(ctx, logger, dataUpload)
@@ -187,6 +191,11 @@ func (r *KubeVirtDataUploadReconciler) Reconcile(ctx context.Context, req ctrl.R
 		logger.Info("Unknown DataUpload phase", "phase", dataUpload.Status.Phase)
 		return ctrl.Result{}, nil
 	}
+
+	if timeoutBound && err == nil {
+		result = capRequeueToOperationDeadline(result, dataUpload.Status.AcceptedTimestamp, dataUpload.Spec.OperationTimeout.Duration)
+	}
+	return result, err
 }
 
 // handleNew processes DataUploads in New phase

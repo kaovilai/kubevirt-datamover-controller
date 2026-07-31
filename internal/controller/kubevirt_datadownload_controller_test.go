@@ -307,6 +307,44 @@ func TestDataDownloadReconcile_OperationTimeout(t *testing.T) {
 			t.Errorf("phase = %q, want %q (Canceling must run to completion, not be preempted by the timeout check)", updated.Status.Phase, velerov2alpha1.DataDownloadPhaseCanceled)
 		}
 	})
+
+	t.Run("handler's RequeueAfterLong is capped to the remaining custom OperationTimeout", func(t *testing.T) {
+		// handleAccepted's target-PVC-not-found branch normally requeues after
+		// RequeueAfterLong (30s) -- with a short custom OperationTimeout that has
+		// mostly elapsed, that would overshoot the deadline by up to ~29s. The
+		// returned RequeueAfter must be capped to (roughly) what's left instead.
+		dd := &velerov2alpha1.DataDownload{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "dd-cap-requeue", Namespace: "openshift-adp",
+				Annotations: map[string]string{common.AnnotationVMName: "vm-1"},
+			},
+			Spec: velerov2alpha1.DataDownloadSpec{
+				DataMover:        common.DataMoverKubeVirt,
+				OperationTimeout: metav1.Duration{Duration: 10 * time.Second},
+				TargetVolume: velerov2alpha1.TargetVolumeSpec{
+					PVC: "not-yet-created", Namespace: "restore-ns",
+				},
+			},
+			Status: velerov2alpha1.DataDownloadStatus{
+				Phase:             velerov2alpha1.DataDownloadPhaseAccepted,
+				AcceptedTimestamp: ptrTime(time.Now().Add(-9 * time.Second)),
+			},
+		}
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(dd).Build()
+		r := &KubeVirtDataDownloadReconciler{Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp"}
+
+		result, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: dd.Name, Namespace: dd.Namespace}})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if result.RequeueAfter <= 0 || result.RequeueAfter >= RequeueAfterLong {
+			t.Errorf("RequeueAfter = %v, want it capped below RequeueAfterLong (%v) to the ~1s remaining before the 10s OperationTimeout deadline", result.RequeueAfter, RequeueAfterLong)
+		}
+		updated := get(t, fakeClient, dd.Name, dd.Namespace)
+		if updated.Status.Phase != velerov2alpha1.DataDownloadPhaseAccepted {
+			t.Errorf("phase = %q, want %q (timeout not yet exceeded)", updated.Status.Phase, velerov2alpha1.DataDownloadPhaseAccepted)
+		}
+	})
 }
 
 func TestDataDownloadUpdatePhase(t *testing.T) {
