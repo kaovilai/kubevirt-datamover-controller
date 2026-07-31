@@ -194,6 +194,10 @@ func TestDataDownloadReconcile(t *testing.T) {
 	})
 }
 
+// TestDataDownloadReconcile_OperationTimeout covers Spec.OperationTimeout
+// enforcement across several independent t.Run subtests.
+//
+//nolint:gocyclo // Table of independent subtests, not complex control flow
 func TestDataDownloadReconcile_OperationTimeout(t *testing.T) {
 	scheme := ddScheme()
 
@@ -451,6 +455,39 @@ func TestDataDownloadReconcile_OperationTimeout(t *testing.T) {
 		}
 		if result.RequeueAfter <= 0 || result.RequeueAfter >= RequeueAfterShort {
 			t.Errorf("RequeueAfter = %v, want it capped below RequeueAfterShort (%v) to the ~2s remaining before the 2s OperationTimeout deadline", result.RequeueAfter, RequeueAfterShort)
+		}
+	})
+
+	t.Run("terminal transition within the same reconcile is never given a nonzero requeue by the cap", func(t *testing.T) {
+		// handleAccepted's own (unrelated-to-timeout) failure path -- e.g. a
+		// missing VM reference -- transitions straight to Failed and returns
+		// ctrl.Result{} (no requeue) in the same reconcile that ran
+		// checkOperationTimeout. Guards against capRequeueToOperationDeadline
+		// ever being applied to a terminal transition's result.
+		dd := &velerov2alpha1.DataDownload{
+			ObjectMeta: metav1.ObjectMeta{Name: "dd-terminal-no-requeue", Namespace: "openshift-adp"},
+			Spec:       velerov2alpha1.DataDownloadSpec{DataMover: common.DataMoverKubeVirt},
+			Status: velerov2alpha1.DataDownloadStatus{
+				Phase:             velerov2alpha1.DataDownloadPhaseAccepted,
+				AcceptedTimestamp: ptrTime(time.Now()),
+			},
+		}
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(dd).Build()
+		r := &KubeVirtDataDownloadReconciler{Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp"}
+
+		result, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: dd.Name, Namespace: dd.Namespace}})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if result.RequeueAfter != 0 {
+			t.Errorf("RequeueAfter = %v, want 0 (terminal transition must not be requeued)", result.RequeueAfter)
+		}
+		updated := get(t, fakeClient, dd.Name, dd.Namespace)
+		if updated.Status.Phase != velerov2alpha1.DataDownloadPhaseFailed {
+			t.Fatalf("phase = %q, want %q", updated.Status.Phase, velerov2alpha1.DataDownloadPhaseFailed)
+		}
+		if strings.Contains(updated.Status.Message, "operation timed out") {
+			t.Errorf("message = %q, want a handler-level failure (missing VM reference), not a timeout", updated.Status.Message)
 		}
 	})
 }
