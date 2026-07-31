@@ -41,6 +41,11 @@ import (
 // unset or zero. Matches Velero server's own default item-operation-timeout.
 const DefaultOperationTimeout = 4 * time.Hour
 
+// immediateRequeueDelay is used by capRequeueToOperationDeadline in place of a
+// zero RequeueAfter: returning ctrl.Result{RequeueAfter: 0} with a nil error
+// is treated by controller-runtime as "don't requeue," not "requeue now."
+const immediateRequeueDelay = time.Second
+
 // operationTimeoutExceeded reports whether the time elapsed since acceptedAt
 // exceeds the effective operation timeout: specTimeout when positive, otherwise
 // DefaultOperationTimeout. Returns exceeded=false if acceptedAt is nil (nothing
@@ -67,7 +72,16 @@ func capRequeueToOperationDeadline(result ctrl.Result, acceptedAt *metav1.Time, 
 		return result
 	}
 	_, elapsed, effective := operationTimeoutExceeded(acceptedAt, specTimeout)
-	if remaining := effective - elapsed; remaining > 0 && remaining < result.RequeueAfter {
+	remaining := effective - elapsed
+	switch {
+	case remaining <= 0:
+		// The deadline has already passed -- e.g. the phase handler itself took
+		// long enough to run that it crossed the deadline after checkOperationTimeout
+		// last evaluated it. Requeue almost immediately instead of preserving the
+		// handler's original (possibly long) delay, so the next reconcile can fail
+		// it right away rather than waiting out a stale poll interval.
+		result.RequeueAfter = immediateRequeueDelay
+	case remaining < result.RequeueAfter:
 		result.RequeueAfter = remaining
 	}
 	return result

@@ -21,6 +21,7 @@ import (
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	ctrl "sigs.k8s.io/controller-runtime"
 )
 
 func TestOperationTimeoutExceeded(t *testing.T) {
@@ -91,4 +92,65 @@ func TestOperationTimeoutExceeded(t *testing.T) {
 func ptrTime(t time.Time) *metav1.Time {
 	mt := metav1.NewTime(t)
 	return &mt
+}
+
+func TestCapRequeueToOperationDeadline(t *testing.T) {
+	tests := []struct {
+		name           string
+		result         ctrl.Result
+		acceptedAt     *metav1.Time
+		specTimeout    time.Duration
+		wantRequeueMin time.Duration
+		wantRequeueMax time.Duration
+	}{
+		{
+			name:           "zero RequeueAfter is left alone",
+			result:         ctrl.Result{},
+			acceptedAt:     ptrTime(time.Now()),
+			specTimeout:    time.Hour,
+			wantRequeueMin: 0,
+			wantRequeueMax: 0,
+		},
+		{
+			name:           "nil acceptedAt is left alone",
+			result:         ctrl.Result{RequeueAfter: 30 * time.Second},
+			acceptedAt:     nil,
+			specTimeout:    time.Hour,
+			wantRequeueMin: 30 * time.Second,
+			wantRequeueMax: 30 * time.Second,
+		},
+		{
+			name:           "plenty of time left, delay unchanged",
+			result:         ctrl.Result{RequeueAfter: 5 * time.Second},
+			acceptedAt:     ptrTime(time.Now().Add(-time.Second)),
+			specTimeout:    time.Hour,
+			wantRequeueMin: 5 * time.Second,
+			wantRequeueMax: 5 * time.Second,
+		},
+		{
+			name:           "delay capped to the remaining deadline",
+			result:         ctrl.Result{RequeueAfter: 30 * time.Second},
+			acceptedAt:     ptrTime(time.Now().Add(-9 * time.Second)),
+			specTimeout:    10 * time.Second,
+			wantRequeueMin: 1,
+			wantRequeueMax: time.Second,
+		},
+		{
+			name:           "deadline already elapsed requeues almost immediately, not with the stale long delay",
+			result:         ctrl.Result{RequeueAfter: 30 * time.Second},
+			acceptedAt:     ptrTime(time.Now().Add(-2 * time.Hour)),
+			specTimeout:    time.Hour,
+			wantRequeueMin: 1,
+			wantRequeueMax: immediateRequeueDelay,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := capRequeueToOperationDeadline(tt.result, tt.acceptedAt, tt.specTimeout)
+			if got.RequeueAfter < tt.wantRequeueMin || got.RequeueAfter > tt.wantRequeueMax {
+				t.Errorf("RequeueAfter = %v, want in range [%v, %v]", got.RequeueAfter, tt.wantRequeueMin, tt.wantRequeueMax)
+			}
+		})
+	}
 }

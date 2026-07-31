@@ -454,18 +454,20 @@ func TestReconcile_OperationTimeout(t *testing.T) {
 
 	t.Run("handler's RequeueAfterShort is capped to the remaining custom OperationTimeout", func(t *testing.T) {
 		// handleInProgress's pod-Pending branch normally requeues after
-		// RequeueAfterShort (5s) -- with a short custom OperationTimeout that has
-		// mostly elapsed, the returned RequeueAfter must be capped to (roughly)
-		// what's left instead of overshooting the deadline.
+		// RequeueAfterShort (5s) -- with a custom OperationTimeout that has
+		// nearly elapsed, the returned RequeueAfter must be capped to (roughly)
+		// what's left instead of overshooting the deadline. Uses a 30s timeout
+		// with 27s elapsed (a wider margin than a few-second timeout) so the
+		// test isn't flaky against real wall-clock execution overhead.
 		du := &velerov2alpha1.DataUpload{
 			ObjectMeta: metav1.ObjectMeta{Name: "du-cap-requeue", Namespace: "openshift-adp", UID: types.UID("du-cap-requeue-uid")},
 			Spec: velerov2alpha1.DataUploadSpec{
 				DataMover:        common.DataMoverKubeVirt,
-				OperationTimeout: metav1.Duration{Duration: 3 * time.Second},
+				OperationTimeout: metav1.Duration{Duration: 30 * time.Second},
 			},
 			Status: velerov2alpha1.DataUploadStatus{
 				Phase:             velerov2alpha1.DataUploadPhaseInProgress,
-				AcceptedTimestamp: ptrTime(time.Now().Add(-2 * time.Second)),
+				AcceptedTimestamp: ptrTime(time.Now().Add(-27 * time.Second)),
 			},
 		}
 		pendingPod := &corev1.Pod{
@@ -483,7 +485,7 @@ func TestReconcile_OperationTimeout(t *testing.T) {
 			t.Fatalf("unexpected error: %v", err)
 		}
 		if result.RequeueAfter <= 0 || result.RequeueAfter >= RequeueAfterShort {
-			t.Errorf("RequeueAfter = %v, want it capped below RequeueAfterShort (%v) to the ~1s remaining before the 3s OperationTimeout deadline", result.RequeueAfter, RequeueAfterShort)
+			t.Errorf("RequeueAfter = %v, want it capped below RequeueAfterShort (%v) to the ~3s remaining before the 30s OperationTimeout deadline", result.RequeueAfter, RequeueAfterShort)
 		}
 		updated := get(t, fakeClient, du.Name, du.Namespace)
 		if updated.Status.Phase != velerov2alpha1.DataUploadPhaseInProgress {
