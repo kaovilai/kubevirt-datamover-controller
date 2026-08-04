@@ -188,6 +188,7 @@ func (r *KubeVirtDataDownloadReconciler) Reconcile(ctx context.Context, req ctrl
 		return ctrl.Result{}, nil
 	}
 
+	// Cap the handler's RequeueAfter to the operation deadline. The condition keys off
 	// dataDownload.Status.AcceptedTimestamp (rather than the pre-dispatch timeoutBound)
 	// so a New DataDownload that handleNew just transitioned to Accepted in this same
 	// reconcile -- setting AcceptedTimestamp along the way -- gets its first
@@ -285,7 +286,16 @@ func (r *KubeVirtDataDownloadReconciler) checkOperationTimeout(ctx context.Conte
 		phase:                func() string { return string(dd.Status.Phase) },
 		persist:              func(ctx context.Context) error { return r.Update(ctx, dd) },
 		fail: func(ctx context.Context, message string) error {
-			return r.updatePhase(ctx, dd, velerov2alpha1.DataDownloadPhaseFailed, message)
+			if err := r.updatePhase(ctx, dd, velerov2alpha1.DataDownloadPhaseFailed, message); err != nil {
+				return err
+			}
+			// A timeout can fire while the downloader pod is still Pending/Running
+			// (that's exactly the unbounded-wait branch this timeout guards against),
+			// unlike the other Failed paths where the pod has already terminated on
+			// its own. Best-effort stop it rather than leaving a live pod running
+			// indefinitely against a DataDownload that's now terminal.
+			cleanupPodsByUID(ctx, r.Client, common.LabelDataDownloadUID, string(dd.UID), r.getPodNamespace(dd), logger)
+			return nil
 		},
 	})
 }

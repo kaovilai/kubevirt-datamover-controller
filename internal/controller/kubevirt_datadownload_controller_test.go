@@ -31,6 +31,7 @@ import (
 	velerov2alpha1 "github.com/vmware-tanzu/velero/pkg/apis/velero/v2alpha1"
 	velero "github.com/vmware-tanzu/velero/pkg/plugin/velero"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -311,8 +312,9 @@ func TestDataDownloadReconcile_OperationTimeout(t *testing.T) {
 			t.Fatalf("unexpected error: %v", err)
 		}
 		updated := get(t, fakeClient, dd.Name, dd.Namespace)
-		if updated.Status.Phase == velerov2alpha1.DataDownloadPhaseFailed && strings.Contains(updated.Status.Message, "operation timed out") {
-			t.Errorf("backfilling a missing AcceptedTimestamp must not itself fail the DataDownload, got message %q", updated.Status.Message)
+		if updated.Status.Phase != velerov2alpha1.DataDownloadPhaseAccepted {
+			t.Errorf("phase = %q, want %q (backfilling a missing AcceptedTimestamp must not fail the DataDownload, message: %q)",
+				updated.Status.Phase, velerov2alpha1.DataDownloadPhaseAccepted, updated.Status.Message)
 		}
 		if updated.Status.AcceptedTimestamp == nil {
 			t.Errorf("expected AcceptedTimestamp to be backfilled, got nil")
@@ -488,6 +490,47 @@ func TestDataDownloadReconcile_OperationTimeout(t *testing.T) {
 		}
 		if strings.Contains(updated.Status.Message, "operation timed out") {
 			t.Errorf("message = %q, want a handler-level failure (missing VM reference), not a timeout", updated.Status.Message)
+		}
+	})
+
+	t.Run("timeout failure stops the still-running downloader pod", func(t *testing.T) {
+		// A timeout can fire while the downloader pod is still Pending/Running --
+		// that's exactly the unbounded-wait branch being guarded against -- unlike
+		// other Failed paths where the pod has already terminated on its own.
+		// Verifies checkOperationTimeoutCore's fail callback actually stops it
+		// rather than leaving it running indefinitely against a terminal DataDownload.
+		dd := &velerov2alpha1.DataDownload{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "dd-timeout-pod-cleanup", Namespace: "openshift-adp",
+				UID: types.UID("dd-timeout-pod-cleanup-uid"),
+			},
+			Spec: velerov2alpha1.DataDownloadSpec{DataMover: common.DataMoverKubeVirt},
+			Status: velerov2alpha1.DataDownloadStatus{
+				Phase:             velerov2alpha1.DataDownloadPhaseInProgress,
+				AcceptedTimestamp: ptrTime(time.Now().Add(-(DefaultOperationTimeout + time.Minute))),
+			},
+		}
+		runningPod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "dd-timeout-pod-cleanup-pod", Namespace: "openshift-adp",
+				Labels: map[string]string{common.LabelDataDownloadUID: string(dd.UID)},
+			},
+			Status: corev1.PodStatus{Phase: corev1.PodRunning},
+		}
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(dd, runningPod).Build()
+		r := &KubeVirtDataDownloadReconciler{Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp"}
+
+		if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: dd.Name, Namespace: dd.Namespace}}); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		updated := get(t, fakeClient, dd.Name, dd.Namespace)
+		if updated.Status.Phase != velerov2alpha1.DataDownloadPhaseFailed {
+			t.Fatalf("phase = %q, want %q", updated.Status.Phase, velerov2alpha1.DataDownloadPhaseFailed)
+		}
+		var pod corev1.Pod
+		err := fakeClient.Get(context.Background(), types.NamespacedName{Name: runningPod.Name, Namespace: runningPod.Namespace}, &pod)
+		if !errors.IsNotFound(err) {
+			t.Errorf("expected downloader pod to be deleted after timeout failure, got err=%v", err)
 		}
 	})
 }

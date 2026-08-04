@@ -188,6 +188,7 @@ func (r *KubeVirtDataUploadReconciler) Reconcile(ctx context.Context, req ctrl.R
 		return ctrl.Result{}, nil
 	}
 
+	// Cap the handler's RequeueAfter to the operation deadline. The condition keys off
 	// dataUpload.Status.AcceptedTimestamp (rather than the pre-dispatch timeoutBound)
 	// so a New DataUpload that handleNew just transitioned to Accepted in this same
 	// reconcile -- setting AcceptedTimestamp along the way -- gets its first
@@ -287,7 +288,16 @@ func (r *KubeVirtDataUploadReconciler) checkOperationTimeout(ctx context.Context
 		phase:                func() string { return string(du.Status.Phase) },
 		persist:              func(ctx context.Context) error { return r.Update(ctx, du) },
 		fail: func(ctx context.Context, message string) error {
-			return r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed, message)
+			if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed, message); err != nil {
+				return err
+			}
+			// A timeout can fire while the datamover pod is still Pending/Running
+			// (that's exactly the unbounded-wait branch this timeout guards against),
+			// unlike the other Failed paths where the pod has already terminated on
+			// its own. Best-effort stop it rather than leaving a live pod running
+			// indefinitely against a DataUpload that's now terminal.
+			cleanupPodsByUID(ctx, r.Client, common.LabelDataUploadUID, string(du.UID), r.getPodNamespace(du), logger)
+			return nil
 		},
 	})
 }

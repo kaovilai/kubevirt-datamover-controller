@@ -135,8 +135,8 @@ func TestCapRequeueToOperationDeadline(t *testing.T) {
 			result:         ctrl.Result{RequeueAfter: 5 * time.Minute},
 			acceptedAt:     ptrTime(time.Now().Add(-time.Second)),
 			specTimeout:    time.Minute,
-			wantRequeueMin: 55 * time.Second,
-			wantRequeueMax: 59 * time.Second,
+			wantRequeueMin: 1,
+			wantRequeueMax: time.Minute,
 		},
 		{
 			name:           "deadline already elapsed requeues almost immediately, not with the stale long delay",

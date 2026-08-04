@@ -34,6 +34,7 @@ import (
 	velerov2alpha1 "github.com/vmware-tanzu/velero/pkg/apis/velero/v2alpha1"
 	velero "github.com/vmware-tanzu/velero/pkg/plugin/velero"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -597,6 +598,47 @@ func TestReconcile_OperationTimeout(t *testing.T) {
 		}
 		if result.RequeueAfter <= 0 || result.RequeueAfter >= RequeueAfterShort {
 			t.Errorf("RequeueAfter = %v, want it capped below RequeueAfterShort (%v) to the ~2s remaining before the 2s OperationTimeout deadline", result.RequeueAfter, RequeueAfterShort)
+		}
+	})
+
+	t.Run("timeout failure stops the still-running datamover pod", func(t *testing.T) {
+		// A timeout can fire while the datamover pod is still Pending/Running --
+		// that's exactly the unbounded-wait branch being guarded against -- unlike
+		// other Failed paths where the pod has already terminated on its own.
+		// Verifies checkOperationTimeoutCore's fail callback actually stops it
+		// rather than leaving it running indefinitely against a terminal DataUpload.
+		du := &velerov2alpha1.DataUpload{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "du-timeout-pod-cleanup", Namespace: "openshift-adp",
+				UID: types.UID("du-timeout-pod-cleanup-uid"),
+			},
+			Spec: velerov2alpha1.DataUploadSpec{DataMover: common.DataMoverKubeVirt},
+			Status: velerov2alpha1.DataUploadStatus{
+				Phase:             velerov2alpha1.DataUploadPhaseInProgress,
+				AcceptedTimestamp: ptrTime(time.Now().Add(-(DefaultOperationTimeout + time.Minute))),
+			},
+		}
+		runningPod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "du-timeout-pod-cleanup-pod", Namespace: "openshift-adp",
+				Labels: map[string]string{common.LabelDataUploadUID: string(du.UID)},
+			},
+			Status: corev1.PodStatus{Phase: corev1.PodRunning},
+		}
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(du, runningPod).Build()
+		r := &KubeVirtDataUploadReconciler{Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp"}
+
+		if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: du.Name, Namespace: du.Namespace}}); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		updated := get(t, fakeClient, du.Name, du.Namespace)
+		if updated.Status.Phase != velerov2alpha1.DataUploadPhaseFailed {
+			t.Fatalf("phase = %q, want %q", updated.Status.Phase, velerov2alpha1.DataUploadPhaseFailed)
+		}
+		var pod corev1.Pod
+		err := fakeClient.Get(context.Background(), types.NamespacedName{Name: runningPod.Name, Namespace: runningPod.Namespace}, &pod)
+		if !errors.IsNotFound(err) {
+			t.Errorf("expected datamover pod to be deleted after timeout failure, got err=%v", err)
 		}
 	})
 }
