@@ -23,8 +23,14 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
 func TestOperationTimeoutExceeded(t *testing.T) {
@@ -268,6 +274,54 @@ func TestCheckOperationTimeoutCore(t *testing.T) {
 		}
 		if *failCalls != 1 {
 			t.Errorf("fail calls = %d, want 1", *failCalls)
+		}
+	})
+}
+
+func TestCleanupPodsByUID(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "victim-pod", Namespace: "ns",
+			Labels: map[string]string{"uid-label": "abc"},
+		},
+	}
+
+	t.Run("deletes matching pods", func(t *testing.T) {
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod.DeepCopy()).Build()
+		if err := cleanupPodsByUID(context.Background(), fakeClient, "uid-label", "abc", "ns", logr.Discard()); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		var got corev1.Pod
+		err := fakeClient.Get(context.Background(), client.ObjectKeyFromObject(pod), &got)
+		if !apierrors.IsNotFound(err) {
+			t.Errorf("expected pod to be deleted, got err=%v", err)
+		}
+	})
+
+	t.Run("delete failure is returned, not swallowed", func(t *testing.T) {
+		deleteErr := errors.New("injected delete failure")
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod.DeepCopy()).
+			WithInterceptorFuncs(interceptor.Funcs{
+				Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+					return deleteErr
+				},
+			}).Build()
+
+		err := cleanupPodsByUID(context.Background(), fakeClient, "uid-label", "abc", "ns", logr.Discard())
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		if !errors.Is(err, deleteErr) {
+			t.Errorf("error = %v, want it to wrap %v", err, deleteErr)
+		}
+		// The pod must still exist -- the caller learns cleanup didn't actually
+		// succeed instead of assuming it did.
+		var got corev1.Pod
+		if err := fakeClient.Get(context.Background(), client.ObjectKeyFromObject(pod), &got); err != nil {
+			t.Errorf("expected pod to still exist after a failed delete, got err=%v", err)
 		}
 	})
 }

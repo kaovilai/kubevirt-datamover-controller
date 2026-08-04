@@ -135,7 +135,7 @@ func (r *KubeVirtDataDownloadReconciler) Reconcile(ctx context.Context, req ctrl
 				if err := r.updatePhase(ctx, dataDownload, velerov2alpha1.DataDownloadPhaseCompleted, "Restored disk provisioned to target volume"); err != nil {
 					return ctrl.Result{}, err
 				}
-				cleanupPodsByUID(ctx, r.Client, common.LabelDataDownloadUID, string(dataDownload.UID), r.getPodNamespace(dataDownload), logger)
+				_ = cleanupPodsByUID(ctx, r.Client, common.LabelDataDownloadUID, string(dataDownload.UID), r.getPodNamespace(dataDownload), logger)
 				r.cleanupScratchPVCIfPresent(ctx, dataDownload, logger)
 				return ctrl.Result{}, nil
 			}
@@ -286,16 +286,19 @@ func (r *KubeVirtDataDownloadReconciler) checkOperationTimeout(ctx context.Conte
 		phase:                func() string { return string(dd.Status.Phase) },
 		persist:              func(ctx context.Context) error { return r.Update(ctx, dd) },
 		fail: func(ctx context.Context, message string) error {
-			if err := r.updatePhase(ctx, dd, velerov2alpha1.DataDownloadPhaseFailed, message); err != nil {
-				return err
+			// Stop the still-running downloader pod BEFORE persisting Failed, and
+			// propagate a cleanup failure rather than swallowing it: a timeout can
+			// fire while the pod is still Pending/Running (that's exactly the
+			// unbounded-wait branch this timeout guards against), unlike the other
+			// Failed paths where the pod has already terminated on its own. Failed
+			// is a dead-end terminal state with no further reconciliation, so
+			// persisting it before cleanup actually succeeds would leave the pod
+			// running forever with no chance to retry -- returning the error here
+			// instead lets the reconcile retry until cleanup succeeds.
+			if err := cleanupPodsByUID(ctx, r.Client, common.LabelDataDownloadUID, string(dd.UID), r.getPodNamespace(dd), logger); err != nil {
+				return fmt.Errorf("failed to stop downloader pod before failing DataDownload on timeout: %w", err)
 			}
-			// A timeout can fire while the downloader pod is still Pending/Running
-			// (that's exactly the unbounded-wait branch this timeout guards against),
-			// unlike the other Failed paths where the pod has already terminated on
-			// its own. Best-effort stop it rather than leaving a live pod running
-			// indefinitely against a DataDownload that's now terminal.
-			cleanupPodsByUID(ctx, r.Client, common.LabelDataDownloadUID, string(dd.UID), r.getPodNamespace(dd), logger)
-			return nil
+			return r.updatePhase(ctx, dd, velerov2alpha1.DataDownloadPhaseFailed, message)
 		},
 	})
 }
@@ -907,7 +910,7 @@ func (r *KubeVirtDataDownloadReconciler) handleInProgress(ctx context.Context, l
 		// Best-effort: the pod (and scratch PVC, if somehow still present) may not
 		// have been cleaned up by whichever prior attempt got the rebind done,
 		// since this path returns before reaching the normal cleanup call below.
-		cleanupPodsByUID(ctx, r.Client, common.LabelDataDownloadUID, string(dd.UID), r.getPodNamespace(dd), logger)
+		_ = cleanupPodsByUID(ctx, r.Client, common.LabelDataDownloadUID, string(dd.UID), r.getPodNamespace(dd), logger)
 		r.cleanupScratchPVCIfPresent(ctx, dd, logger)
 		return ctrl.Result{}, nil
 	}
@@ -936,7 +939,7 @@ func (r *KubeVirtDataDownloadReconciler) handleInProgress(ctx context.Context, l
 		// finalizer won't clear while any pod object (even a Completed one) still
 		// references it in spec.volumes -- leaving this pod around would deadlock
 		// that wait until it times out.
-		cleanupPodsByUID(ctx, r.Client, common.LabelDataDownloadUID, string(dd.UID), podNamespace, logger)
+		_ = cleanupPodsByUID(ctx, r.Client, common.LabelDataDownloadUID, string(dd.UID), podNamespace, logger)
 
 		scratchPVC, err := r.findScratchPVC(ctx, dd)
 		if err != nil {
@@ -1039,7 +1042,7 @@ func (r *KubeVirtDataDownloadReconciler) handleCanceling(ctx context.Context, lo
 
 	podNamespace := r.getPodNamespace(dd)
 
-	cleanupPodsByUID(ctx, r.Client, common.LabelDataDownloadUID, string(dd.UID), podNamespace, logger)
+	_ = cleanupPodsByUID(ctx, r.Client, common.LabelDataDownloadUID, string(dd.UID), podNamespace, logger)
 
 	// The scratch PVC is never rebound out of podNamespace before Completed (only the
 	// InProgress->Completed transition rebinds it), so on cancel it can be deleted

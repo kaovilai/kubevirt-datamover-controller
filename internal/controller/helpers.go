@@ -29,6 +29,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/client-go/kubernetes"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -133,8 +134,12 @@ func checkOperationTimeoutCore(ctx context.Context, logger logr.Logger, resource
 
 	logger.Error(nil, resourceKind+" exceeded operation timeout",
 		"phase", t.phase(), "elapsed", elapsed.Round(time.Second), "timeout", effective)
+	// t.fail may fail here either because it couldn't stop a still-running pod or
+	// because persisting the Failed phase itself failed -- either way, propagate
+	// so the reconcile retries rather than silently leaving a pod running behind
+	// a resource that was never actually marked Failed.
 	if err := t.fail(ctx, fmt.Sprintf("operation timed out after %s in phase %s (limit %s)", elapsed.Round(time.Second), t.phase(), effective)); err != nil {
-		return false, fmt.Errorf("failed to transition %s to Failed: %w", resourceKind, err)
+		return false, fmt.Errorf("failed to fail %s on operation timeout: %w", resourceKind, err)
 	}
 	return true, nil
 }
@@ -175,20 +180,27 @@ func findPodByUID(ctx context.Context, k8sClient client.Client, uidLabelKey, uid
 }
 
 // cleanupPodsByUID deletes all pods matching a UID label in the given namespace.
-func cleanupPodsByUID(ctx context.Context, k8sClient client.Client, uidLabelKey, uid, namespace string, logger logr.Logger) {
+// Returns an aggregated error if the list or any delete call failed, so a caller
+// that needs a guarantee the pod is actually gone (e.g. before marking a resource
+// terminal) can retry on error; callers that only want best-effort cleanup (the
+// existing callers of this function) can continue to ignore the return value.
+func cleanupPodsByUID(ctx context.Context, k8sClient client.Client, uidLabelKey, uid, namespace string, logger logr.Logger) error {
 	podList := &corev1.PodList{}
 	if err := k8sClient.List(ctx, podList, client.InNamespace(namespace), client.MatchingLabels{uidLabelKey: uid}); err != nil {
 		logger.Error(err, "Failed to list datamover pods for cleanup")
-		return
+		return fmt.Errorf("failed to list pods for cleanup: %w", err)
 	}
+	var errs []error
 	for i := range podList.Items {
 		pod := &podList.Items[i]
 		if err := k8sClient.Delete(ctx, pod); err != nil && !errors.IsNotFound(err) {
 			logger.Error(err, "Failed to delete datamover pod", "pod", pod.Name)
+			errs = append(errs, fmt.Errorf("failed to delete pod %s: %w", pod.Name, err))
 		} else {
 			logger.Info("Deleted datamover pod", "pod", pod.Name)
 		}
 	}
+	return utilerrors.NewAggregate(errs)
 }
 
 // extractPodFailureMessage extracts the failure message from a failed pod.

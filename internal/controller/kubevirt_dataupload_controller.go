@@ -288,16 +288,19 @@ func (r *KubeVirtDataUploadReconciler) checkOperationTimeout(ctx context.Context
 		phase:                func() string { return string(du.Status.Phase) },
 		persist:              func(ctx context.Context) error { return r.Update(ctx, du) },
 		fail: func(ctx context.Context, message string) error {
-			if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed, message); err != nil {
-				return err
+			// Stop the still-running datamover pod BEFORE persisting Failed, and
+			// propagate a cleanup failure rather than swallowing it: a timeout can
+			// fire while the pod is still Pending/Running (that's exactly the
+			// unbounded-wait branch this timeout guards against), unlike the other
+			// Failed paths where the pod has already terminated on its own. Failed
+			// is a dead-end terminal state with no further reconciliation, so
+			// persisting it before cleanup actually succeeds would leave the pod
+			// running forever with no chance to retry -- returning the error here
+			// instead lets the reconcile retry until cleanup succeeds.
+			if err := cleanupPodsByUID(ctx, r.Client, common.LabelDataUploadUID, string(du.UID), r.getPodNamespace(du), logger); err != nil {
+				return fmt.Errorf("failed to stop datamover pod before failing DataUpload on timeout: %w", err)
 			}
-			// A timeout can fire while the datamover pod is still Pending/Running
-			// (that's exactly the unbounded-wait branch this timeout guards against),
-			// unlike the other Failed paths where the pod has already terminated on
-			// its own. Best-effort stop it rather than leaving a live pod running
-			// indefinitely against a DataUpload that's now terminal.
-			cleanupPodsByUID(ctx, r.Client, common.LabelDataUploadUID, string(du.UID), r.getPodNamespace(du), logger)
-			return nil
+			return r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhaseFailed, message)
 		},
 	})
 }
@@ -1073,7 +1076,7 @@ func (r *KubeVirtDataUploadReconciler) emitPodLogs(ctx context.Context, logger l
 
 // cleanupDatamoverResources cleans up resources created during the datamover process
 func (r *KubeVirtDataUploadReconciler) cleanupDatamoverResources(ctx context.Context, logger logr.Logger, du *velerov2alpha1.DataUpload, podNamespace string) {
-	cleanupPodsByUID(ctx, r.Client, common.LabelDataUploadUID, string(du.UID), podNamespace, logger)
+	_ = cleanupPodsByUID(ctx, r.Client, common.LabelDataUploadUID, string(du.UID), podNamespace, logger)
 
 	reboundPVCName := common.SafeResourceName(common.ReboundPVCNamePrefix, du.Name)
 	if err := cleanupReboundPVCAndPV(ctx, r.Client, logger, reboundPVCName, podNamespace, string(du.UID), common.LabelDataUploadUID); err != nil {
