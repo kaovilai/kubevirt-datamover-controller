@@ -324,4 +324,28 @@ func TestCleanupPodsByUID(t *testing.T) {
 			t.Errorf("expected pod to still exist after a failed delete, got err=%v", err)
 		}
 	})
+
+	t.Run("a pod still terminating after Delete is reported, not silently accepted", func(t *testing.T) {
+		// Delete() only requests termination -- a pod held by a finalizer gets a
+		// DeletionTimestamp but is not actually removed until the finalizer clears
+		// (the fake client models this the same way a real API server does). A
+		// caller relying on "the pod is stopped" must see this as still-incomplete
+		// cleanup, not a successful one.
+		terminatingPod := pod.DeepCopy()
+		terminatingPod.Finalizers = []string{"example.com/still-cleaning-up"}
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(terminatingPod).Build()
+
+		err := cleanupPodsByUID(context.Background(), fakeClient, "uid-label", "abc", "ns", logr.Discard())
+		if err == nil {
+			t.Fatal("expected error reporting incomplete cleanup, got nil")
+		}
+
+		var got corev1.Pod
+		if getErr := fakeClient.Get(context.Background(), client.ObjectKeyFromObject(pod), &got); getErr != nil {
+			t.Fatalf("expected pod to still exist (blocked on its finalizer), got err=%v", getErr)
+		}
+		if got.DeletionTimestamp == nil {
+			t.Error("expected DeletionTimestamp to be set (delete was requested), but pod looks untouched")
+		}
+	})
 }

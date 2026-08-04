@@ -180,10 +180,15 @@ func findPodByUID(ctx context.Context, k8sClient client.Client, uidLabelKey, uid
 }
 
 // cleanupPodsByUID deletes all pods matching a UID label in the given namespace.
-// Returns an aggregated error if the list or any delete call failed, so a caller
-// that needs a guarantee the pod is actually gone (e.g. before marking a resource
-// terminal) can retry on error; callers that only want best-effort cleanup (the
-// existing callers of this function) can continue to ignore the return value.
+// Returns an aggregated error if the list or any delete call failed, or if any
+// matching pod is still present after the delete calls (Delete only requests
+// termination -- a pod can linger for a while afterward, e.g. blocked on a
+// finalizer, or simply not yet removed by the API server) -- so a caller that
+// needs a guarantee the pod is actually gone (e.g. before a PVC-deletion wait
+// that would otherwise deadlock on a still-referencing pod, or before marking a
+// resource terminal) can retry on error. Callers that only want best-effort
+// cleanup (the existing callers of this function) can continue to ignore the
+// return value.
 func cleanupPodsByUID(ctx context.Context, k8sClient client.Client, uidLabelKey, uid, namespace string, logger logr.Logger) error {
 	podList := &corev1.PodList{}
 	if err := k8sClient.List(ctx, podList, client.InNamespace(namespace), client.MatchingLabels{uidLabelKey: uid}); err != nil {
@@ -200,7 +205,19 @@ func cleanupPodsByUID(ctx context.Context, k8sClient client.Client, uidLabelKey,
 			logger.Info("Deleted datamover pod", "pod", pod.Name)
 		}
 	}
-	return utilerrors.NewAggregate(errs)
+	if err := utilerrors.NewAggregate(errs); err != nil {
+		return err
+	}
+
+	remaining := &corev1.PodList{}
+	if err := k8sClient.List(ctx, remaining, client.InNamespace(namespace), client.MatchingLabels{uidLabelKey: uid}); err != nil {
+		logger.Error(err, "Failed to re-list datamover pods after cleanup")
+		return fmt.Errorf("failed to confirm pod cleanup: %w", err)
+	}
+	if len(remaining.Items) > 0 {
+		return fmt.Errorf("%d pod(s) for uid %s still present after delete (likely still terminating)", len(remaining.Items), uid)
+	}
+	return nil
 }
 
 // extractPodFailureMessage extracts the failure message from a failed pod.

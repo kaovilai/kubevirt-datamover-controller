@@ -152,10 +152,25 @@ func (r *KubeVirtDataDownloadReconciler) Reconcile(ctx context.Context, req ctrl
 	// etc.) would retry forever instead of eventually failing per Spec.OperationTimeout.
 	timeoutBound := isDataDownloadTimeoutBound(dataDownload.Status.Phase)
 	if timeoutBound {
-		if failed, err := r.checkOperationTimeout(ctx, logger, dataDownload); err != nil {
-			return ctrl.Result{}, err
-		} else if failed {
-			return ctrl.Result{}, nil
+		// Mirrors the Cancel-vs-provisioned race handled above: a restore that
+		// already rebound the target volume (Completed didn't persist yet after a
+		// successful rebind, e.g. a transient API error) must not be failed by an
+		// expired timeout -- let handleInProgress's own idempotent-resume check
+		// finalize it as Completed instead.
+		provisioned := false
+		if dataDownload.Status.Phase == velerov2alpha1.DataDownloadPhaseInProgress {
+			done, err := r.isRestoreAlreadyProvisioned(ctx, dataDownload)
+			if err != nil {
+				return ctrl.Result{}, fmt.Errorf("failed to check restore completion state: %w", err)
+			}
+			provisioned = done
+		}
+		if !provisioned {
+			if failed, err := r.checkOperationTimeout(ctx, logger, dataDownload); err != nil {
+				return ctrl.Result{}, err
+			} else if failed {
+				return ctrl.Result{}, nil
+			}
 		}
 	}
 
@@ -938,8 +953,12 @@ func (r *KubeVirtDataDownloadReconciler) handleInProgress(ctx context.Context, l
 		// PVC and waits for it to fully terminate, but Kubernetes' pvc-protection
 		// finalizer won't clear while any pod object (even a Completed one) still
 		// references it in spec.volumes -- leaving this pod around would deadlock
-		// that wait until it times out.
-		_ = cleanupPodsByUID(ctx, r.Client, common.LabelDataDownloadUID, string(dd.UID), podNamespace, logger)
+		// that wait until it times out. Propagate a cleanup failure instead of
+		// proceeding into that deadlock-prone wait: the reconcile retries and
+		// tries the delete again on the next attempt.
+		if err := cleanupPodsByUID(ctx, r.Client, common.LabelDataDownloadUID, string(dd.UID), podNamespace, logger); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to delete downloader pod before rebinding restored volume: %w", err)
+		}
 
 		scratchPVC, err := r.findScratchPVC(ctx, dd)
 		if err != nil {

@@ -493,6 +493,48 @@ func TestDataDownloadReconcile_OperationTimeout(t *testing.T) {
 		}
 	})
 
+	t.Run("timeout does not override a restore that already provisioned the target volume", func(t *testing.T) {
+		// Mirrors the Cancel-vs-provisioned race already handled at the top of
+		// Reconcile: a restore whose rebind already committed (PV claimRef set)
+		// but whose Completed phase update hasn't persisted yet (e.g. a transient
+		// API error right after a successful rebind) must not be misreported as
+		// Failed just because Spec.OperationTimeout has since expired.
+		dd := &velerov2alpha1.DataDownload{
+			ObjectMeta: metav1.ObjectMeta{Name: "dd-timeout-provisioned", Namespace: "openshift-adp", UID: types.UID("dd-timeout-provisioned-uid")},
+			Spec: velerov2alpha1.DataDownloadSpec{
+				DataMover: common.DataMoverKubeVirt,
+				TargetVolume: velerov2alpha1.TargetVolumeSpec{
+					PVC:       "restored-disk-1",
+					Namespace: "restore-ns",
+				},
+			},
+			Status: velerov2alpha1.DataDownloadStatus{
+				Phase:             velerov2alpha1.DataDownloadPhaseInProgress,
+				AcceptedTimestamp: ptrTime(time.Now().Add(-(DefaultOperationTimeout + time.Minute))),
+			},
+		}
+		reboundPV := &corev1.PersistentVolume{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:   "pv-rebound-timeout",
+				Labels: map[string]string{common.LabelDataDownloadUID: string(dd.UID)},
+			},
+			Spec: corev1.PersistentVolumeSpec{
+				ClaimRef: &corev1.ObjectReference{Name: "restored-disk-1", Namespace: "restore-ns"},
+			},
+		}
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(dd, reboundPV).Build()
+		r := &KubeVirtDataDownloadReconciler{Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp"}
+
+		if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: dd.Name, Namespace: dd.Namespace}}); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		updated := get(t, fakeClient, dd.Name, dd.Namespace)
+		if updated.Status.Phase != velerov2alpha1.DataDownloadPhaseCompleted {
+			t.Errorf("phase = %q, want %q (an already-provisioned restore must finalize as Completed, not be failed by an expired timeout)",
+				updated.Status.Phase, velerov2alpha1.DataDownloadPhaseCompleted)
+		}
+	})
+
 	t.Run("timeout failure stops the still-running downloader pod", func(t *testing.T) {
 		// A timeout can fire while the downloader pod is still Pending/Running --
 		// that's exactly the unbounded-wait branch being guarded against -- unlike
