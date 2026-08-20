@@ -1,0 +1,25 @@
+FROM brew.registry.redhat.io/rh-osbs/openshift-golang-builder:rhel_9_golang_1.26 AS builder
+COPY . .
+WORKDIR $APP_ROOT/app/
+COPY go.mod go.mod
+COPY go.sum go.sum
+RUN go mod download
+COPY cmd/main.go cmd/main.go
+COPY internal/ internal/
+COPY pkg/ pkg/
+ENV BUILDTAGS strictfipsruntime
+ENV GOEXPERIMENT strictfipsruntime
+RUN CGO_ENABLED=1 GOOS=linux go build -tags "$BUILDTAGS" -mod=mod -a -o manager cmd/main.go
+
+FROM registry.redhat.io/ubi9/ubi:latest
+COPY --from=builder $APP_ROOT/app/manager /manager
+
+USER 65532:65532
+
+ENTRYPOINT ["/manager"]
+
+LABEL description="KubeVirt data mover controller"
+LABEL io.k8s.description="KubeVirt data mover controller"
+LABEL io.k8s.display-name="kubevirt-datamover-controller"
+LABEL io.openshift.tags="migration"
+LABEL summary="KubeVirt data mover controller"
