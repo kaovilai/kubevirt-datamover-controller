@@ -52,6 +52,7 @@ For full design details, see the [OADP KubeVirt Datamover Design Document](https
 - KubeVirt with Changed Block Tracking (CBT) enabled
 - Virtual machines with `status.ChangedBlockTracking: Enabled`
 - oc CLI configured to access the cluster
+- For restore: the target VM disk's StorageClass must use `volumeBindingMode: WaitForFirstConsumer`, not `Immediate`. An `Immediate` StorageClass lets the provisioner bind Velero's restored PVC to a fresh PV before this controller can rebind its own reconstructed-disk PV onto it, and the restore fails (see [Troubleshooting](#restore-fails-with-target-pvc-already-bound)).
 
 ## Deployment and Testing
 
@@ -188,6 +189,19 @@ docker push <image>
 # Use unique tag to avoid cached images
 docker build --platform linux/amd64 -t ttl.sh/kubevirt-datamover-controller:amd64-$(date +%s) .
 ```
+
+#### Restore Fails With "target PVC ... already bound"
+The DataDownload phase fails immediately with a message like:
+```
+target PVC <ns>/<name> is already bound or requests volume "...", which conflicts with restore rebinding
+```
+Cause: the target VM disk's StorageClass uses `volumeBindingMode: Immediate`. The provisioner binds Velero's just-restored PVC to a brand-new PV right away, before this controller gets a chance to rebind its own reconstructed-disk PV onto it.
+
+Fix: use (or clone with `volumeBindingMode: WaitForFirstConsumer`) a StorageClass that defers binding, e.g.:
+```bash
+oc get sc -o custom-columns=NAME:.metadata.name,BINDING:.volumeBindingMode
+```
+Then set the VM's disk PVC to a `WaitForFirstConsumer` StorageClass before backing it up, or before restoring.
 
 ### 6. Development Commands
 

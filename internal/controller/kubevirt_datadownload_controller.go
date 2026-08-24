@@ -457,7 +457,9 @@ func (r *KubeVirtDataDownloadReconciler) handleAccepted(ctx context.Context, log
 	// in validateExistingPVCForBind.
 	if targetPVC.Spec.VolumeName != "" || targetPVC.Status.Phase == corev1.ClaimBound {
 		if err := r.updatePhase(ctx, dd, velerov2alpha1.DataDownloadPhaseFailed,
-			fmt.Sprintf("target PVC %s/%s is already bound or requests volume %q, which conflicts with restore rebinding",
+			fmt.Sprintf("target PVC %s/%s is already bound or requests volume %q, which conflicts with restore rebinding "+
+				"(likely cause: target StorageClass uses volumeBindingMode Immediate, letting the provisioner bind this PVC "+
+				"before the restore's scratch PV is ready -- use volumeBindingMode WaitForFirstConsumer instead)",
 				dd.Spec.TargetVolume.Namespace, dd.Spec.TargetVolume.PVC, targetPVC.Spec.VolumeName)); err != nil {
 			return ctrl.Result{}, err
 		}

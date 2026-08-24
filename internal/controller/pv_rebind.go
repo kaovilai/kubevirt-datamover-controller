@@ -487,7 +487,8 @@ func validateExistingPVCForBind(
 
 	if pvc.Status.Phase == corev1.ClaimBound {
 		if pvc.Spec.VolumeName != pv.Name {
-			return nil, fmt.Errorf("target PVC %s/%s is already bound to PV %q, expected %q",
+			return nil, fmt.Errorf("target PVC %s/%s is already bound to PV %q, expected %q "+
+				"(likely cause: target StorageClass uses volumeBindingMode Immediate -- use WaitForFirstConsumer instead)",
 				targetNamespace, existingPVCName, pvc.Spec.VolumeName, pv.Name)
 		}
 		logger.V(1).Info("Target PVC already bound to this PV", "pvc", existingPVCName, "namespace", targetNamespace, "pv", pv.Name)
