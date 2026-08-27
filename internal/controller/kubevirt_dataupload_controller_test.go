@@ -38,6 +38,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	kubevirtbackupv1alpha1 "kubevirt.io/api/backup/v1alpha1"
 	kubevirtcorev1 "kubevirt.io/api/core/v1"
@@ -5633,6 +5634,184 @@ func TestHandleAccepted_StaleCheckpointForcesFullBackup(t *testing.T) {
 
 	if updatedDU.Annotations[common.AnnotationBSLValidated] != "true" {
 		t.Error("expected BSL validated annotation to be set")
+	}
+}
+
+// TestHandleAccepted_ExpectedBackupTypeSurvivesUpdateConflict reproduces a
+// real-world report: kubevirt-datamover.io/expected-backup-type never gets
+// stamped on a DataUpload, observed even after waiting well past the
+// annotation's normal appearance time.
+//
+// handleAccepted's fresh-VMB path issues three sequential r.Update(ctx, du)
+// calls on the same object (VMBT-name annotation, then BSL-validated
+// annotation inside validateBSLCheckpoint, then expected-backup-type). Any
+// one of them can lose a race against a concurrent writer (this repo's own
+// README documents that Velero's built-in DataUpload controller also
+// processes these objects) and return a Conflict. The first Update
+// (VMBT-name) propagates its error and lets the whole reconcile retry. The
+// expected-backup-type Update instead only logs the failure and falls
+// through to Step 4, which creates the VMB in the very same reconcile call.
+// Once that VMB exists, every later reconcile takes the "vmb != nil" path
+// and never reaches this code again -- so a single lost race permanently
+// loses the annotation for the DataUpload's entire lifetime, with no error
+// surfaced anywhere.
+func TestHandleAccepted_ExpectedBackupTypeSurvivesUpdateConflict(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = velerov2alpha1.AddToScheme(scheme)
+	_ = velerov1.AddToScheme(scheme)
+	_ = kubevirtbackupv1alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	vmName := "test-vm"
+	vmNamespace := "test-ns"
+	duName := "test-du-conflict"
+
+	du := &velerov2alpha1.DataUpload{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      duName,
+			Namespace: vmNamespace,
+			UID:       types.UID("test-uid"),
+			Annotations: map[string]string{
+				common.AnnotationVMName:      vmName,
+				common.AnnotationVMNamespace: vmNamespace,
+			},
+		},
+		Spec: velerov2alpha1.DataUploadSpec{
+			DataMover:             common.DataMoverKubeVirt,
+			SourceNamespace:       vmNamespace,
+			BackupStorageLocation: "default",
+		},
+		Status: velerov2alpha1.DataUploadStatus{
+			Phase: velerov2alpha1.DataUploadPhaseAccepted,
+		},
+	}
+
+	bsl := &velerov1.BackupStorageLocation{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "default",
+			Namespace: vmNamespace,
+		},
+		Spec: velerov1.BackupStorageLocationSpec{
+			Provider: "aws",
+			StorageType: velerov1.StorageType{
+				ObjectStorage: &velerov1.ObjectStorageLocation{
+					Bucket: "test-bucket",
+					Prefix: "velero",
+				},
+			},
+			Config: map[string]string{"region": "us-east-1"},
+			Credential: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "cloud-creds"},
+				Key:                  "cloud",
+			},
+		},
+		Status: velerov1.BackupStorageLocationStatus{
+			Phase: velerov1.BackupStorageLocationPhaseAvailable,
+		},
+	}
+
+	credSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "cloud-creds",
+			Namespace: vmNamespace,
+		},
+		Data: map[string][]byte{
+			"cloud": []byte("[default]\naws_access_key_id=AKID\naws_secret_access_key=SECRET\n"),
+		},
+	}
+
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "kubevirt-backup-" + duName,
+			Namespace: vmNamespace,
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceStorage: resource.MustParse("1Gi"),
+				},
+			},
+		},
+	}
+
+	vmbt := &kubevirtbackupv1alpha1.VirtualMachineBackupTracker{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "vmbt-" + vmName,
+			Namespace: vmNamespace,
+		},
+		Spec: kubevirtbackupv1alpha1.VirtualMachineBackupTrackerSpec{
+			Source: corev1.TypedLocalObjectReference{
+				APIGroup: new("kubevirt.io"),
+				Kind:     "VirtualMachine",
+				Name:     vmName,
+			},
+		},
+	}
+
+	// Do NOT pre-create the VMB: let ensureVMBackup create it fresh, exercising
+	// the same Step 2/3/3b/3c/4 sequence a first-ever reconcile takes.
+	baseClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(du, bsl, credSecret, pvc, vmbt).
+		WithStatusSubresource(&kubevirtbackupv1alpha1.VirtualMachineBackupTracker{}).
+		Build()
+
+	// Mock object store with no index.json -- checkpointLookup comes back
+	// non-nil (Found=false), which is what gates both the BSL-validated and
+	// expected-backup-type annotation Updates in handleAccepted.
+	mockStore := uploader.NewMockObjectStore("test-bucket", "velero-kubevirt-datamover")
+
+	conflictInjected := false
+	interceptedClient := interceptor.NewClient(baseClient, interceptor.Funcs{
+		Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+			if updatedDU, ok := obj.(*velerov2alpha1.DataUpload); ok {
+				if _, has := updatedDU.Annotations[common.AnnotationExpectedBackupType]; has && !conflictInjected {
+					conflictInjected = true
+					return errors.NewConflict(schema.GroupResource{Group: "velero.io", Resource: "datauploads"}, updatedDU.Name,
+						fmt.Errorf("simulated concurrent write (e.g. Velero's own built-in DataUpload controller)"))
+				}
+			}
+			return c.Update(ctx, obj, opts...)
+		},
+	})
+
+	r := &KubeVirtDataUploadReconciler{
+		Client:        interceptedClient,
+		Scheme:        scheme,
+		Log:           logr.Discard(),
+		OADPNamespace: vmNamespace,
+		ObjectStoreFactory: func(_ *common.ObjectStoreConfig) (velero.ObjectStore, error) {
+			return mockStore, nil
+		},
+	}
+
+	if _, err := r.handleAccepted(context.Background(), logr.Discard(), du); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !conflictInjected {
+		t.Fatal("test did not exercise the conflict path -- fixture drifted from handleAccepted's actual Update sequence")
+	}
+
+	// The VMB gets created regardless (matches today's best-effort tradeoff:
+	// a lost annotation race must not block the backup itself).
+	vmbList := &kubevirtbackupv1alpha1.VirtualMachineBackupList{}
+	if err := baseClient.List(context.Background(), vmbList, client.InNamespace(vmNamespace), client.MatchingLabels{common.LabelDataUploadUID: string(du.UID)}); err != nil {
+		t.Fatalf("failed to list created VMBs: %v", err)
+	}
+	if len(vmbList.Items) != 1 {
+		t.Fatalf("expected 1 VMB to be created despite the annotation conflict, found %d", len(vmbList.Items))
+	}
+
+	var updatedDU velerov2alpha1.DataUpload
+	if err := baseClient.Get(context.Background(), types.NamespacedName{Name: duName, Namespace: vmNamespace}, &updatedDU); err != nil {
+		t.Fatalf("failed to get updated DataUpload: %v", err)
+	}
+	if updatedDU.Annotations[common.AnnotationExpectedBackupType] == "" {
+		t.Error("expected-backup-type annotation is empty after a transient Update conflict -- " +
+			"it must survive a single conflicting write the same way the VMBT-name and BSL-validated " +
+			"annotations do, not be silently lost for the DataUpload's entire remaining lifetime " +
+			"(the VMB already exists now, so no future reconcile ever re-attempts this)")
 	}
 }
 

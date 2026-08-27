@@ -39,6 +39,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	kubevirtbackupv1alpha1 "kubevirt.io/api/backup/v1alpha1"
 	kubevirtcorev1 "kubevirt.io/api/core/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -493,14 +494,32 @@ func (r *KubeVirtDataUploadReconciler) handleAccepted(ctx context.Context, logge
 		// This annotation lets handlePrepared() compare the actual VMB result
 		// against what the controller intended, and the datamover pod can
 		// reconcile the S3 index if they differ (e.g., VM lost checkpoint).
+		//
+		// Retries on conflict (refetching du fresh each attempt) rather than
+		// logging and moving on: once Step 4 below creates the VMB, "vmb == nil"
+		// is false on every future reconcile, so this code never runs again for
+		// this DataUpload. A single lost race against a concurrent writer (e.g.
+		// Velero's own built-in DataUpload controller, which also reconciles
+		// these objects per this repo's own README caveat) would otherwise lose
+		// the annotation permanently with no way to ever retry it, not just on
+		// the next reconcile.
 		if checkpointLookup != nil {
 			expectedType := uploader.BackupTypeFull
 			if !forceFullBackup && checkpointLookup.Found && checkpointLookup.IsChainValid {
 				expectedType = uploader.BackupTypeIncremental
 			}
-			du.Annotations[common.AnnotationExpectedBackupType] = expectedType
-			if err := r.Update(ctx, du); err != nil {
-				logger.Info("Failed to set expected backup type annotation, will retry",
+			duKey := client.ObjectKeyFromObject(du)
+			if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+				if err := r.Get(ctx, duKey, du); err != nil {
+					return err
+				}
+				if du.Annotations == nil {
+					du.Annotations = make(map[string]string)
+				}
+				du.Annotations[common.AnnotationExpectedBackupType] = expectedType
+				return r.Update(ctx, du)
+			}); err != nil {
+				logger.Info("Failed to set expected backup type annotation after retrying, giving up for this DataUpload's lifetime",
 					"reason", err.Error())
 			}
 		}
