@@ -33,6 +33,31 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
+func TestDataMoverControllerOptions(t *testing.T) {
+	tests := []struct {
+		name string
+		in   int
+		want int
+	}{
+		{name: "zero falls back to default", in: 0, want: DefaultMaxConcurrentReconciles},
+		{name: "negative falls back to default", in: -1, want: DefaultMaxConcurrentReconciles},
+		{name: "positive is kept", in: 7, want: 7},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			opts := dataMoverControllerOptions(tt.in)
+			if opts.MaxConcurrentReconciles != tt.want {
+				t.Errorf("MaxConcurrentReconciles = %d, want %d", opts.MaxConcurrentReconciles, tt.want)
+			}
+			// nil would fall back to controller-runtime's default (priority
+			// queue on), which can starve re-listed objects after a restart.
+			if opts.UsePriorityQueue == nil || *opts.UsePriorityQueue {
+				t.Errorf("UsePriorityQueue = %v, want explicit false", opts.UsePriorityQueue)
+			}
+		})
+	}
+}
+
 func TestOperationTimeoutExceeded(t *testing.T) {
 	tests := []struct {
 		name          string

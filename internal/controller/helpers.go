@@ -33,6 +33,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 
 	"github.com/migtools/kubevirt-datamover-controller/pkg/common"
 )
@@ -53,6 +54,30 @@ const immediateRequeueDelay = time.Second
 // otherwise flood the controller's logs with no bound; keeping only the last
 // N lines still surfaces the most relevant (final) output.
 const maxEmittedPodLogLines = 200
+
+// dataMoverControllerOptions returns the controller options shared by the
+// DataUpload and DataDownload controllers, defaulting maxConcurrentReconciles
+// to DefaultMaxConcurrentReconciles when it isn't positive.
+//
+// The priority queue (enabled by default in controller-runtime) is turned
+// off. It enqueues everything from an informer's initial list at
+// LowPriority, and a RequeueAfter keeps the priority the item was dequeued
+// with, so after a controller restart any object that keeps receiving fresh
+// events (priority 0) is always dequeued ahead of the re-listed ones. A few
+// such objects can occupy every worker and starve the rest indefinitely --
+// e.g. DataUploads waiting on their VirtualMachineBackup, which nothing
+// watches, are only ever woken by their own RequeueAfter. Plain FIFO
+// ordering bounds every item's wait.
+func dataMoverControllerOptions(maxConcurrentReconciles int) controller.Options {
+	if maxConcurrentReconciles <= 0 {
+		maxConcurrentReconciles = DefaultMaxConcurrentReconciles
+	}
+	usePriorityQueue := false
+	return controller.Options{
+		MaxConcurrentReconciles: maxConcurrentReconciles,
+		UsePriorityQueue:        &usePriorityQueue,
+	}
+}
 
 // operationTimeoutExceeded reports whether the time elapsed since acceptedAt
 // exceeds the effective operation timeout: specTimeout when positive, otherwise
