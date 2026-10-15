@@ -311,10 +311,10 @@ stateDiagram-v2
   the timeout. Velero does the same: it enforces `itemOperationTimeout` from when the operation
   was created, whether or not the CR is waiting.
 - **Plain FIFO work queue**: the DataUpload and DataDownload controllers opt out of
-  controller-runtime's priority queue (the default since v0.24). With the priority queue, CRs
+  controller-runtime's priority queue (the default since v0.23). With the priority queue, CRs
   re-listed after a controller restart are queued at low priority, and CRs that requeue
-  themselves can keep them from being processed indefinitely. With FIFO, every queued CR is
-  processed within a bounded time.
+  themselves can keep them from being processed indefinitely. With FIFO, items queued later
+  cannot overtake a queued CR, so it is processed once the items ahead of it are done.
 - **Scoped cache**: Pods are cached only in `--oadp-namespace`, where the datamover pods run.
   Secrets are not cached; the BSL credential lookup reads them directly from the API server.
   managedFields are stripped from cached objects. This keeps controller memory from growing
