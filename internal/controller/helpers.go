@@ -67,8 +67,8 @@ const maxEmittedPodLogLines = 200
 // events (priority 0) is always dequeued ahead of the re-listed ones. A few
 // such objects can occupy every worker and starve the rest indefinitely --
 // e.g. DataUploads waiting on their VirtualMachineBackup, which nothing
-// watches, are only ever woken by their own RequeueAfter. Plain FIFO
-// ordering bounds every item's wait.
+// watches, are only ever woken by their own RequeueAfter. With plain FIFO
+// ordering, items queued later can't overtake one that is already waiting.
 func dataMoverControllerOptions(maxConcurrentReconciles int) controller.Options {
 	if maxConcurrentReconciles <= 0 {
 		maxConcurrentReconciles = DefaultMaxConcurrentReconciles
