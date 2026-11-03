@@ -37,6 +37,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	kubevirtbackupv1alpha1 "kubevirt.io/api/backup/v1alpha1"
@@ -9883,6 +9884,54 @@ func TestHandleInProgress_PodLogCollectionFailureDoesNotBlock(t *testing.T) {
 			}
 			if updatedDU.Status.Phase != tt.expectedPhase {
 				t.Errorf("expected phase=%s, got phase=%s", tt.expectedPhase, updatedDU.Status.Phase)
+			}
+		})
+	}
+}
+
+// vmbStatusReader serves status.includedVolumes as unstructured, which the
+// vendored kubevirt.io/api (v1.8.0-alpha.0) cannot model.
+type vmbStatusReader struct {
+	includedVolumes []interface{}
+	err             error
+}
+
+func (f *vmbStatusReader) Get(_ context.Context, _ client.ObjectKey, obj client.Object, _ ...client.GetOption) error {
+	if f.err != nil {
+		return f.err
+	}
+	u, ok := obj.(*unstructured.Unstructured)
+	if !ok {
+		return fmt.Errorf("unexpected object type %T", obj)
+	}
+	return unstructured.SetNestedSlice(u.Object, f.includedVolumes, "status", "includedVolumes")
+}
+
+func (f *vmbStatusReader) List(context.Context, client.ObjectList, ...client.ListOption) error {
+	return fmt.Errorf("not implemented")
+}
+
+func TestResolveVMBBackupType(t *testing.T) {
+	vol := func(typ string) interface{} {
+		return map[string]interface{}{"volumeName": "disk0", "type": typ}
+	}
+	tests := []struct {
+		name   string
+		reader *vmbStatusReader
+		want   string
+	}{
+		{"all volumes incremental", &vmbStatusReader{includedVolumes: []interface{}{vol("Incremental"), vol("Incremental")}}, uploader.BackupTypeIncremental},
+		{"any full volume makes backup full", &vmbStatusReader{includedVolumes: []interface{}{vol("Incremental"), vol("Full")}}, uploader.BackupTypeFull},
+		{"single full volume", &vmbStatusReader{includedVolumes: []interface{}{vol("Full")}}, uploader.BackupTypeFull},
+		{"no included volumes defaults to full", &vmbStatusReader{}, uploader.BackupTypeFull},
+		{"read failure defaults to full", &vmbStatusReader{err: fmt.Errorf("boom")}, uploader.BackupTypeFull},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := &KubeVirtDataUploadReconciler{APIReader: tt.reader}
+			vmb := &kubevirtbackupv1alpha1.VirtualMachineBackup{ObjectMeta: metav1.ObjectMeta{Name: "vmb", Namespace: "ns"}}
+			if got := r.resolveVMBBackupType(context.Background(), logr.Discard(), vmb); got != tt.want {
+				t.Fatalf("resolveVMBBackupType() = %q, want %q", got, tt.want)
 			}
 		})
 	}
