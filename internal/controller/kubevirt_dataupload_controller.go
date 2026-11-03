@@ -675,7 +675,7 @@ func (r *KubeVirtDataUploadReconciler) resolveVMBBackupType(
 	volumes, _, _ := unstructured.NestedSlice(live.Object, "status", "includedVolumes")
 	incremental := false
 	for _, v := range volumes {
-		m, _ := v.(map[string]interface{})
+		m, _ := v.(map[string]any)
 		if t, _ := m["type"].(string); strings.EqualFold(t, uploader.BackupTypeIncremental) {
 			incremental = true
 			continue
