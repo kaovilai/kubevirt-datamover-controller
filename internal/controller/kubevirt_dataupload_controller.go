@@ -37,6 +37,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	kubevirtbackupv1alpha1 "kubevirt.io/api/backup/v1alpha1"
@@ -647,6 +648,46 @@ func (r *KubeVirtDataUploadReconciler) handleAccepted(ctx context.Context, logge
 // vmb.Status.Conditions already has Complete=True.
 const conditionComplete kubevirtbackupv1alpha1.ConditionType = "Complete"
 
+// resolveVMBBackupType returns the backup type ("full" or "incremental") the
+// virt-controller actually performed for vmb.
+//
+// KubeVirt dropped the whole-backup VirtualMachineBackup.status.type field
+// (kubevirt/kubevirt f1a69f53c) in favour of status.includedVolumes[].type
+// (c32da47a4). The vendored kubevirt.io/api (v1.8.0-alpha.0) only models the
+// removed field, so the per-volume types are read from the live object as
+// unstructured. A VMB is incremental only if every included volume is
+// incremental; any full volume (e.g. a disk that lost its bitmap) makes it
+// full. Defaults to "full" when nothing can be determined.
+func (r *KubeVirtDataUploadReconciler) resolveVMBBackupType(
+	ctx context.Context, logger logr.Logger, vmb *kubevirtbackupv1alpha1.VirtualMachineBackup,
+) string {
+	var reader client.Reader = r.Client
+	if r.APIReader != nil {
+		reader = r.APIReader
+	}
+	live := &unstructured.Unstructured{}
+	live.SetGroupVersionKind(kubevirtbackupv1alpha1.SchemeGroupVersion.WithKind("VirtualMachineBackup"))
+	if err := reader.Get(ctx, types.NamespacedName{Name: vmb.Name, Namespace: vmb.Namespace}, live); err != nil {
+		logger.Info("Could not read VirtualMachineBackup status.includedVolumes, defaulting backup type to full",
+			"vmb", vmb.Name, "reason", err.Error())
+		return uploader.BackupTypeFull
+	}
+	volumes, _, _ := unstructured.NestedSlice(live.Object, "status", "includedVolumes")
+	incremental := false
+	for _, v := range volumes {
+		m, _ := v.(map[string]interface{})
+		if t, _ := m["type"].(string); strings.EqualFold(t, uploader.BackupTypeIncremental) {
+			incremental = true
+			continue
+		}
+		return uploader.BackupTypeFull
+	}
+	if incremental {
+		return uploader.BackupTypeIncremental
+	}
+	return uploader.BackupTypeFull
+}
+
 // evaluateVMBackupStatus checks conditions on a VirtualMachineBackup to determine
 // whether the backup succeeded, failed, or is still running.
 // KubeVirt condition combinations:
@@ -695,11 +736,11 @@ func (r *KubeVirtDataUploadReconciler) evaluateVMBackupStatus(
 
 		logger.Info("VirtualMachineBackup completed",
 			"vmb", vmb.Name,
-			"type", vmb.Status.Type,
+			"type", r.resolveVMBBackupType(ctx, logger, vmb),
 			"checkpoint", vmb.Status.CheckpointName)
 
 		if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhasePrepared,
-			fmt.Sprintf("VMBackup completed (type=%s)", vmb.Status.Type)); err != nil {
+			fmt.Sprintf("VMBackup completed (type=%s)", r.resolveVMBBackupType(ctx, logger, vmb))); err != nil {
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
@@ -1112,11 +1153,8 @@ func (r *KubeVirtDataUploadReconciler) handlePrepared(ctx context.Context, logge
 		logger.Info("PV already rebound to OADP namespace", "pvc", reboundPVCName)
 	}
 
-	// Get backup type from VMB status
-	backupType := "full"
-	if vmb.Status != nil && vmb.Status.Type != "" {
-		backupType = string(vmb.Status.Type)
-	}
+	// Get backup type from VMB status.includedVolumes[].type
+	backupType := r.resolveVMBBackupType(ctx, logger, vmb)
 
 	// Detect mismatch between expected and actual backup type.
 	// This catches the case where the controller allowed incremental but
