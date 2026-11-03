@@ -9892,7 +9892,7 @@ func TestHandleInProgress_PodLogCollectionFailureDoesNotBlock(t *testing.T) {
 // vmbStatusReader serves status.includedVolumes as unstructured, which the
 // vendored kubevirt.io/api (v1.8.0-alpha.0) cannot model.
 type vmbStatusReader struct {
-	includedVolumes []interface{}
+	includedVolumes []any
 	err             error
 }
 
@@ -9912,17 +9912,17 @@ func (f *vmbStatusReader) List(context.Context, client.ObjectList, ...client.Lis
 }
 
 func TestResolveVMBBackupType(t *testing.T) {
-	vol := func(typ string) interface{} {
-		return map[string]interface{}{"volumeName": "disk0", "type": typ}
+	vol := func(typ string) any {
+		return map[string]any{"volumeName": "disk0", "type": typ}
 	}
 	tests := []struct {
 		name   string
 		reader *vmbStatusReader
 		want   string
 	}{
-		{"all volumes incremental", &vmbStatusReader{includedVolumes: []interface{}{vol("Incremental"), vol("Incremental")}}, uploader.BackupTypeIncremental},
-		{"any full volume makes backup full", &vmbStatusReader{includedVolumes: []interface{}{vol("Incremental"), vol("Full")}}, uploader.BackupTypeFull},
-		{"single full volume", &vmbStatusReader{includedVolumes: []interface{}{vol("Full")}}, uploader.BackupTypeFull},
+		{"all volumes incremental", &vmbStatusReader{includedVolumes: []any{vol("Incremental"), vol("Incremental")}}, uploader.BackupTypeIncremental},
+		{"any full volume makes backup full", &vmbStatusReader{includedVolumes: []any{vol("Incremental"), vol("Full")}}, uploader.BackupTypeFull},
+		{"single full volume", &vmbStatusReader{includedVolumes: []any{vol("Full")}}, uploader.BackupTypeFull},
 		{"no included volumes defaults to full", &vmbStatusReader{}, uploader.BackupTypeFull},
 		{"read failure defaults to full", &vmbStatusReader{err: fmt.Errorf("boom")}, uploader.BackupTypeFull},
 	}
