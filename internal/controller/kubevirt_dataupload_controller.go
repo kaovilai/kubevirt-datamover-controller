@@ -648,16 +648,24 @@ func (r *KubeVirtDataUploadReconciler) handleAccepted(ctx context.Context, logge
 // vmb.Status.Conditions already has Complete=True.
 const conditionComplete kubevirtbackupv1alpha1.ConditionType = "Complete"
 
-// resolveVMBBackupType returns the backup type ("full" or "incremental") the
-// virt-controller actually performed for vmb.
+// resolveVMBBackupType returns the backup type ("full" or "incremental") to
+// record for vmb.
 //
 // KubeVirt dropped the whole-backup VirtualMachineBackup.status.type field
 // (kubevirt/kubevirt f1a69f53c) in favour of status.includedVolumes[].type
 // (c32da47a4). The vendored kubevirt.io/api (v1.8.0-alpha.0) only models the
 // removed field, so the per-volume types are read from the live object as
-// unstructured. A VMB is incremental only if every included volume is
-// incremental; any full volume (e.g. a disk that lost its bitmap) makes it
-// full. Defaults to "full" when nothing can be determined.
+// unstructured.
+//
+// The checkpoint index stores a single Type/Parent per checkpoint, shared by
+// all volumes, so per-volume types must be collapsed. The result is
+// "incremental" if ANY volume is incremental, and "full" only if every volume
+// is full (or nothing can be determined). Reporting a mixed backup as full
+// would make the uploader drop the checkpoint's parent pointer
+// (mismatchToFull), which breaks restore for the incremental volumes, whose
+// qcow2 files depend on their parent chain. A full volume's qcow2 is a
+// standalone image and restores correctly even with an unused parent chain.
+// Per-volume type/parent tracking in the checkpoint index is the proper fix.
 func (r *KubeVirtDataUploadReconciler) resolveVMBBackupType(
 	ctx context.Context, logger logr.Logger, vmb *kubevirtbackupv1alpha1.VirtualMachineBackup,
 ) string {
@@ -673,17 +681,11 @@ func (r *KubeVirtDataUploadReconciler) resolveVMBBackupType(
 		return uploader.BackupTypeFull
 	}
 	volumes, _, _ := unstructured.NestedSlice(live.Object, "status", "includedVolumes")
-	incremental := false
 	for _, v := range volumes {
 		m, _ := v.(map[string]any)
 		if t, _ := m["type"].(string); strings.EqualFold(t, uploader.BackupTypeIncremental) {
-			incremental = true
-			continue
+			return uploader.BackupTypeIncremental
 		}
-		return uploader.BackupTypeFull
-	}
-	if incremental {
-		return uploader.BackupTypeIncremental
 	}
 	return uploader.BackupTypeFull
 }

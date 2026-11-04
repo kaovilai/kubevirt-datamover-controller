@@ -9921,7 +9921,8 @@ func TestResolveVMBBackupType(t *testing.T) {
 		want   string
 	}{
 		{"all volumes incremental", &vmbStatusReader{includedVolumes: []any{vol("Incremental"), vol("Incremental")}}, uploader.BackupTypeIncremental},
-		{"any full volume makes backup full", &vmbStatusReader{includedVolumes: []any{vol("Incremental"), vol("Full")}}, uploader.BackupTypeFull},
+		{"mixed volumes stay incremental to preserve the parent chain", &vmbStatusReader{includedVolumes: []any{vol("Full"), vol("Incremental")}}, uploader.BackupTypeIncremental},
+		{"all volumes full", &vmbStatusReader{includedVolumes: []any{vol("Full"), vol("Full")}}, uploader.BackupTypeFull},
 		{"single full volume", &vmbStatusReader{includedVolumes: []any{vol("Full")}}, uploader.BackupTypeFull},
 		{"no included volumes defaults to full", &vmbStatusReader{}, uploader.BackupTypeFull},
 		{"read failure defaults to full", &vmbStatusReader{err: fmt.Errorf("boom")}, uploader.BackupTypeFull},
