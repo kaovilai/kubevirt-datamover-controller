@@ -660,12 +660,19 @@ const conditionComplete kubevirtbackupv1alpha1.ConditionType = "Complete"
 // The checkpoint index stores a single Type/Parent per checkpoint, shared by
 // all volumes, so per-volume types must be collapsed. The result is
 // "incremental" if ANY volume is incremental, and "full" only if every volume
-// is full (or nothing can be determined). Reporting a mixed backup as full
-// would make the uploader drop the checkpoint's parent pointer
-// (mismatchToFull), which breaks restore for the incremental volumes, whose
-// qcow2 files depend on their parent chain. A full volume's qcow2 is a
-// standalone image and restores correctly even with an unused parent chain.
-// Per-volume type/parent tracking in the checkpoint index is the proper fix.
+// is full (or nothing can be determined).
+//
+// Known limitation: a MIXED backup (some volumes full, some incremental)
+// cannot be restored correctly for all volumes under either choice, because
+// the index and the restore path are per-checkpoint. Reporting it as full makes
+// the uploader drop the parent pointer (mismatchToFull), so an incremental
+// volume's qcow2 (which has a backing file) is then first in its chain and
+// rebaseChain refuses it. Reporting it as incremental keeps the chain for the
+// incremental volumes, but rebaseChain requires every non-base file to have a
+// backing file, so the full volume's standalone qcow2 is refused instead. Both
+// fail loudly at restore rather than silently. Incremental is chosen here to
+// preserve the existing chain; per-volume type/parent tracking in the
+// checkpoint index is the proper fix.
 func (r *KubeVirtDataUploadReconciler) resolveVMBBackupType(
 	ctx context.Context, logger logr.Logger, vmb *kubevirtbackupv1alpha1.VirtualMachineBackup,
 ) string {
