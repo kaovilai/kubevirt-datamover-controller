@@ -4176,6 +4176,7 @@ func TestHandlePrepared(t *testing.T) {
 
 			r := &KubeVirtDataUploadReconciler{
 				Client:         fakeClient,
+				APIReader:      withVMBIncludedVolumeTypes(fakeClient, "Full"),
 				Scheme:         scheme,
 				Log:            logr.Discard(),
 				OADPNamespace:  "openshift-adp",
@@ -4447,6 +4448,7 @@ func TestHandlePreparedDataUpload_ConcurrencyLimit(t *testing.T) {
 		fakeClient := builder.Build()
 		r := &KubeVirtDataUploadReconciler{
 			Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp",
+			APIReader:      withVMBIncludedVolumeTypes(fakeClient, "Full"),
 			DatamoverImage: "quay.io/test/datamover:latest", MaxConcurrentDataMovers: 3,
 		}
 
@@ -4470,6 +4472,7 @@ func TestHandlePreparedDataUpload_ConcurrencyLimit(t *testing.T) {
 		fakeClient := builder.Build()
 		r := &KubeVirtDataUploadReconciler{
 			Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp",
+			APIReader:      withVMBIncludedVolumeTypes(fakeClient, "Full"),
 			DatamoverImage: "quay.io/test/datamover:latest", MaxConcurrentDataMovers: 3,
 		}
 
@@ -4514,6 +4517,7 @@ func TestHandlePreparedDataUpload_ConcurrencyLimit(t *testing.T) {
 		fakeClient := builder.Build()
 		r := &KubeVirtDataUploadReconciler{
 			Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: "openshift-adp",
+			APIReader:      withVMBIncludedVolumeTypes(fakeClient, "Full"),
 			DatamoverImage: "quay.io/test/datamover:latest", MaxConcurrentDataMovers: 0,
 		}
 
@@ -4629,6 +4633,7 @@ func TestHandlePreparedDataUpload_ConcurrentDeadlockRegression(t *testing.T) {
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
 	r := &KubeVirtDataUploadReconciler{
 		Client: fakeClient, Scheme: scheme, Log: logr.Discard(), OADPNamespace: oadpNS,
+		APIReader:      withVMBIncludedVolumeTypes(fakeClient, "Full"),
 		DatamoverImage: "quay.io/test/datamover:latest", MaxConcurrentDataMovers: limit,
 	}
 
@@ -9925,7 +9930,8 @@ func TestResolveVMBBackupType(t *testing.T) {
 		{"mixed volumes stay incremental to preserve the parent chain", &vmbStatusReader{includedVolumes: []any{vol("Full"), vol("Incremental")}}, uploader.BackupTypeIncremental, false},
 		{"all volumes full", &vmbStatusReader{includedVolumes: []any{vol("Full"), vol("Full")}}, uploader.BackupTypeFull, false},
 		{"single full volume", &vmbStatusReader{includedVolumes: []any{vol("Full")}}, uploader.BackupTypeFull, false},
-		{"no included volumes defaults to full", &vmbStatusReader{}, uploader.BackupTypeFull, false},
+		{"no included volumes is an error", &vmbStatusReader{}, "", true},
+		{"volumes without a type is an error", &vmbStatusReader{includedVolumes: []any{map[string]any{"volumeName": "disk0"}}}, "", true},
 		{"read failure is an error, not a guess", &vmbStatusReader{err: fmt.Errorf("boom")}, "", true},
 	}
 	for _, tt := range tests {
@@ -9941,4 +9947,27 @@ func TestResolveVMBBackupType(t *testing.T) {
 			}
 		})
 	}
+}
+
+// vmbIncludedVolumesReader serves status.includedVolumes[].type for the
+// unstructured VirtualMachineBackup read in resolveVMBBackupType, and
+// delegates every other read to the wrapped reader.
+type vmbIncludedVolumesReader struct {
+	client.Reader
+	types []string
+}
+
+func withVMBIncludedVolumeTypes(r client.Reader, types ...string) client.Reader {
+	return &vmbIncludedVolumesReader{Reader: r, types: types}
+}
+
+func (v *vmbIncludedVolumesReader) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if u, ok := obj.(*unstructured.Unstructured); ok {
+		volumes := make([]any, 0, len(v.types))
+		for i, typ := range v.types {
+			volumes = append(volumes, map[string]any{"volumeName": fmt.Sprintf("volume%d", i), "type": typ})
+		}
+		return unstructured.SetNestedSlice(u.Object, volumes, "status", "includedVolumes")
+	}
+	return v.Reader.Get(ctx, key, obj, opts...)
 }
