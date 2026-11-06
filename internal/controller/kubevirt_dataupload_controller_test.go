@@ -9916,22 +9916,27 @@ func TestResolveVMBBackupType(t *testing.T) {
 		return map[string]any{"volumeName": "disk0", "type": typ}
 	}
 	tests := []struct {
-		name   string
-		reader *vmbStatusReader
-		want   string
+		name    string
+		reader  *vmbStatusReader
+		want    string
+		wantErr bool
 	}{
-		{"all volumes incremental", &vmbStatusReader{includedVolumes: []any{vol("Incremental"), vol("Incremental")}}, uploader.BackupTypeIncremental},
-		{"mixed volumes stay incremental to preserve the parent chain", &vmbStatusReader{includedVolumes: []any{vol("Full"), vol("Incremental")}}, uploader.BackupTypeIncremental},
-		{"all volumes full", &vmbStatusReader{includedVolumes: []any{vol("Full"), vol("Full")}}, uploader.BackupTypeFull},
-		{"single full volume", &vmbStatusReader{includedVolumes: []any{vol("Full")}}, uploader.BackupTypeFull},
-		{"no included volumes defaults to full", &vmbStatusReader{}, uploader.BackupTypeFull},
-		{"read failure defaults to full", &vmbStatusReader{err: fmt.Errorf("boom")}, uploader.BackupTypeFull},
+		{"all volumes incremental", &vmbStatusReader{includedVolumes: []any{vol("Incremental"), vol("Incremental")}}, uploader.BackupTypeIncremental, false},
+		{"mixed volumes stay incremental to preserve the parent chain", &vmbStatusReader{includedVolumes: []any{vol("Full"), vol("Incremental")}}, uploader.BackupTypeIncremental, false},
+		{"all volumes full", &vmbStatusReader{includedVolumes: []any{vol("Full"), vol("Full")}}, uploader.BackupTypeFull, false},
+		{"single full volume", &vmbStatusReader{includedVolumes: []any{vol("Full")}}, uploader.BackupTypeFull, false},
+		{"no included volumes defaults to full", &vmbStatusReader{}, uploader.BackupTypeFull, false},
+		{"read failure is an error, not a guess", &vmbStatusReader{err: fmt.Errorf("boom")}, "", true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			r := &KubeVirtDataUploadReconciler{APIReader: tt.reader}
 			vmb := &kubevirtbackupv1alpha1.VirtualMachineBackup{ObjectMeta: metav1.ObjectMeta{Name: "vmb", Namespace: "ns"}}
-			if got := r.resolveVMBBackupType(context.Background(), logr.Discard(), vmb); got != tt.want {
+			got, err := r.resolveVMBBackupType(context.Background(), vmb)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("resolveVMBBackupType() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if got != tt.want {
 				t.Fatalf("resolveVMBBackupType() = %q, want %q", got, tt.want)
 			}
 		})

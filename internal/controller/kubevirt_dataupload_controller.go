@@ -660,7 +660,12 @@ const conditionComplete kubevirtbackupv1alpha1.ConditionType = "Complete"
 // The checkpoint index stores a single Type/Parent per checkpoint, shared by
 // all volumes, so per-volume types must be collapsed. The result is
 // "incremental" if ANY volume is incremental, and "full" only if every volume
-// is full (or nothing can be determined).
+// is full (or the VMB reports no included volumes).
+//
+// A failure to read the VMB is returned as an error instead of guessing a
+// type: defaulting to "full" for an incremental backup would make the uploader
+// drop the checkpoint's parent pointer (mismatchToFull) and leave the uploaded
+// image unrestorable.
 //
 // Known limitation: a MIXED backup (some volumes full, some incremental)
 // cannot be restored correctly for all volumes under either choice, because
@@ -674,8 +679,8 @@ const conditionComplete kubevirtbackupv1alpha1.ConditionType = "Complete"
 // preserve the existing chain; per-volume type/parent tracking in the
 // checkpoint index is the proper fix.
 func (r *KubeVirtDataUploadReconciler) resolveVMBBackupType(
-	ctx context.Context, logger logr.Logger, vmb *kubevirtbackupv1alpha1.VirtualMachineBackup,
-) string {
+	ctx context.Context, vmb *kubevirtbackupv1alpha1.VirtualMachineBackup,
+) (string, error) {
 	var reader client.Reader = r.Client
 	if r.APIReader != nil {
 		reader = r.APIReader
@@ -683,18 +688,16 @@ func (r *KubeVirtDataUploadReconciler) resolveVMBBackupType(
 	live := &unstructured.Unstructured{}
 	live.SetGroupVersionKind(kubevirtbackupv1alpha1.SchemeGroupVersion.WithKind("VirtualMachineBackup"))
 	if err := reader.Get(ctx, types.NamespacedName{Name: vmb.Name, Namespace: vmb.Namespace}, live); err != nil {
-		logger.Info("Could not read VirtualMachineBackup status.includedVolumes, defaulting backup type to full",
-			"vmb", vmb.Name, "reason", err.Error())
-		return uploader.BackupTypeFull
+		return "", fmt.Errorf("failed to read VirtualMachineBackup %s/%s to determine backup type: %w", vmb.Namespace, vmb.Name, err)
 	}
 	volumes, _, _ := unstructured.NestedSlice(live.Object, "status", "includedVolumes")
 	for _, v := range volumes {
 		m, _ := v.(map[string]any)
 		if t, _ := m["type"].(string); strings.EqualFold(t, uploader.BackupTypeIncremental) {
-			return uploader.BackupTypeIncremental
+			return uploader.BackupTypeIncremental, nil
 		}
 	}
-	return uploader.BackupTypeFull
+	return uploader.BackupTypeFull, nil
 }
 
 // evaluateVMBackupStatus checks conditions on a VirtualMachineBackup to determine
@@ -743,13 +746,20 @@ func (r *KubeVirtDataUploadReconciler) evaluateVMBackupStatus(
 			return ctrl.Result{}, nil
 		}
 
+		// Informational only: a read failure here must not block the phase
+		// transition. handlePrepared re-reads the type and retries on failure.
+		completedType, typeErr := r.resolveVMBBackupType(ctx, vmb)
+		if typeErr != nil {
+			logger.Info("Could not determine backup type for status message", "vmb", vmb.Name, "reason", typeErr.Error())
+			completedType = "unknown"
+		}
 		logger.Info("VirtualMachineBackup completed",
 			"vmb", vmb.Name,
-			"type", r.resolveVMBBackupType(ctx, logger, vmb),
+			"type", completedType,
 			"checkpoint", vmb.Status.CheckpointName)
 
 		if err := r.updatePhase(ctx, du, velerov2alpha1.DataUploadPhasePrepared,
-			fmt.Sprintf("VMBackup completed (type=%s)", r.resolveVMBBackupType(ctx, logger, vmb))); err != nil {
+			fmt.Sprintf("VMBackup completed (type=%s)", completedType)); err != nil {
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{RequeueAfter: RequeueAfterShort}, nil
@@ -1163,7 +1173,12 @@ func (r *KubeVirtDataUploadReconciler) handlePrepared(ctx context.Context, logge
 	}
 
 	// Get backup type from VMB status.includedVolumes[].type
-	backupType := r.resolveVMBBackupType(ctx, logger, vmb)
+	backupType, err := r.resolveVMBBackupType(ctx, vmb)
+	if err != nil {
+		// Do not guess: a wrong "full" would drop the checkpoint parent chain.
+		logger.Error(err, "Cannot determine backup type; requeuing")
+		return ctrl.Result{}, err
+	}
 
 	// Detect mismatch between expected and actual backup type.
 	// This catches the case where the controller allowed incremental but
