@@ -660,10 +660,10 @@ const conditionComplete kubevirtbackupv1alpha1.ConditionType = "Complete"
 // The checkpoint index stores a single Type/Parent per checkpoint, shared by
 // all volumes, so per-volume types must be collapsed. The result is
 // "incremental" if ANY volume is incremental, and "full" only if every volume
-// is full (or the VMB reports no included volumes).
+// is full.
 //
-// A failure to read the VMB is returned as an error instead of guessing a
-// type: defaulting to "full" for an incremental backup would make the uploader
+// A failure to read the VMB, or a VMB that reports no per-volume type at all,
+// is returned as an error instead of guessing a type: defaulting to "full" for an incremental backup would make the uploader
 // drop the checkpoint's parent pointer (mismatchToFull) and leave the uploaded
 // image unrestorable.
 //
@@ -691,11 +691,23 @@ func (r *KubeVirtDataUploadReconciler) resolveVMBBackupType(
 		return "", fmt.Errorf("failed to read VirtualMachineBackup %s/%s to determine backup type: %w", vmb.Namespace, vmb.Name, err)
 	}
 	volumes, _, _ := unstructured.NestedSlice(live.Object, "status", "includedVolumes")
+	typed := false
 	for _, v := range volumes {
 		m, _ := v.(map[string]any)
-		if t, _ := m["type"].(string); strings.EqualFold(t, uploader.BackupTypeIncremental) {
+		t, _ := m["type"].(string)
+		if t == "" {
+			continue
+		}
+		typed = true
+		if strings.EqualFold(t, uploader.BackupTypeIncremental) {
 			return uploader.BackupTypeIncremental, nil
 		}
+	}
+	if !typed {
+		// Neither a per-volume type nor anything else to go on (for example a
+		// KubeVirt that predates status.includedVolumes[].type): fail loudly
+		// instead of recording the backup as full.
+		return "", fmt.Errorf("VirtualMachineBackup %s/%s reports no per-volume backup type in status.includedVolumes[].type", vmb.Namespace, vmb.Name)
 	}
 	return uploader.BackupTypeFull, nil
 }
