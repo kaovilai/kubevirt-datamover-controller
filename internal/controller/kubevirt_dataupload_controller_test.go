@@ -9954,17 +9954,17 @@ func TestResolveVMBBackupType(t *testing.T) {
 // delegates every other read to the wrapped reader.
 type vmbIncludedVolumesReader struct {
 	client.Reader
-	types []string
+	volumeTypes []string
 }
 
-func withVMBIncludedVolumeTypes(r client.Reader, types ...string) client.Reader {
-	return &vmbIncludedVolumesReader{Reader: r, types: types}
+func withVMBIncludedVolumeTypes(r client.Reader, volumeTypes ...string) client.Reader {
+	return &vmbIncludedVolumesReader{Reader: r, volumeTypes: volumeTypes}
 }
 
 func (v *vmbIncludedVolumesReader) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
 	if u, ok := obj.(*unstructured.Unstructured); ok {
-		volumes := make([]any, 0, len(v.types))
-		for i, typ := range v.types {
+		volumes := make([]any, 0, len(v.volumeTypes))
+		for i, typ := range v.volumeTypes {
 			volumes = append(volumes, map[string]any{"volumeName": fmt.Sprintf("volume%d", i), "type": typ})
 		}
 		return unstructured.SetNestedSlice(u.Object, volumes, "status", "includedVolumes")
